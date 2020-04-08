@@ -1,9 +1,7 @@
-*.a
 *.o
 *.o.*
 *.d
 *.def
-*.dll
 *.dylib
 *.exe
 *.exp
@@ -11,7 +9,6 @@
 *.gcno
 *.h.c
 *.ilk
-*.lib
 *.pc
 *.pdb
 *.so
