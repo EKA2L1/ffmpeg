@@ -21,6 +21,14 @@ elseif (APPLE)
 		"${CMAKE_CURRENT_SOURCE_DIR}/macos/x86_64/lib/libavutil.a"
 		"${CMAKE_CURRENT_SOURCE_DIR}/macos/x86_64/lib/libswresample.a"
 		"z")
+elseif (ANDROID)
+	target_link_libraries(${FFMPEG_CORE_NAME} INTERFACE
+		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libavformat.a"
+		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libavcodec.a"
+		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libswscale.a"
+		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libavutil.a"
+		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libswresample.a"
+		"z")
 elseif (UNIX)
 	target_link_libraries(${FFMPEG_CORE_NAME} INTERFACE
 		"${CMAKE_CURRENT_SOURCE_DIR}/linux/x86_64/lib/libavformat.a"
