@@ -100,6 +100,18 @@ make install
 echo "The Compilation of FFmpeg for $CPU is completed"
 }
 
+#armv7
+ARCH=arm
+CPU=armv7-a
+CC=${TOOLCHAIN}/bin/armv7a-linux-androideabi${ANDROID_API}-clang
+CXX=${TOOLCHAIN}/bin/armv7a-linux-androideabi${ANDROID_API}-clang++
+SYSROOT=${NDK_HOME}/toolchains/llvm/prebuilt/${PLATFORM}-x86_64/sysroot
+CROSS_PREFIX=${TOOLCHAIN}/bin/arm-linux-androideabi-
+PREFIX=$(pwd)/android/armeabi-v7a
+OPTIMIZE_CFLAGS="-march=${CPU}"
+ASM_FLAGS=" --enable-neon --enable-asm --enable-inline-asm"
+build_ffmpeg
+
 #armv8-a
 ARCH=arm64
 CPU=armv8-a
