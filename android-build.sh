@@ -63,6 +63,7 @@ echo "Compiling FFmpeg for $CPU"
     --enable-demuxer=mpegvideo \
     --enable-demuxer=mpegps \
     --enable-demuxer=mjpeg \
+    --enable-demuxer=mov \
     --enable-demuxer=avi \
     --enable-demuxer=aac \
     --enable-demuxer=pcm_s16le \

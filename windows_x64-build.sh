@@ -102,6 +102,7 @@ DEMUXERS="
     --enable-demuxer=h264
     --enable-demuxer=mp3
     --enable-demuxer=mpegvideo
+    --enable-demuxer=mov
     --enable-demuxer=avi
     --enable-demuxer=aac
     --enable-demuxer=pcm_s16le
