@@ -60,6 +60,7 @@ echo "Compiling FFmpeg for $CPU"
     --enable-demuxer=h264 \
     --enable-demuxer=m4v \
     --enable-demuxer=mp3 \
+    --enable-demuxer=mov \
     --enable-demuxer=mpegvideo \
     --enable-demuxer=mpegps \
     --enable-demuxer=mjpeg \

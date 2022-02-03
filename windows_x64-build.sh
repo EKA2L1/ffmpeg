@@ -101,6 +101,7 @@ MUXERS="
 DEMUXERS="
     --enable-demuxer=h264
     --enable-demuxer=mp3
+    --enable-demuxer=mov
     --enable-demuxer=mpegvideo
     --enable-demuxer=mov
     --enable-demuxer=avi
