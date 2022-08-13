@@ -57,6 +57,7 @@ AUDIO_DECODERS="
     --enable-decoder=wavpack
     --enable-decoder=amrnb
     --enable-decoder=amrwb
+    --enable-decoder=amr
     --enable-decoder=mp3
     --enable-decoder=pcm_s16le
     --enable-decoder=pcm_s8
@@ -99,6 +100,9 @@ MUXERS="
 "
 
 DEMUXERS="
+    --enable-demuxer=amr
+    --enable-demuxer=amrnb
+    --enable-demuxer=amrwb
     --enable-demuxer=h264
     --enable-demuxer=mp3
     --enable-demuxer=mov
