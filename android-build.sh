@@ -54,6 +54,7 @@ echo "Compiling FFmpeg for $CPU"
     --enable-decoder=wavpack \
     --enable-decoder=amrnb \
     --enable-decoder=amrwb \
+    --enable-decoder=amr \
     --enable-decoder=mp3 \
     --enable-decoder=pcm_s16le \
     --enable-decoder=pcm_s8 \
@@ -70,6 +71,9 @@ echo "Compiling FFmpeg for $CPU"
     --enable-demuxer=pcm_s16le \
     --enable-demuxer=pcm_s8 \
     --enable-demuxer=wav \
+    --enable-demuxer=amr \
+    --enable-demuxer=amrnb \
+    --enable-demuxer=amrwb \
     --enable-encoder=pcm_s16le \
     --enable-muxer=amr \
     --enable-muxer=avi \
