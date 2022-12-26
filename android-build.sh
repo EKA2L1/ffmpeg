@@ -97,7 +97,7 @@ echo "Compiling FFmpeg for $CPU"
     --cxx=${CXX} \
     --enable-cross-compile \
     --sysroot=${SYSROOT} \
-    --extra-cflags="-Os -fpic ${OPTIMIZE_CFLAGS}" \
+    --extra-cflags="-Os -fpic -DVK_ENABLE_BETA_EXTENSIONS=0 ${OPTIMIZE_CFLAGS}" \
     --extra-ldflags="${ADDI_LDFLAGS}" \
     ${ADDITIONAL_CONFIGURE_FLAG}
 make clean
@@ -112,7 +112,7 @@ CPU=armv7-a
 CC=${TOOLCHAIN}/bin/armv7a-linux-androideabi${ANDROID_API}-clang
 CXX=${TOOLCHAIN}/bin/armv7a-linux-androideabi${ANDROID_API}-clang++
 SYSROOT=${NDK_HOME}/toolchains/llvm/prebuilt/${PLATFORM}-x86_64/sysroot
-CROSS_PREFIX=${TOOLCHAIN}/bin/arm-linux-androideabi-
+CROSS_PREFIX=${TOOLCHAIN}/bin/llvm-
 PREFIX=$(pwd)/android/armeabi-v7a
 OPTIMIZE_CFLAGS="-march=${CPU}"
 ASM_FLAGS=" --enable-neon --enable-asm --enable-inline-asm"
@@ -124,7 +124,7 @@ CPU=armv8-a
 CC=${TOOLCHAIN}/bin/aarch64-linux-android${ANDROID_API}-clang
 CXX=${TOOLCHAIN}/bin/aarch64-linux-android${ANDROID_API}-clang++
 SYSROOT=${NDK_HOME}/toolchains/llvm/prebuilt/${PLATFORM}-x86_64/sysroot
-CROSS_PREFIX=${TOOLCHAIN}/bin/aarch64-linux-android-
+CROSS_PREFIX=${TOOLCHAIN}/bin/llvm-
 PREFIX=$(pwd)/android/arm64-v8a
 OPTIMIZE_CFLAGS="-march=${CPU}"
 ASM_FLAGS=" --enable-neon --enable-asm --enable-inline-asm"
@@ -136,8 +136,8 @@ CPU=x86-64
 CC=${TOOLCHAIN}/bin/x86_64-linux-android${ANDROID_API}-clang
 CXX=${TOOLCHAIN}/bin/x86_64-linux-android${ANDROID_API}-clang++
 SYSROOT=${NDK_HOME}/toolchains/llvm/prebuilt/${PLATFORM}-x86_64/sysroot
-CROSS_PREFIX=${TOOLCHAIN}/bin/x86_64-linux-android-
+CROSS_PREFIX=${TOOLCHAIN}/bin/llvm-
 PREFIX=$(pwd)/android/x86_64
-OPTIMIZE_CFLAGS="-march=$CPU -msse4.2 -mpopcnt -m64 -mtune=intel"
+OPTIMIZE_CFLAGS="-march=$CPU -msse4.2 -mpopcnt -m64"
 ASM_FLAGS=" --disable-neon --disable-asm --disable-inline-asm"
 build_ffmpeg
