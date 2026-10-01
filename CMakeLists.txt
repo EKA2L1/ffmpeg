@@ -5,8 +5,13 @@ endif()
 
 set(EKA2L1_FFMPEG_CACHE_DIR "${CMAKE_SOURCE_DIR}/build/ffmpeg-cache" CACHE PATH "Cache for FFmpeg source builds")
 set(EKA2L1_FFMPEG_JOBS 4 CACHE STRING "Parallel jobs used to build FFmpeg")
-find_program(EKA2L1_FFMPEG_BASH NAMES bash HINTS "C:/msys64/usr/bin")
-find_program(EKA2L1_FFMPEG_MAKE NAMES gmake make HINTS "C:/msys64/usr/bin")
+if(WIN32)
+    # Native Windows make cannot resolve the /c/... paths emitted by MSYS.
+    find_program(EKA2L1_FFMPEG_BASH NAMES bash PATHS "C:/msys64/usr/bin" NO_DEFAULT_PATH)
+    find_program(EKA2L1_FFMPEG_MAKE NAMES make PATHS "C:/msys64/usr/bin" NO_DEFAULT_PATH)
+endif()
+find_program(EKA2L1_FFMPEG_BASH NAMES bash)
+find_program(EKA2L1_FFMPEG_MAKE NAMES gmake make)
 
 if(NOT EKA2L1_FFMPEG_BASH OR NOT EKA2L1_FFMPEG_MAKE)
     message(FATAL_ERROR "FFmpeg needs Bash and GNU Make. On Windows install MSYS2 and its make package.")
