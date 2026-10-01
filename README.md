@@ -10,6 +10,8 @@ EKA2L1 adds this directory through CMake. FFmpeg is compiled on demand from
 source; no platform libraries or installed headers are tracked in this fork.
 Bash and GNU Make are required. On Windows, install MSYS2 with its `make`
 package alongside Visual Studio's C++ tools (`C:/msys64` is detected by default).
+For another installation location, set `EKA2L1_FFMPEG_BASH` and
+`EKA2L1_FFMPEG_MAKE` to its `usr/bin/bash.exe` and `usr/bin/make.exe`.
 
 The cache defaults to the main project's `build/ffmpeg-cache`. Override it with
 `EKA2L1_FFMPEG_CACHE_DIR`; `EKA2L1_FFMPEG_JOBS` controls compilation parallelism.

@@ -14,11 +14,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: msys2/setup-msys2@v2
+        id: msys2
         if: runner.os == 'Windows'
         with:
           install: make
       - name: Configure
+        if: runner.os != 'Windows'
         run: cmake -S . -B build/native -DCMAKE_BUILD_TYPE=Release
+      - name: Configure Windows
+        if: runner.os == 'Windows'
+        run: >-
+          cmake -S . -B build/native
+          -DEKA2L1_FFMPEG_BASH="${{ steps.msys2.outputs.msys2-location }}/usr/bin/bash.exe"
+          -DEKA2L1_FFMPEG_MAKE="${{ steps.msys2.outputs.msys2-location }}/usr/bin/make.exe"
       - uses: actions/cache@v4
         with:
           path: build/ffmpeg-cache
