@@ -1,0 +1,96 @@
+name: Source builds
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          install: make
+      - name: Configure
+        run: cmake -S . -B build/native -DCMAKE_BUILD_TYPE=Release
+      - uses: actions/cache@v4
+        with:
+          path: build/ffmpeg-cache
+          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build/native/ffmpeg-build-config.cmake') }}
+      - name: Build and test
+        run: |
+          cmake --build build/native --config Release --parallel 4
+          ctest --test-dir build/native -C Release --output-on-failure
+      - name: Check warm cache
+        shell: bash
+        run: |
+          find build/ffmpeg-cache -name build.log -exec cksum {} \; > before.txt
+          cmake --build build/native --config Release --parallel 4
+          find build/ffmpeg-cache -name build.log -exec cksum {} \; > after.txt
+          diff before.txt after.txt
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: logs-${{ matrix.os }}
+          path: |
+            build/ffmpeg-cache/**/build.log
+            build/ffmpeg-cache/**/ffbuild/config.log
+  android:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [armeabi-v7a, arm64-v8a, x86_64]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install NDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;25.1.8937393' > /dev/null
+      - name: Configure
+        run: >-
+          cmake -S . -B build/android
+          -DCMAKE_TOOLCHAIN_FILE="$ANDROID_HOME/ndk/25.1.8937393/build/cmake/android.toolchain.cmake"
+          -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-21
+          -DCMAKE_BUILD_TYPE=Release
+      - uses: actions/cache@v4
+        with:
+          path: build/ffmpeg-cache
+          key: ffmpeg-android-${{ matrix.abi }}-${{ hashFiles('build/android/ffmpeg-build-config.cmake') }}
+      - run: cmake --build build/android --parallel 4
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: logs-android-${{ matrix.abi }}
+          path: |
+            build/ffmpeg-cache/**/build.log
+            build/ffmpeg-cache/**/ffbuild/config.log
+  ios:
+    runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [iphoneos, iphonesimulator]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >-
+          cmake -S . -B build/ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS
+          -DCMAKE_OSX_SYSROOT=${{ matrix.sdk }} -DCMAKE_OSX_ARCHITECTURES=arm64
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DCMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO
+      - uses: actions/cache@v4
+        with:
+          path: build/ffmpeg-cache
+          key: ffmpeg-${{ matrix.sdk }}-${{ hashFiles('build/ios/ffmpeg-build-config.cmake') }}
+      - run: cmake --build build/ios --config Release --parallel 4
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: logs-${{ matrix.sdk }}
+          path: |
+            build/ffmpeg-cache/**/build.log
+            build/ffmpeg-cache/**/ffbuild/config.log

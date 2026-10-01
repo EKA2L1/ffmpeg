@@ -1,51 +1,230 @@
-if (NOT DEFINED FFMPEG_CORE_NAME)
-	set(FFMPEG_CORE_NAME ffmpeg)
+cmake_minimum_required(VERSION 3.16)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(EKA2L1FFmpeg C)
 endif()
 
-add_library(${FFMPEG_CORE_NAME} INTERFACE)
+set(EKA2L1_FFMPEG_CACHE_DIR "${CMAKE_SOURCE_DIR}/build/ffmpeg-cache" CACHE PATH "Cache for FFmpeg source builds")
+set(EKA2L1_FFMPEG_JOBS 4 CACHE STRING "Parallel jobs used to build FFmpeg")
+find_program(EKA2L1_FFMPEG_BASH NAMES bash HINTS "C:/msys64/usr/bin")
+find_program(EKA2L1_FFMPEG_MAKE NAMES gmake make HINTS "C:/msys64/usr/bin")
 
-target_include_directories(${FFMPEG_CORE_NAME} INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
-if (WIN32)
-	if (MINGW)
-		target_link_libraries(${FFMPEG_CORE_NAME} INTERFACE
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/mingw/libavformat.a"
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/mingw/libavcodec.a"
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/mingw/libswscale.a"
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/mingw/libavutil.a"
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/mingw/libswresample.a"
-				"Bcrypt.lib"
-				"z")
-	else()
-		target_link_libraries(${FFMPEG_CORE_NAME} INTERFACE
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/msvc/avformat.lib"
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/msvc/avcodec.lib"
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/msvc/swscale.lib"
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/msvc/avutil.lib"
-				"${CMAKE_CURRENT_SOURCE_DIR}/windows/x86_64/lib/msvc/swresample.lib"
-				"Bcrypt.lib")
-	endif()
-elseif (APPLE)
-	target_link_libraries(${FFMPEG_CORE_NAME} INTERFACE
-		"${CMAKE_CURRENT_SOURCE_DIR}/macos/x86_64/lib/libavformat.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/macos/x86_64/lib/libavcodec.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/macos/x86_64/lib/libswscale.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/macos/x86_64/lib/libavutil.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/macos/x86_64/lib/libswresample.a"
-		"z")
-elseif (ANDROID)
-	target_link_libraries(${FFMPEG_CORE_NAME} INTERFACE
-		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libavformat.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libavcodec.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libswscale.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libavutil.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/android/${CMAKE_ANDROID_ARCH_ABI}/lib/libswresample.a"
-		"z")
-elseif (UNIX)
-	target_link_libraries(${FFMPEG_CORE_NAME} INTERFACE
-		"${CMAKE_CURRENT_SOURCE_DIR}/linux/x86_64/lib/libavformat.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/linux/x86_64/lib/libavcodec.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/linux/x86_64/lib/libswscale.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/linux/x86_64/lib/libavutil.a"
-		"${CMAKE_CURRENT_SOURCE_DIR}/linux/x86_64/lib/libswresample.a"
-		"z")
+if(NOT EKA2L1_FFMPEG_BASH OR NOT EKA2L1_FFMPEG_MAKE)
+    message(FATAL_ERROR "FFmpeg needs Bash and GNU Make. On Windows install MSYS2 and its make package.")
+endif()
+set(ffmpeg_arch "${CMAKE_SYSTEM_PROCESSOR}")
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    list(LENGTH CMAKE_OSX_ARCHITECTURES arch_count)
+    if(NOT arch_count EQUAL 1)
+        message(FATAL_ERROR "Build FFmpeg separately for each Apple architecture")
+    endif()
+    set(ffmpeg_arch "${CMAKE_OSX_ARCHITECTURES}")
+elseif(MSVC AND CMAKE_C_COMPILER_ARCHITECTURE_ID)
+    set(ffmpeg_arch "${CMAKE_C_COMPILER_ARCHITECTURE_ID}")
+endif()
+string(TOLOWER "${ffmpeg_arch}" ffmpeg_arch)
+if(ffmpeg_arch MATCHES "^(arm64|aarch64)$")
+    set(ffmpeg_arch aarch64)
+elseif(ffmpeg_arch MATCHES "^(amd64|x64|x86_64)$")
+    set(ffmpeg_arch x86_64)
+elseif(ffmpeg_arch MATCHES "^arm")
+    set(ffmpeg_arch arm)
+elseif(ffmpeg_arch MATCHES "^(x86|i.86)$")
+    set(ffmpeg_arch x86)
+endif()
+
+set(ffmpeg_options
+    --disable-everything --disable-autodetect --disable-shared --enable-static
+    --enable-pic --disable-avdevice --disable-avfilter --disable-postproc
+    --disable-programs --disable-doc --disable-network
+    --enable-decoder=h264,mpeg4,h263,h263p,mpeg2video,mjpeg,mjpegb
+    --enable-decoder=aac,aac_latm,wavpack,amrnb,amrwb,mp3,pcm_alaw,pcm_s16le,pcm_s8
+    --enable-encoder=pcm_s16le
+    --enable-demuxer=h264,m4v,mp3,mpegvideo,mpegps,mjpeg,mov,avi,aac,amr,amrnb,amrwb,epoc,pcm_s16le,pcm_s8,wav
+    --enable-muxer=amr,avi,mp3,wav,pcm_s16le,pcm_s8,ogg
+    --enable-parser=h264,mpeg4video,mpegvideo,mjpeg,aac,aac_latm,mpegaudio
+    --enable-protocol=file "--arch=${ffmpeg_arch}")
+set(ffmpeg_cflags "${CMAKE_C_FLAGS}")
+set(ffmpeg_ldflags "${CMAKE_EXE_LINKER_FLAGS}")
+set(ffmpeg_libraries)
+
+if(MSVC)
+    list(APPEND ffmpeg_options --toolchain=msvc --cc=cl --ld=link --ar=lib
+        --disable-x86asm --disable-zlib --enable-w32threads
+        --enable-dxva2 --enable-hwaccel=h264_dxva2 --enable-encoder=ffv1,mpeg4)
+    # FFmpeg is built once per target, independently of the app's Debug/Release setting.
+    string(APPEND ffmpeg_cflags " /MT")
+    set(vs_root "${CMAKE_VS_INSTALLATION_PATH}")
+    if(NOT vs_root)
+        string(REGEX REPLACE "/VC/Tools/MSVC/.*" "" vs_root "${CMAKE_C_COMPILER}")
+    endif()
+    set(vcvars "${vs_root}/VC/Auxiliary/Build/vcvarsall.bat")
+    if(NOT EXISTS "${vcvars}")
+        message(FATAL_ERROR "Cannot locate vcvarsall.bat for the FFmpeg MSVC build: ${vcvars}")
+    endif()
+    set(vcvars_arch amd64)
+    if(ffmpeg_arch STREQUAL aarch64)
+        set(vcvars_arch amd64_arm64)
+    elseif(ffmpeg_arch STREQUAL x86)
+        set(vcvars_arch amd64_x86)
+    endif()
+    get_filename_component(ffmpeg_compiler_dir "${CMAKE_C_COMPILER}" DIRECTORY)
+    list(APPEND ffmpeg_libraries bcrypt)
+else()
+    list(APPEND ffmpeg_options "--cc=${CMAKE_C_COMPILER}" "--ar=${CMAKE_AR}" "--ranlib=${CMAKE_RANLIB}")
+    if(CMAKE_C_COMPILER_TARGET)
+        string(APPEND ffmpeg_cflags " --target=${CMAKE_C_COMPILER_TARGET}")
+        string(APPEND ffmpeg_ldflags " --target=${CMAKE_C_COMPILER_TARGET}")
+    endif()
+    if(CMAKE_SYSROOT)
+        list(APPEND ffmpeg_options "--sysroot=${CMAKE_SYSROOT}")
+    endif()
+    if(APPLE)
+        list(APPEND ffmpeg_options --target-os=darwin --enable-cross-compile)
+        set(ffmpeg_sdk_hint "${CMAKE_OSX_SYSROOT}")
+        if(NOT ffmpeg_sdk_hint)
+            set(ffmpeg_sdk_hint macosx)
+        endif()
+        execute_process(COMMAND xcrun --sdk "${ffmpeg_sdk_hint}" --show-sdk-path
+            OUTPUT_VARIABLE ffmpeg_sdk OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE sdk_result)
+        if(NOT sdk_result EQUAL 0)
+            message(FATAL_ERROR "Cannot resolve the Apple SDK for FFmpeg: ${ffmpeg_sdk_hint}")
+        endif()
+        list(APPEND ffmpeg_options "--sysroot=${ffmpeg_sdk}")
+        set(apple_arch "${ffmpeg_arch}")
+        if(apple_arch STREQUAL aarch64)
+            set(apple_arch arm64)
+            list(APPEND ffmpeg_options --disable-asm)
+        endif()
+        string(APPEND ffmpeg_cflags " -arch ${apple_arch}")
+        string(APPEND ffmpeg_ldflags " -arch ${apple_arch}")
+        if(CMAKE_SYSTEM_NAME STREQUAL iOS)
+            if(ffmpeg_sdk MATCHES "[Ss]imulator")
+                set(min_version_flag -mios-simulator-version-min)
+            else()
+                set(min_version_flag -miphoneos-version-min)
+            endif()
+        else()
+            set(min_version_flag -mmacosx-version-min)
+        endif()
+        if(CMAKE_OSX_DEPLOYMENT_TARGET)
+            string(APPEND ffmpeg_cflags " ${min_version_flag}=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+            string(APPEND ffmpeg_ldflags " ${min_version_flag}=${CMAKE_OSX_DEPLOYMENT_TARGET}")
+        endif()
+    elseif(ANDROID)
+        list(APPEND ffmpeg_options --target-os=android --enable-cross-compile "--nm=${CMAKE_NM}")
+        if(ffmpeg_arch STREQUAL arm)
+            list(APPEND ffmpeg_options --cpu=armv7-a --enable-neon)
+        endif()
+    elseif(WIN32)
+        list(APPEND ffmpeg_options --target-os=mingw32)
+        list(APPEND ffmpeg_libraries bcrypt)
+    elseif(CMAKE_CROSSCOMPILING)
+        list(APPEND ffmpeg_options --enable-cross-compile)
+    endif()
+    if(ffmpeg_arch MATCHES "^x86")
+        find_program(ffmpeg_assembler NAMES nasm yasm)
+        if(ffmpeg_assembler)
+            list(APPEND ffmpeg_options "--x86asmexe=${ffmpeg_assembler}")
+        else()
+            list(APPEND ffmpeg_options --disable-x86asm)
+        endif()
+    endif()
+    list(APPEND ffmpeg_options --enable-zlib)
+    list(APPEND ffmpeg_libraries z)
+endif()
+list(APPEND ffmpeg_options "--extra-cflags=${ffmpeg_cflags}" "--extra-ldflags=${ffmpeg_ldflags}")
+
+# Hash source contents as well as the toolchain so local edits cannot reuse stale libraries.
+file(GLOB_RECURSE ffmpeg_inputs CONFIGURE_DEPENDS
+    "libavcodec/*.c" "libavcodec/*.h" "libavcodec/*.S" "libavcodec/*.asm" "libavcodec/*Makefile"
+    "libavformat/*.c" "libavformat/*.h" "libavformat/*Makefile"
+    "libavutil/*.c" "libavutil/*.h" "libavutil/*.S" "libavutil/*.asm" "libavutil/*Makefile"
+    "libswresample/*.c" "libswresample/*.h" "libswresample/*.S" "libswresample/*.asm" "libswresample/*Makefile"
+    "libswscale/*.c" "libswscale/*.h" "libswscale/*.S" "libswscale/*.asm" "libswscale/*Makefile"
+    "compat/*.c" "compat/*.h" "compat/*Makefile" "compat/windows/makedef"
+    "ffbuild/*.mak" "ffbuild/*.sh" "libavcodec/*.inc" "libavutil/*.inc"
+    "libswresample/*.inc" "libswscale/*.inc")
+list(FILTER ffmpeg_inputs EXCLUDE REGEX "/(ffversion|avconfig)\\.h$")
+list(APPEND ffmpeg_inputs "${CMAKE_CURRENT_SOURCE_DIR}/configure" "${CMAKE_CURRENT_SOURCE_DIR}/Makefile"
+    "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildFFmpeg.cmake")
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE ffmpeg_revision OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+set(ffmpeg_signature "${ffmpeg_revision};${CMAKE_SYSTEM_NAME};${ffmpeg_arch};${CMAKE_C_COMPILER};${CMAKE_C_COMPILER_ID};${CMAKE_C_COMPILER_VERSION};${ffmpeg_options}")
+foreach(input IN LISTS ffmpeg_inputs)
+    file(SHA256 "${input}" digest)
+    string(APPEND ffmpeg_signature "${digest}")
+endforeach()
+string(SHA256 ffmpeg_key "${ffmpeg_signature}")
+set(ffmpeg_cache "${EKA2L1_FFMPEG_CACHE_DIR}/${CMAKE_SYSTEM_NAME}-${ffmpeg_arch}-${ffmpeg_key}")
+set(ffmpeg_prefix "${ffmpeg_cache}/install")
+file(MAKE_DIRECTORY "${ffmpeg_prefix}/include")
+
+function(ffmpeg_shell_quote output value)
+    string(REPLACE "'" "'\"'\"'" quoted "${value}")
+    set(${output} "'${quoted}'" PARENT_SCOPE)
+endfunction()
+set(ffmpeg_script "#!/bin/sh\nset -eu\n")
+if(WIN32)
+    string(APPEND ffmpeg_script "export PATH=\"/usr/bin:$PATH\"\n")
+endif()
+if(MSVC)
+    ffmpeg_shell_quote(quoted "${ffmpeg_compiler_dir}")
+    string(APPEND ffmpeg_script "export PATH=\"$(cygpath -u ${quoted}):$PATH\"\n")
+endif()
+ffmpeg_shell_quote(quoted "${CMAKE_CURRENT_SOURCE_DIR}/configure")
+string(APPEND ffmpeg_script "${quoted}")
+foreach(option IN LISTS ffmpeg_options)
+    ffmpeg_shell_quote(quoted "${option}")
+    string(APPEND ffmpeg_script " ${quoted}")
+endforeach()
+ffmpeg_shell_quote(quoted "--prefix=${ffmpeg_prefix}")
+string(APPEND ffmpeg_script " ${quoted}\n")
+ffmpeg_shell_quote(quoted "${EKA2L1_FFMPEG_MAKE}")
+string(APPEND ffmpeg_script "${quoted} -j${EKA2L1_FFMPEG_JOBS}\n${quoted} install\n")
+set(ffmpeg_script_path "${CMAKE_CURRENT_BINARY_DIR}/build-ffmpeg.sh")
+file(GENERATE OUTPUT "${ffmpeg_script_path}" CONTENT "${ffmpeg_script}")
+if(MSVC)
+    file(TO_NATIVE_PATH "${vcvars}" vcvars_native)
+    file(TO_NATIVE_PATH "${EKA2L1_FFMPEG_BASH}" bash_native)
+    set(wrapper "@echo off\r\ncall \"${vcvars_native}\" ${vcvars_arch} >nul\r\nif errorlevel 1 exit /b %errorlevel%\r\n\"${bash_native}\" --noprofile --norc \"${ffmpeg_script_path}\"\r\n")
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/build-ffmpeg.cmd" CONTENT "${wrapper}")
+    set(ffmpeg_command cmd /c "${CMAKE_CURRENT_BINARY_DIR}/build-ffmpeg.cmd")
+else()
+    set(ffmpeg_command "${EKA2L1_FFMPEG_BASH}" "${ffmpeg_script_path}")
+endif()
+set(ffmpeg_build_config "set(cache [==[${ffmpeg_cache}]==])\nset(command [==[${ffmpeg_command}]==])\n")
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-build-config.cmake" CONTENT "${ffmpeg_build_config}")
+set(ffmpeg_archives)
+foreach(library avformat avcodec swscale swresample avutil)
+    list(APPEND ffmpeg_archives "${ffmpeg_prefix}/lib/lib${library}.a")
+endforeach()
+set(ffmpeg_header "${ffmpeg_prefix}/include/libavcodec/avcodec.h")
+add_custom_command(OUTPUT ${ffmpeg_archives} "${ffmpeg_cache}/complete" "${ffmpeg_header}"
+    COMMAND "${CMAKE_COMMAND}" "-Dconfig=${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-build-config.cmake"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildFFmpeg.cmake"
+    COMMENT "Building cached FFmpeg (${CMAKE_SYSTEM_NAME}/${ffmpeg_arch})"
+    VERBATIM)
+add_custom_target(ffmpeg-build DEPENDS ${ffmpeg_archives} "${ffmpeg_cache}/complete" "${ffmpeg_header}")
+add_library(ffmpeg INTERFACE)
+add_dependencies(ffmpeg ffmpeg-build)
+target_include_directories(ffmpeg INTERFACE "${ffmpeg_prefix}/include")
+target_link_libraries(ffmpeg INTERFACE ${ffmpeg_archives} ${ffmpeg_libraries})
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ffmpeg_inputs})
+message(STATUS "FFmpeg source build cache: ${ffmpeg_cache}")
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT CMAKE_CROSSCOMPILING)
+    include(CTest)
+    if(BUILD_TESTING)
+        add_executable(epoc-test libavformat/tests/epoc.c)
+        target_link_libraries(epoc-test PRIVATE ffmpeg)
+        if(MSVC)
+            set_property(TARGET epoc-test PROPERTY MSVC_RUNTIME_LIBRARY MultiThreaded)
+        else()
+            target_link_libraries(epoc-test PRIVATE m)
+        endif()
+        add_test(NAME epoc COMMAND epoc-test)
+    endif()
 endif()
