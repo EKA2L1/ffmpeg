@@ -23,10 +23,10 @@ jobs:
         with:
           path: build/ffmpeg-cache
           key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build/native/ffmpeg-build-config.cmake') }}
-      - name: Build and test
-        run: |
-          cmake --build build/native --config Release --parallel 4
-          ctest --test-dir build/native -C Release --output-on-failure
+      - name: Build
+        run: cmake --build build/native --config Release --parallel 4
+      - name: Test
+        run: ctest --test-dir build/native -C Release --output-on-failure
       - name: Check warm cache
         shell: bash
         run: |
