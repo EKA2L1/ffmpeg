@@ -44,6 +44,7 @@ AUDIO_DECODERS="\
     --enable-decoder=amrwb \
     --enable-decoder=amr \
     --enable-decoder=mp3 \
+    --enable-decoder=pcm_alaw \
     --enable-decoder=pcm_s16le \
     --enable-decoder=pcm_s8"
 
@@ -60,6 +61,7 @@ DEMUXERS="\
     --enable-demuxer=amr \
     --enable-demuxer=amrnb \
     --enable-demuxer=amrwb \
+    --enable-demuxer=epoc \
     --enable-demuxer=pcm_s16le \
     --enable-demuxer=pcm_s8 \
     --enable-demuxer=wav"

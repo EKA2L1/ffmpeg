@@ -1,0 +1,102 @@
+name: Rebuild libraries
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - 'libavformat/epocdec.c'
+      - 'libavformat/tests/epoc.c'
+      - '*build.sh'
+      - '.github/workflows/rebuild-libraries.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            script: linux_x64-build.sh
+            directory: linux/x86_64/lib
+            artifact: linux-x86_64
+          - os: macos-15-intel
+            script: macos_x64-build.sh
+            directory: macos/x86_64/lib
+            artifact: macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        env:
+          MAKEFLAGS: -j3
+        run: |
+          sh "${{ matrix.script }}"
+          make fate-epoc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.directory }}/*.a
+          if-no-files-found: error
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [msvc, mingw]
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.toolchain == 'msvc'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.toolchain == 'msvc' && 'MSYS' || 'MINGW64' }}
+          path-type: inherit
+          install: make diffutils perl dos2unix nasm pkgconf mingw-w64-x86_64-gcc mingw-w64-x86_64-zlib
+      - name: Build MSVC libraries
+        if: matrix.toolchain == 'msvc'
+        shell: msys2 {0}
+        env:
+          MAKEFLAGS: -j3
+        run: |
+          test ! -f /usr/bin/link.exe || mv /usr/bin/link.exe /usr/bin/link.exe.unused
+          bash windows_x64-build.sh
+          make fate-epoc
+          mkdir -p artifacts
+          cp Windows/x86_64/lib/*.lib artifacts/
+      - name: Build MinGW libraries
+        if: matrix.toolchain == 'mingw'
+        shell: msys2 {0}
+        env:
+          MAKEFLAGS: -j3
+        run: |
+          sh linux_x64-build.sh
+          make fate-epoc
+          mkdir -p artifacts
+          cp linux/x86_64/lib/*.a artifacts/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64-${{ matrix.toolchain }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up NDK
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;25.2.9519653'
+          mkdir -p "$HOME/sdk"
+          ln -s "$ANDROID_HOME/ndk/25.2.9519653" "$HOME/sdk/ndk-bundle"
+      - name: Build
+        run: bash android-build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: android/*/lib/*.a
+          if-no-files-found: error
