@@ -20,6 +20,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "boxblur.h"
 
 static const char *const var_names[] = {
@@ -113,9 +114,9 @@ int ff_boxblur_eval_filter_params(AVFilterLink *inlink,
 
 #define CHECK_RADIUS_VAL(w_, h_, comp)                                  \
     if (comp->radius < 0 ||                                   \
-        2*comp->radius > FFMIN(w_, h_)) {                     \
+        2*comp->radius >= FFMIN(w_, h_)) {                              \
         av_log(ctx, AV_LOG_ERROR,                                       \
-               "Invalid " #comp " radius value %d, must be >= 0 and <= %d\n", \
+               "Invalid " #comp " radius value %d, must be >= 0 and < %d\n", \
                comp->radius, FFMIN(w_, h_)/2);                \
         return AVERROR(EINVAL);                                         \
     }

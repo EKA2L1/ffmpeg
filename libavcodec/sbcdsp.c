@@ -103,49 +103,49 @@ static void sbc_analyze_8_simd(const int16_t *in, int32_t *out,
     sbc_analyze_simd(in, out, consts, 8);
 }
 
-static inline void sbc_analyze_4b_4s_simd(SBCDSPContext *s,
-                                          int16_t *x, int32_t *out, int out_stride)
+static inline void sbc_analyze_4b_4s_simd(SBCDSPContext *s, const int16_t *x,
+                                          int32_t *out, int out_stride)
 {
     /* Analyze blocks */
-    s->sbc_analyze_4(x + 12, out, ff_sbcdsp_analysis_consts_fixed4_simd_odd);
+    s->sbc_analyze_4(x + 12, out, sbcdsp_analysis_consts_fixed4_simd_odd);
     out += out_stride;
-    s->sbc_analyze_4(x + 8, out, ff_sbcdsp_analysis_consts_fixed4_simd_even);
+    s->sbc_analyze_4(x + 8, out, sbcdsp_analysis_consts_fixed4_simd_even);
     out += out_stride;
-    s->sbc_analyze_4(x + 4, out, ff_sbcdsp_analysis_consts_fixed4_simd_odd);
+    s->sbc_analyze_4(x + 4, out, sbcdsp_analysis_consts_fixed4_simd_odd);
     out += out_stride;
-    s->sbc_analyze_4(x + 0, out, ff_sbcdsp_analysis_consts_fixed4_simd_even);
+    s->sbc_analyze_4(x + 0, out, sbcdsp_analysis_consts_fixed4_simd_even);
 }
 
-static inline void sbc_analyze_4b_8s_simd(SBCDSPContext *s,
-                                          int16_t *x, int32_t *out, int out_stride)
+static inline void sbc_analyze_4b_8s_simd(SBCDSPContext *s, const int16_t *x,
+                                          int32_t *out, int out_stride)
 {
     /* Analyze blocks */
-    s->sbc_analyze_8(x + 24, out, ff_sbcdsp_analysis_consts_fixed8_simd_odd);
+    s->sbc_analyze_8(x + 24, out, sbcdsp_analysis_consts_fixed8_simd_odd);
     out += out_stride;
-    s->sbc_analyze_8(x + 16, out, ff_sbcdsp_analysis_consts_fixed8_simd_even);
+    s->sbc_analyze_8(x + 16, out, sbcdsp_analysis_consts_fixed8_simd_even);
     out += out_stride;
-    s->sbc_analyze_8(x + 8, out, ff_sbcdsp_analysis_consts_fixed8_simd_odd);
+    s->sbc_analyze_8(x + 8, out, sbcdsp_analysis_consts_fixed8_simd_odd);
     out += out_stride;
-    s->sbc_analyze_8(x + 0, out, ff_sbcdsp_analysis_consts_fixed8_simd_even);
+    s->sbc_analyze_8(x + 0, out, sbcdsp_analysis_consts_fixed8_simd_even);
 }
 
 static inline void sbc_analyze_1b_8s_simd_even(SBCDSPContext *s,
-                                               int16_t *x, int32_t *out,
+                                               const int16_t *x, int32_t *out,
                                                int out_stride);
 
 static inline void sbc_analyze_1b_8s_simd_odd(SBCDSPContext *s,
-                                              int16_t *x, int32_t *out,
+                                              const int16_t *x, int32_t *out,
                                               int out_stride)
 {
-    s->sbc_analyze_8(x, out, ff_sbcdsp_analysis_consts_fixed8_simd_odd);
+    s->sbc_analyze_8(x, out, sbcdsp_analysis_consts_fixed8_simd_odd);
     s->sbc_analyze_8s = sbc_analyze_1b_8s_simd_even;
 }
 
 static inline void sbc_analyze_1b_8s_simd_even(SBCDSPContext *s,
-                                               int16_t *x, int32_t *out,
+                                               const int16_t *x, int32_t *out,
                                                int out_stride)
 {
-    s->sbc_analyze_8(x, out, ff_sbcdsp_analysis_consts_fixed8_simd_even);
+    s->sbc_analyze_8(x, out, sbcdsp_analysis_consts_fixed8_simd_even);
     s->sbc_analyze_8s = sbc_analyze_1b_8s_simd_odd;
 }
 
@@ -267,7 +267,7 @@ static int sbc_enc_process_input_8s(int position, const uint8_t *pcm,
     return position;
 }
 
-static void sbc_calc_scalefactors(int32_t sb_sample_f[16][2][8],
+static void sbc_calc_scalefactors(const int32_t sb_sample_f[16][2][8],
                                   uint32_t scale_factor[2][8],
                                   int blocks, int channels, int subbands)
 {
@@ -380,8 +380,9 @@ av_cold void ff_sbcdsp_init(SBCDSPContext *s)
     s->sbc_calc_scalefactors = sbc_calc_scalefactors;
     s->sbc_calc_scalefactors_j = sbc_calc_scalefactors_j;
 
-    if (ARCH_ARM)
-        ff_sbcdsp_init_arm(s);
-    if (ARCH_X86)
-        ff_sbcdsp_init_x86(s);
+#if ARCH_ARM
+    ff_sbcdsp_init_arm(s);
+#elif ARCH_X86 && HAVE_X86ASM
+    ff_sbcdsp_init_x86(s);
+#endif
 }

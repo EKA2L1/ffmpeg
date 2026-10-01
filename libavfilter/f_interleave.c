@@ -23,14 +23,14 @@
  * audio and video interleaver
  */
 
+#include "config_components.h"
+
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/opt.h"
 
 #include "avfilter.h"
-#include "formats.h"
 #include "filters.h"
-#include "internal.h"
 #include "audio.h"
 #include "video.h"
 
@@ -52,10 +52,10 @@ static const AVOption filt_name##_options[] = {                     \
    { "nb_inputs", "set number of inputs", OFFSET(nb_inputs), AV_OPT_TYPE_INT, {.i64 = 2}, 1, INT_MAX, .flags = flags_ }, \
    { "n",         "set number of inputs", OFFSET(nb_inputs), AV_OPT_TYPE_INT, {.i64 = 2}, 1, INT_MAX, .flags = flags_ }, \
    { "duration", "how to determine the end-of-stream",              \
-       OFFSET(duration_mode), AV_OPT_TYPE_INT, { .i64 = DURATION_LONGEST }, 0,  2, flags_, "duration" }, \
-       { "longest",  "Duration of longest input",  0, AV_OPT_TYPE_CONST, { .i64 = DURATION_LONGEST  }, 0, 0, flags_, "duration" }, \
-       { "shortest", "Duration of shortest input", 0, AV_OPT_TYPE_CONST, { .i64 = DURATION_SHORTEST }, 0, 0, flags_, "duration" }, \
-       { "first",    "Duration of first input",    0, AV_OPT_TYPE_CONST, { .i64 = DURATION_FIRST    }, 0, 0, flags_, "duration" }, \
+       OFFSET(duration_mode), AV_OPT_TYPE_INT, { .i64 = DURATION_LONGEST }, 0,  2, flags_, .unit = "duration" }, \
+       { "longest",  "Duration of longest input",  0, AV_OPT_TYPE_CONST, { .i64 = DURATION_LONGEST  }, 0, 0, flags_, .unit = "duration" }, \
+       { "shortest", "Duration of shortest input", 0, AV_OPT_TYPE_CONST, { .i64 = DURATION_SHORTEST }, 0, 0, flags_, .unit = "duration" }, \
+       { "first",    "Duration of first input",    0, AV_OPT_TYPE_CONST, { .i64 = DURATION_FIRST    }, 0, 0, flags_, .unit = "duration" }, \
    { NULL }                                                         \
 }
 
@@ -182,6 +182,7 @@ static av_cold int init(AVFilterContext *ctx)
 
 static int config_output(AVFilterLink *outlink)
 {
+    FilterLink *l = ff_filter_link(outlink);
     AVFilterContext *ctx = outlink->src;
     AVFilterLink *inlink0 = ctx->inputs[0];
     int i;
@@ -192,7 +193,7 @@ static int config_output(AVFilterLink *outlink)
         outlink->h                   = inlink0->h;
         outlink->sample_aspect_ratio = inlink0->sample_aspect_ratio;
         outlink->format              = inlink0->format;
-        outlink->frame_rate = (AVRational) {1, 0};
+        l->frame_rate = (AVRational) {1, 0};
         for (i = 1; i < ctx->nb_inputs; i++) {
             AVFilterLink *inlink = ctx->inputs[i];
 
@@ -229,15 +230,15 @@ static const AVFilterPad interleave_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_interleave = {
-    .name        = "interleave",
-    .description = NULL_IF_CONFIG_SMALL("Temporally interleave video inputs."),
+const FFFilter ff_vf_interleave = {
+    .p.name        = "interleave",
+    .p.description = NULL_IF_CONFIG_SMALL("Temporally interleave video inputs."),
+    .p.priv_class  = &interleave_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size   = sizeof(InterleaveContext),
     .init        = init,
     .activate    = activate,
     FILTER_OUTPUTS(interleave_outputs),
-    .priv_class  = &interleave_class,
-    .flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
 };
 
 #endif
@@ -255,15 +256,15 @@ static const AVFilterPad ainterleave_outputs[] = {
     },
 };
 
-const AVFilter ff_af_ainterleave = {
-    .name        = "ainterleave",
-    .description = NULL_IF_CONFIG_SMALL("Temporally interleave audio inputs."),
+const FFFilter ff_af_ainterleave = {
+    .p.name        = "ainterleave",
+    .p.description = NULL_IF_CONFIG_SMALL("Temporally interleave audio inputs."),
+    .p.priv_class  = &ainterleave_class,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size   = sizeof(InterleaveContext),
     .init        = init,
     .activate    = activate,
     FILTER_OUTPUTS(ainterleave_outputs),
-    .priv_class  = &ainterleave_class,
-    .flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
 };
 
 #endif

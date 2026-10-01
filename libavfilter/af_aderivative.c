@@ -16,9 +16,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/opt.h"
 #include "audio.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
 typedef struct ADerivativeContext {
     const AVClass *class;
@@ -103,8 +104,18 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFilterContext *ctx = inlink->dst;
     ADerivativeContext *s = ctx->priv;
     AVFilterLink *outlink = ctx->outputs[0];
-    AVFrame *out = ff_get_audio_buffer(outlink, in->nb_samples);
+    AVFrame *out;
 
+    if (ctx->is_disabled) {
+        if (s->prev)
+            av_samples_set_silence(s->prev->extended_data, 0, 1,
+                                   s->prev->ch_layout.nb_channels,
+                                   s->prev->format);
+
+        return ff_filter_frame(outlink, in);
+    }
+
+    out = ff_get_audio_buffer(outlink, in->nb_samples);
     if (!out) {
         av_frame_free(&in);
         return AVERROR(ENOMEM);
@@ -115,12 +126,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         s->prev = ff_get_audio_buffer(inlink, 1);
         if (!s->prev) {
             av_frame_free(&in);
+            av_frame_free(&out);
             return AVERROR(ENOMEM);
         }
     }
 
     s->filter((void **)out->extended_data, (void **)s->prev->extended_data, (const void **)in->extended_data,
-              in->nb_samples, in->channels);
+              in->nb_samples, in->ch_layout.nb_channels);
 
     av_frame_free(&in);
     return ff_filter_frame(outlink, out);
@@ -142,30 +154,33 @@ static const AVFilterPad aderivative_inputs[] = {
     },
 };
 
-static const AVFilterPad aderivative_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
+static const AVOption aderivative_options[] = {
+    { NULL }
 };
 
-const AVFilter ff_af_aderivative = {
-    .name          = "aderivative",
-    .description   = NULL_IF_CONFIG_SMALL("Compute derivative of input audio."),
+AVFILTER_DEFINE_CLASS_EXT(aderivative, "aderivative/aintegral", aderivative_options);
+
+const FFFilter ff_af_aderivative = {
+    .p.name        = "aderivative",
+    .p.description = NULL_IF_CONFIG_SMALL("Compute derivative of input audio."),
+    .p.priv_class  = &aderivative_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .priv_size     = sizeof(ADerivativeContext),
     .uninit        = uninit,
     FILTER_INPUTS(aderivative_inputs),
-    FILTER_OUTPUTS(aderivative_outputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
     FILTER_SAMPLEFMTS(AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_FLTP,
                       AV_SAMPLE_FMT_S32P, AV_SAMPLE_FMT_DBLP),
 };
 
-const AVFilter ff_af_aintegral = {
-    .name          = "aintegral",
-    .description   = NULL_IF_CONFIG_SMALL("Compute integral of input audio."),
+const FFFilter ff_af_aintegral = {
+    .p.name        = "aintegral",
+    .p.description = NULL_IF_CONFIG_SMALL("Compute integral of input audio."),
+    .p.priv_class  = &aderivative_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .priv_size     = sizeof(ADerivativeContext),
     .uninit        = uninit,
     FILTER_INPUTS(aderivative_inputs),
-    FILTER_OUTPUTS(aderivative_outputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
     FILTER_SAMPLEFMTS(AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_DBLP),
 };

@@ -19,9 +19,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/dict.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "pcm.h"
 #include "aiff.h"
@@ -53,26 +57,26 @@ static enum AVCodecID aiff_codec_get_id(int bps)
 }
 
 /* returns the size of the found tag */
-static int get_tag(AVIOContext *pb, uint32_t * tag)
+static int64_t get_tag(AVIOContext *pb, uint32_t * tag)
 {
-    int size;
+    int64_t size;
 
     if (avio_feof(pb))
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
 
     *tag = avio_rl32(pb);
     size = avio_rb32(pb);
-
-    if (size < 0)
-        size = 0x7fffffff;
 
     return size;
 }
 
 /* Metadata string read */
-static void get_meta(AVFormatContext *s, const char *key, int size)
+static void get_meta(AVFormatContext *s, const char *key, int64_t size)
 {
-    uint8_t *str = av_malloc(size+1);
+    uint8_t *str = NULL;
+
+    if (size < SIZE_MAX)
+        str = av_malloc(size+1);
 
     if (str) {
         int res = avio_read(s->pb, str, size);
@@ -89,7 +93,7 @@ static void get_meta(AVFormatContext *s, const char *key, int size)
 }
 
 /* Returns the number of sound data frames or negative on error */
-static int get_aiff_header(AVFormatContext *s, int size,
+static int get_aiff_header(AVFormatContext *s, int64_t size,
                                     unsigned version)
 {
     AVIOContext *pb        = s->pb;
@@ -99,14 +103,15 @@ static int get_aiff_header(AVFormatContext *s, int size,
     uint64_t val;
     int sample_rate;
     unsigned int num_frames;
-
-    if (size == INT_MAX)
-        return AVERROR_INVALIDDATA;
+    int channels;
 
     if (size & 1)
         size++;
     par->codec_type = AVMEDIA_TYPE_AUDIO;
-    par->channels = avio_rb16(pb);
+    channels = avio_rb16(pb);
+    if (par->ch_layout.nb_channels && par->ch_layout.nb_channels != channels)
+        return AVERROR_INVALIDDATA;
+    par->ch_layout.nb_channels = channels;
     num_frames = avio_rb32(pb);
     par->bits_per_coded_sample = avio_rb16(pb);
 
@@ -154,21 +159,29 @@ static int get_aiff_header(AVFormatContext *s, int size,
             aiff->block_duration = 1;
             break;
         case AV_CODEC_ID_ADPCM_IMA_QT:
-            par->block_align = 34 * par->channels;
+            par->block_align = 34 * channels;
             break;
         case AV_CODEC_ID_MACE3:
-            par->block_align = 2 * par->channels;
+            par->block_align = 2 * channels;
             break;
         case AV_CODEC_ID_ADPCM_G726LE:
             par->bits_per_coded_sample = 5;
+            av_fallthrough;
         case AV_CODEC_ID_ADPCM_IMA_WS:
         case AV_CODEC_ID_ADPCM_G722:
         case AV_CODEC_ID_MACE6:
+        case AV_CODEC_ID_CBD2_DPCM:
         case AV_CODEC_ID_SDX2_DPCM:
-            par->block_align = 1 * par->channels;
+            par->block_align = 1 * channels;
             break;
         case AV_CODEC_ID_GSM:
             par->block_align = 33;
+            break;
+        case AV_CODEC_ID_G728:
+            par->block_align = 5;
+            break;
+        case AV_CODEC_ID_ADPCM_N64:
+            par->block_align = 9;
             break;
         default:
             aiff->block_duration = 1;
@@ -182,7 +195,7 @@ static int get_aiff_header(AVFormatContext *s, int size,
     /* Block align needs to be computed in all cases, as the definition
      * is specific to applications -> here we use the WAVE format definition */
     if (!par->block_align)
-        par->block_align = (av_get_bits_per_sample(par->codec_id) * par->channels) >> 3;
+        par->block_align = (av_get_bits_per_sample(par->codec_id) * channels) >> 3;
 
     if (aiff->block_duration) {
         par->bit_rate = av_rescale(par->sample_rate, par->block_align * 8LL,
@@ -201,8 +214,8 @@ static int get_aiff_header(AVFormatContext *s, int size,
 static int aiff_probe(const AVProbeData *p)
 {
     /* check file header */
-    if (p->buf[0] == 'F' && p->buf[1] == 'O' &&
-        p->buf[2] == 'R' && p->buf[3] == 'M' &&
+    if (AV_RL32(p->buf) == MKTAG('F', 'O', 'R', 'M') &&
+        AV_RB32(p->buf + 4) >= 4 &&
         p->buf[8] == 'A' && p->buf[9] == 'I' &&
         p->buf[10] == 'F' && (p->buf[11] == 'F' || p->buf[11] == 'C'))
         return AVPROBE_SCORE_MAX;
@@ -213,7 +226,8 @@ static int aiff_probe(const AVProbeData *p)
 /* aiff input */
 static int aiff_read_header(AVFormatContext *s)
 {
-    int ret, size, filesize;
+    int ret;
+    int64_t filesize, size;
     int64_t offset = 0, position;
     uint32_t tag;
     unsigned version = AIFF_C_VERSION1;
@@ -224,7 +238,7 @@ static int aiff_read_header(AVFormatContext *s)
 
     /* check FORM header */
     filesize = get_tag(pb, &tag);
-    if (filesize < 0 || tag != MKTAG('F', 'O', 'R', 'M'))
+    if (filesize < 4 || tag != MKTAG('F', 'O', 'R', 'M'))
         return AVERROR_INVALIDDATA;
 
     /* AIFF data type */
@@ -251,10 +265,7 @@ static int aiff_read_header(AVFormatContext *s)
         if (size < 0)
             return size;
 
-        if (size >= 0x7fffffff - 8)
-            filesize = 0;
-        else
-            filesize -= size + 8;
+        filesize -= size + 8;
 
         switch (tag) {
         case MKTAG('C', 'O', 'M', 'M'):     /* Common chunk */
@@ -348,9 +359,36 @@ static int aiff_read_header(AVFormatContext *s)
 
             goto got_sound;
             break;
+        case MKTAG('A','P','P','L'):
+            if (size > 4) {
+                uint32_t chunk = avio_rl32(pb);
+
+                size -= 4;
+                if (chunk == MKTAG('s','t','o','c')) {
+                    int len = avio_r8(pb);
+
+                    size--;
+                    if (len == 11 && size > 11) {
+                        uint8_t chunk[11];
+
+                        ret = ffio_read_size(pb, chunk, 11);
+                        if (ret < 0)
+                            return ret;
+                        size -= ret;
+                        if (!memcmp(chunk, "VADPCMCODES", sizeof(chunk))) {
+                            if ((ret = ff_get_extradata(s, st->codecpar, pb, size)) < 0)
+                                return ret;
+                            size -= ret;
+                        }
+                    }
+                }
+            }
+            avio_skip(pb, size);
+            break;
         case 0:
             if (offset > 0 && st->codecpar->block_align) // COMM && SSND
                 goto got_sound;
+            av_fallthrough;
         default: /* Jump */
             avio_skip(pb, size);
         }
@@ -374,6 +412,8 @@ got_sound:
         av_log(s, AV_LOG_ERROR, "could not find COMM tag or invalid block_align value\n");
         return AVERROR_INVALIDDATA;
     }
+    if (aiff->block_duration < 0)
+        return AVERROR_INVALIDDATA;
 
     /* Now positioned, get the sound data start and end */
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
@@ -428,17 +468,17 @@ static int aiff_read_packet(AVFormatContext *s,
         pkt->flags &= ~AV_PKT_FLAG_CORRUPT;
     /* Only one stream in an AIFF file */
     pkt->stream_index = 0;
-    pkt->duration     = (res / st->codecpar->block_align) * aiff->block_duration;
+    pkt->duration     = (res / st->codecpar->block_align) * (int64_t) aiff->block_duration;
     return 0;
 }
 
-const AVInputFormat ff_aiff_demuxer = {
-    .name           = "aiff",
-    .long_name      = NULL_IF_CONFIG_SMALL("Audio IFF"),
+const FFInputFormat ff_aiff_demuxer = {
+    .p.name         = "aiff",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Audio IFF"),
+    .p.codec_tag    = ff_aiff_codec_tags_list,
     .priv_data_size = sizeof(AIFFInputContext),
     .read_probe     = aiff_probe,
     .read_header    = aiff_read_header,
     .read_packet    = aiff_read_packet,
     .read_seek      = ff_pcm_read_seek,
-    .codec_tag      = ff_aiff_codec_tags_list,
 };

@@ -22,13 +22,14 @@
 #include <inttypes.h>
 
 #include "libavutil/avassert.h"
-#include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/dict.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "rmsipr.h"
 #include "rm.h"
@@ -51,8 +52,8 @@ struct RMStream {
     int64_t audiotimestamp; ///< Audio packet timestamp
     int sub_packet_cnt; // Subpacket counter, used while reading
     int sub_packet_size, sub_packet_h, coded_framesize; ///< Descrambling parameters from container
-    int audio_framesize; /// Audio frame size from container
-    int sub_packet_lengths[16]; /// Length of each subpacket
+    int audio_framesize; ///< Audio frame size from container
+    int sub_packet_lengths[16]; ///< Length of each subpacket
     int32_t deint_id;  ///< deinterleaver used in audio stream
 };
 
@@ -127,10 +128,6 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
     uint32_t version;
     int ret;
 
-    // Duplicate tags
-    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-        return AVERROR_INVALIDDATA;
-
     /* ra type header */
     version = avio_rb16(pb); /* version */
     if (version == 3) {
@@ -152,8 +149,7 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
         if (bytes_per_minute)
             st->codecpar->bit_rate = 8LL * bytes_per_minute / 60;
         st->codecpar->sample_rate = 8000;
-        st->codecpar->channels = 1;
-        st->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+        st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
         st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
         st->codecpar->codec_id = AV_CODEC_ID_RA_144;
         ast->deint_id = DEINT_ID_INT0;
@@ -189,10 +185,12 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
         }
         st->codecpar->sample_rate = avio_rb16(pb);
         avio_rb32(pb);
-        st->codecpar->channels = avio_rb16(pb);
+        st->codecpar->ch_layout.nb_channels = avio_rb16(pb);
         if (version == 5) {
             ast->deint_id = avio_rl32(pb);
-            avio_read(pb, buf, 4);
+            ret = ffio_read_size(pb, buf, 4);
+            if (ret < 0)
+                return ret;
             buf[4] = 0;
         } else {
             AV_WL32(buf, 0);
@@ -217,6 +215,7 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
             break;
         case AV_CODEC_ID_COOK:
             sti->need_parsing = AVSTREAM_PARSE_HEADERS;
+            av_fallthrough;
         case AV_CODEC_ID_ATRAC3:
         case AV_CODEC_ID_SIPR:
             if (read_all) {
@@ -272,9 +271,9 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
         case DEINT_ID_INT4:
             if (ast->coded_framesize > ast->audio_framesize ||
                 sub_packet_h <= 1 ||
-                ast->coded_framesize * (uint64_t)sub_packet_h > (2 + (sub_packet_h & 1)) * ast->audio_framesize)
+                ast->coded_framesize * (uint64_t)sub_packet_h > (2LL + (sub_packet_h & 1)) * ast->audio_framesize)
                 return AVERROR_INVALIDDATA;
-            if (ast->coded_framesize * (uint64_t)sub_packet_h != 2*ast->audio_framesize) {
+            if (ast->coded_framesize * (uint64_t)sub_packet_h != 2LL*ast->audio_framesize) {
                 avpriv_request_sample(s, "mismatching interleaver parameters");
                 return AVERROR_INVALIDDATA;
             }
@@ -330,6 +329,11 @@ int ff_rm_read_mdpr_codecdata(AVFormatContext *s, AVIOContext *pb,
     if (codec_data_size == 0)
         return 0;
 
+    // Duplicate tags
+    if (   st->codecpar->codec_type != AVMEDIA_TYPE_UNKNOWN
+        && st->codecpar->codec_type != AVMEDIA_TYPE_DATA)
+        return AVERROR_INVALIDDATA;
+
     avpriv_set_pts_info(st, 64, 1, 1000);
     codec_pos = avio_tell(pb);
     v = avio_rb32(pb);
@@ -349,7 +353,7 @@ int ff_rm_read_mdpr_codecdata(AVFormatContext *s, AVIOContext *pb,
                                                 st->codecpar->codec_tag);
     } else if(mime && !strcmp(mime, "logical-fileinfo")){
         int stream_count, rule_count, property_count, i;
-        ff_free_stream(s, st);
+        ff_remove_stream(s, st);
         if (avio_rb16(pb) != 0) {
             av_log(s, AV_LOG_WARNING, "Unsupported version\n");
             goto skip;
@@ -428,7 +432,8 @@ skip:
 static int rm_read_index(AVFormatContext *s)
 {
     AVIOContext *pb = s->pb;
-    unsigned int size, n_pkts, str_id, next_off, n, pos, pts;
+    unsigned int size, ver, n_pkts, str_id, next_off, n, pts;
+    uint64_t pos;
     AVStream *st;
 
     do {
@@ -437,10 +442,14 @@ static int rm_read_index(AVFormatContext *s)
         size     = avio_rb32(pb);
         if (size < 20)
             return -1;
-        avio_skip(pb, 2);
+        ver = avio_rb16(pb);
+        if (ver != 0 && ver != 2)
+            return AVERROR_INVALIDDATA;
         n_pkts   = avio_rb32(pb);
         str_id   = avio_rb16(pb);
         next_off = avio_rb32(pb);
+        if (ver == 2)
+            avio_skip(pb, 4);
         for (n = 0; n < s->nb_streams; n++)
             if (s->streams[n]->id == str_id) {
                 st = s->streams[n];
@@ -465,7 +474,7 @@ static int rm_read_index(AVFormatContext *s)
                 return AVERROR_INVALIDDATA;
             avio_skip(pb, 2);
             pts = avio_rb32(pb);
-            pos = avio_rb32(pb);
+            pos = (ver == 0) ? avio_rb32(pb) : avio_rb64(pb);
             avio_skip(pb, 4); /* packet no. */
 
             av_add_index_entry(st, pos, pts, 0, 0, AVINDEX_KEYFRAME);
@@ -546,8 +555,10 @@ static int rm_read_header(AVFormatContext *s)
     AVIOContext *pb = s->pb;
     unsigned int tag;
     int tag_size;
+    int ver;
     unsigned int start_time, duration;
-    unsigned int data_off = 0, indx_off = 0;
+    unsigned int data_off = 0;
+    uint64_t indx_off = 0;
     char buf[128], mime[128];
     int flags = 0;
     int ret;
@@ -558,11 +569,13 @@ static int rm_read_header(AVFormatContext *s)
     if (tag == MKTAG('.', 'r', 'a', 0xfd)) {
         /* very old .ra format */
         return rm_read_header_old(s);
-    } else if (tag != MKTAG('.', 'R', 'M', 'F')) {
-        return AVERROR(EIO);
+    } else if (tag != MKTAG('.', 'R', 'M', 'F') && tag != MKTAG('.', 'R', 'M', 'P')) {
+        return AVERROR_INVALIDDATA;
     }
 
     tag_size = avio_rb32(pb);
+    if (tag_size < 0)
+        return AVERROR_INVALIDDATA;
     avio_skip(pb, tag_size - 8);
 
     for(;;) {
@@ -570,10 +583,11 @@ static int rm_read_header(AVFormatContext *s)
             return AVERROR_INVALIDDATA;
         tag = avio_rl32(pb);
         tag_size = avio_rb32(pb);
-        avio_rb16(pb);
+        ver = avio_rb16(pb);
         av_log(s, AV_LOG_TRACE, "tag=%s size=%d\n",
                av_fourcc2str(tag), tag_size);
-        if (tag_size < 10 && tag != MKTAG('D', 'A', 'T', 'A'))
+        if ((tag_size < 10 && tag != MKTAG('D', 'A', 'T', 'A')) ||
+            (ver != 0 && ver != 2))
             return AVERROR_INVALIDDATA;
         switch(tag) {
         case MKTAG('P', 'R', 'O', 'P'):
@@ -586,7 +600,7 @@ static int rm_read_header(AVFormatContext *s)
             duration = avio_rb32(pb); /* duration */
             s->duration = av_rescale(duration, AV_TIME_BASE, 1000);
             avio_rb32(pb); /* preroll */
-            indx_off = avio_rb32(pb); /* index offset */
+            indx_off = (ver == 0) ? avio_rb32(pb) : avio_rb64(pb); /* index offset */
             data_off = avio_rb32(pb); /* data offset */
             avio_rb16(pb); /* nb streams */
             flags = avio_rb16(pb); /* flags */
@@ -648,15 +662,17 @@ static int rm_read_header(AVFormatContext *s)
     rm->nb_packets = avio_rb32(pb); /* number of packets */
     if (!rm->nb_packets && (flags & 4))
         rm->nb_packets = 3600 * 25;
+    if (ver == 2)
+        avio_skip(pb, 12);
     avio_rb32(pb); /* next data header */
 
     if (!data_off)
-        data_off = avio_tell(pb) - 18;
+        data_off = avio_tell(pb) - (ver == 0 ? 18 : 30);
     if (indx_off && (pb->seekable & AVIO_SEEKABLE_NORMAL) &&
         !(s->flags & AVFMT_FLAG_IGNIDX) &&
         avio_seek(pb, indx_off, SEEK_SET) >= 0) {
         rm_read_index(s);
-        avio_seek(pb, data_off + 18, SEEK_SET);
+        avio_seek(pb, data_off + (ver == 0 ? 18 : 30), SEEK_SET);
     }
 
     return 0;
@@ -701,12 +717,19 @@ static int rm_sync(AVFormatContext *s, int64_t *timestamp, int *flags, int *stre
             state= (state<<8) + avio_r8(pb);
 
             if(state == MKBETAG('I', 'N', 'D', 'X')){
+                int ver;
                 int n_pkts;
                 int64_t expected_len;
                 len = avio_rb32(pb);
-                avio_skip(pb, 2);
+                ver = avio_rb16(pb);
+                if (ver != 0 && ver != 2)
+                    return AVERROR_INVALIDDATA;
                 n_pkts = avio_rb32(pb);
-                expected_len = 20 + n_pkts * 14LL;
+
+                if (ver == 0)
+                    expected_len = 20 + n_pkts * 14LL;
+                else if (ver == 2)
+                    expected_len = 24 + n_pkts * 18LL;
 
                 if (len == 20 && expected_len <= INT_MAX)
                     /* some files don't add index entries to chunk size... */
@@ -795,10 +818,11 @@ static int rm_assemble_video_frame(AVFormatContext *s, AVIOContext *pb,
         pkt->data[0] = 0;
         AV_WL32(pkt->data + 1, 1);
         AV_WL32(pkt->data + 5, 0);
-        if ((ret = avio_read(pb, pkt->data + 9, len)) != len) {
+        ret = ffio_read_size(pb, pkt->data + 9, len);
+        if (ret < 0) {
             av_packet_unref(pkt);
             av_log(s, AV_LOG_ERROR, "Failed to read %d bytes\n", len);
-            return ret < 0 ? ret : AVERROR(EIO);
+            return ret;
         }
         return 0;
     }
@@ -835,8 +859,9 @@ static int rm_assemble_video_frame(AVFormatContext *s, AVIOContext *pb,
         av_log(s, AV_LOG_ERROR, "outside videobufsize\n");
         return 1;
     }
-    if (avio_read(pb, vst->pkt.data + vst->videobufpos, len) != len)
-        return AVERROR(EIO);
+    ret = ffio_read_size(pb, vst->pkt.data + vst->videobufpos, len);
+    if (ret < 0)
+        return ret;
     vst->videobufpos += len;
     rm->remaining_len-= len;
 
@@ -1040,7 +1065,7 @@ static int rm_read_packet(AVFormatContext *s, AVPacket *pkt)
             if (avio_feof(s->pb))
                 return AVERROR_EOF;
             if (len <= 0)
-                return AVERROR(EIO);
+                return AVERROR_INVALIDDATA;
 
             res = ff_rm_parse_packet (s, s->pb, st, st->priv_data, len, pkt,
                                       &seq, flags, timestamp);
@@ -1076,7 +1101,7 @@ static int rm_probe(const AVProbeData *p)
 {
     /* check file header */
     if ((p->buf[0] == '.' && p->buf[1] == 'R' &&
-         p->buf[2] == 'M' && p->buf[3] == 'F' &&
+         p->buf[2] == 'M' && (p->buf[3] == 'F' || p->buf[3] == 'P') &&
          p->buf[4] == 0 && p->buf[5] == 0) ||
         (p->buf[0] == '.' && p->buf[1] == 'r' &&
          p->buf[2] == 'a' && p->buf[3] == 0xfd))
@@ -1143,11 +1168,11 @@ static int rm_read_seek(AVFormatContext *s, int stream_index,
 }
 
 
-const AVInputFormat ff_rm_demuxer = {
-    .name           = "rm",
-    .long_name      = NULL_IF_CONFIG_SMALL("RealMedia"),
+const FFInputFormat ff_rm_demuxer = {
+    .p.name         = "rm",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("RealMedia"),
     .priv_data_size = sizeof(RMDemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = rm_probe,
     .read_header    = rm_read_header,
     .read_packet    = rm_read_packet,
@@ -1156,12 +1181,12 @@ const AVInputFormat ff_rm_demuxer = {
     .read_seek      = rm_read_seek,
 };
 
-const AVInputFormat ff_rdt_demuxer = {
-    .name           = "rdt",
-    .long_name      = NULL_IF_CONFIG_SMALL("RDT demuxer"),
+const FFInputFormat ff_rdt_demuxer = {
+    .p.name         = "rdt",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("RDT demuxer"),
+    .p.flags        = AVFMT_NOFILE,
     .priv_data_size = sizeof(RMDemuxContext),
     .read_close     = rm_read_close,
-    .flags          = AVFMT_NOFILE,
 };
 
 static int ivr_probe(const AVProbeData *p)
@@ -1176,7 +1201,7 @@ static int ivr_probe(const AVProbeData *p)
 static int ivr_read_header(AVFormatContext *s)
 {
     unsigned tag, type, len, tlen, value;
-    int i, j, n, count, nb_streams = 0, ret;
+    int i, n, count, nb_streams = 0, ret;
     uint8_t key[256], val[256];
     AVIOContext *pb = s->pb;
     AVStream *st;
@@ -1230,7 +1255,7 @@ static int ivr_read_header(AVFormatContext *s)
             av_log(s, AV_LOG_DEBUG, "%s = '%s'\n", key, val);
         } else if (type == 4) {
             av_log(s, AV_LOG_DEBUG, "%s = '0x", key);
-            for (j = 0; j < len; j++) {
+            for (unsigned j = 0; j < len; j++) {
                 if (avio_feof(pb))
                     return AVERROR_INVALIDDATA;
                 av_log(s, AV_LOG_DEBUG, "%X", avio_r8(pb));
@@ -1283,10 +1308,8 @@ static int ivr_read_header(AVFormatContext *s)
                 if (ret < 0)
                     return ret;
             } else if (type == 4) {
-                int j;
-
                 av_log(s, AV_LOG_DEBUG, "%s = '0x", key);
-                for (j = 0; j < len; j++) {
+                for (unsigned j = 0; j < len; j++) {
                     if (avio_feof(pb))
                         return AVERROR_INVALIDDATA;
                     av_log(s, AV_LOG_DEBUG, "%X", avio_r8(pb));
@@ -1386,7 +1409,7 @@ static int ivr_read_packet(AVFormatContext *s, AVPacket *pkt)
                 }
             } else {
                 av_log(s, AV_LOG_ERROR, "Unsupported opcode=%d at %"PRIX64"\n", opcode, avio_tell(pb) - 1);
-                return AVERROR(EIO);
+                return AVERROR_INVALIDDATA;
             }
         }
 
@@ -1396,14 +1419,14 @@ static int ivr_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-const AVInputFormat ff_ivr_demuxer = {
-    .name           = "ivr",
-    .long_name      = NULL_IF_CONFIG_SMALL("IVR (Internet Video Recording)"),
+const FFInputFormat ff_ivr_demuxer = {
+    .p.name         = "ivr",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("IVR (Internet Video Recording)"),
+    .p.extensions   = "ivr",
     .priv_data_size = sizeof(RMDemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = ivr_probe,
     .read_header    = ivr_read_header,
     .read_packet    = ivr_read_packet,
     .read_close     = rm_read_close,
-    .extensions     = "ivr",
 };

@@ -30,7 +30,7 @@ void ff_vc1_inv_trans_8x8_dc_lasx(uint8_t *dest, ptrdiff_t stride, int16_t *bloc
 void ff_vc1_inv_trans_8x4_lasx(uint8_t *dest, ptrdiff_t stride, int16_t *block);
 void ff_vc1_inv_trans_8x4_dc_lasx(uint8_t *dest, ptrdiff_t stride, int16_t *block);
 void ff_vc1_inv_trans_4x8_dc_lasx(uint8_t *dest, ptrdiff_t stride, int16_t *block);
-void ff_vc1_inv_trans_4x8_lasx(uint8_t *dest, ptrdiff_t stride, int16_t *blokc);
+void ff_vc1_inv_trans_4x8_lasx(uint8_t *dest, ptrdiff_t stride, int16_t *block);
 void ff_vc1_inv_trans_4x4_dc_lasx(uint8_t *dest, ptrdiff_t stride, int16_t *block);
 void ff_vc1_inv_trans_4x4_lasx(uint8_t *dest, ptrdiff_t stride, int16_t *block);
 
@@ -73,7 +73,7 @@ FF_PUT_VC1_MSPEL_MC_H_LASX(2);
 FF_PUT_VC1_MSPEL_MC_H_LASX(3);
 
 void ff_put_no_rnd_vc1_chroma_mc8_lasx(uint8_t *dst /* align 8 */,
-                                       uint8_t *src /* align 1 */,
+                                       const uint8_t *src /* align 1 */,
                                        ptrdiff_t stride, int h, int x, int y);
 
 #endif /* AVCODEC_LOONGARCH_VC1DSP_LOONGARCH_H */

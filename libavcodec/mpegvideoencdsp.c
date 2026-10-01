@@ -25,11 +25,34 @@
 #include "libavutil/attributes.h"
 #include "libavutil/imgutils.h"
 #include "avcodec.h"
-#include "me_cmp.h"
+#include "mathops.h"
 #include "mpegvideoencdsp.h"
 
-static int try_8x8basis_c(int16_t rem[64], int16_t weight[64],
-                          int16_t basis[64], int scale)
+static void denoise_dct_c(int16_t block[64], int dct_error_sum[64],
+                          const uint16_t dct_offset[64])
+{
+    for (int i = 0; i < 64; ++i) {
+        int level = block[i];
+
+        if (level) {
+            if (level > 0) {
+                dct_error_sum[i] += level;
+                level -= dct_offset[i];
+                if (level < 0)
+                    level = 0;
+            } else {
+                dct_error_sum[i] -= level;
+                level += dct_offset[i];
+                if (level > 0)
+                    level = 0;
+            }
+            block[i] = level;
+        }
+    }
+}
+
+static int try_8x8basis_c(const int16_t rem[64], const int16_t weight[64],
+                          const int16_t basis[64], int scale)
 {
     int i;
     unsigned int sum = 0;
@@ -47,7 +70,7 @@ static int try_8x8basis_c(int16_t rem[64], int16_t weight[64],
     return sum >> 2;
 }
 
-static void add_8x8basis_c(int16_t rem[64], int16_t basis[64], int scale)
+static void add_8x8basis_c(int16_t rem[64], const int16_t basis[64], int scale)
 {
     int i;
 
@@ -57,7 +80,7 @@ static void add_8x8basis_c(int16_t rem[64], int16_t basis[64], int scale)
                   (BASIS_SHIFT - RECON_SHIFT);
 }
 
-static int pix_sum_c(uint8_t *pix, int line_size)
+static int pix_sum_c(const uint8_t *pix, ptrdiff_t line_size)
 {
     int s = 0, i, j;
 
@@ -78,7 +101,7 @@ static int pix_sum_c(uint8_t *pix, int line_size)
     return s;
 }
 
-static int pix_norm1_c(uint8_t *pix, int line_size)
+static int pix_norm1_c(const uint8_t *pix, ptrdiff_t line_size)
 {
     int s = 0, i, j;
     const uint32_t *sq = ff_square_tab + 256;
@@ -114,19 +137,31 @@ static int pix_norm1_c(uint8_t *pix, int line_size)
     return s;
 }
 
-/* draw the edges of width 'w' of an image of size width, height */
-// FIXME: Check that this is OK for MPEG-4 interlaced.
-static void draw_edges_8_c(uint8_t *buf, int wrap, int width, int height,
-                           int w, int h, int sides)
+static av_always_inline void draw_edges_lr(uint8_t *ptr, ptrdiff_t wrap, int width, int height, int w)
 {
-    uint8_t *ptr = buf, *last_line;
-    int i;
-
-    /* left and right */
-    for (i = 0; i < height; i++) {
+    for (int i = 0; i < height; i++) {
         memset(ptr - w, ptr[0], w);
         memset(ptr + width, ptr[width - 1], w);
         ptr += wrap;
+    }
+}
+
+/* draw the edges of width 'w' of an image of size width, height */
+// FIXME: Check that this is OK for MPEG-4 interlaced.
+static void draw_edges_8_c(uint8_t *buf, ptrdiff_t wrap, int width, int height,
+                           int w, int h, int sides)
+{
+    uint8_t *last_line;
+    int i;
+
+    /* left and right */
+    if (w == 16) {
+        draw_edges_lr(buf, wrap, width, height, 16);
+    } else if (w == 8) {
+        draw_edges_lr(buf, wrap, width, height, 8);
+    } else {
+        av_assert1(w == 4);
+        draw_edges_lr(buf, wrap, width, height, 4);
     }
 
     /* top and bottom + corners */
@@ -142,9 +177,18 @@ static void draw_edges_8_c(uint8_t *buf, int wrap, int width, int height,
             memcpy(last_line + (i + 1) * wrap, last_line, width + w + w);
 }
 
+/* This wrapper function only serves to convert the stride parameters
+ * from ptrdiff_t to int for av_image_copy_plane(). */
+static void copy_plane_wrapper(uint8_t *restrict dst, ptrdiff_t dst_wrap,
+                               const uint8_t *restrict src, ptrdiff_t src_wrap,
+                               int width, int height)
+{
+    av_image_copy_plane(dst, dst_wrap, src, src_wrap, width, height);
+}
+
 /* 2x2 -> 1x1 */
-static void shrink22(uint8_t *dst, int dst_wrap,
-                     const uint8_t *src, int src_wrap,
+static void shrink22(uint8_t *restrict dst, ptrdiff_t dst_wrap,
+                     const uint8_t *restrict src, ptrdiff_t src_wrap,
                      int width, int height)
 {
     int w;
@@ -176,8 +220,8 @@ static void shrink22(uint8_t *dst, int dst_wrap,
 }
 
 /* 4x4 -> 1x1 */
-static void shrink44(uint8_t *dst, int dst_wrap,
-                     const uint8_t *src, int src_wrap,
+static void shrink44(uint8_t *restrict dst, ptrdiff_t dst_wrap,
+                     const uint8_t *restrict src, ptrdiff_t src_wrap,
                      int width, int height)
 {
     int w;
@@ -207,8 +251,8 @@ static void shrink44(uint8_t *dst, int dst_wrap,
 }
 
 /* 8x8 -> 1x1 */
-static void shrink88(uint8_t *dst, int dst_wrap,
-                     const uint8_t *src, int src_wrap,
+static void shrink88(uint8_t *restrict dst, ptrdiff_t dst_wrap,
+                     const uint8_t *restrict src, ptrdiff_t src_wrap,
                      int width, int height)
 {
     int w, i;
@@ -232,10 +276,12 @@ static void shrink88(uint8_t *dst, int dst_wrap,
 av_cold void ff_mpegvideoencdsp_init(MpegvideoEncDSPContext *c,
                                      AVCodecContext *avctx)
 {
+    c->denoise_dct  = denoise_dct_c;
+
     c->try_8x8basis = try_8x8basis_c;
     c->add_8x8basis = add_8x8basis_c;
 
-    c->shrink[0] = av_image_copy_plane;
+    c->shrink[0] = copy_plane_wrapper;
     c->shrink[1] = shrink22;
     c->shrink[2] = shrink44;
     c->shrink[3] = shrink88;
@@ -245,12 +291,17 @@ av_cold void ff_mpegvideoencdsp_init(MpegvideoEncDSPContext *c,
 
     c->draw_edges = draw_edges_8_c;
 
-    if (ARCH_ARM)
-        ff_mpegvideoencdsp_init_arm(c, avctx);
-    if (ARCH_PPC)
-        ff_mpegvideoencdsp_init_ppc(c, avctx);
-    if (ARCH_X86)
-        ff_mpegvideoencdsp_init_x86(c, avctx);
-    if (ARCH_MIPS)
-        ff_mpegvideoencdsp_init_mips(c, avctx);
+#if ARCH_AARCH64
+    ff_mpegvideoencdsp_init_aarch64(c, avctx);
+#elif ARCH_ARM
+    ff_mpegvideoencdsp_init_arm(c, avctx);
+#elif ARCH_PPC
+    ff_mpegvideoencdsp_init_ppc(c, avctx);
+#elif ARCH_RISCV
+    ff_mpegvideoencdsp_init_riscv(c, avctx);
+#elif ARCH_X86
+    ff_mpegvideoencdsp_init_x86(c, avctx);
+#elif ARCH_MIPS
+    ff_mpegvideoencdsp_init_mips(c, avctx);
+#endif
 }

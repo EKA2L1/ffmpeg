@@ -22,8 +22,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 #include "framesync.h"
 
@@ -171,8 +170,8 @@ static int limitdiff_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jo
         const int thr2 = s->thr2;
         const int w = s->planewidth[p];
         const int h = s->planeheight[p];
-        const int slice_start = (h * jobnr) / nb_jobs;
-        const int slice_end = (h * (jobnr+1)) / nb_jobs;
+        const int slice_start = ff_slice_pos(h, jobnr, nb_jobs);
+        const int slice_end = ff_slice_pos(h, jobnr + 1, nb_jobs);
         const uint8_t *filtered = td->filtered->data[p] + slice_start * filtered_linesize;
         const uint8_t *source = td->source->data[p] + slice_start * source_linesize;
         const uint8_t *reference = td->reference->data[p] + slice_start * reference_linesize;
@@ -244,6 +243,8 @@ static int config_output(AVFilterLink *outlink)
     LimitDiffContext *s = ctx->priv;
     AVFilterLink *filtered = ctx->inputs[0];
     AVFilterLink *source = ctx->inputs[1];
+    FilterLink *il = ff_filter_link(filtered);
+    FilterLink *ol = ff_filter_link(outlink);
     FFFrameSyncIn *in;
     int ret;
 
@@ -272,7 +273,7 @@ static int config_output(AVFilterLink *outlink)
     outlink->w = filtered->w;
     outlink->h = filtered->h;
     outlink->sample_aspect_ratio = filtered->sample_aspect_ratio;
-    outlink->frame_rate = filtered->frame_rate;
+    ol->frame_rate = il->frame_rate;
 
     if ((ret = ff_framesync_init(&s->fs, ctx, 2 + !!s->reference)) < 0)
         return ret;
@@ -353,18 +354,18 @@ static const AVFilterPad limitdiff_outputs[] = {
 
 AVFILTER_DEFINE_CLASS(limitdiff);
 
-const AVFilter ff_vf_limitdiff = {
-    .name          = "limitdiff",
-    .description   = NULL_IF_CONFIG_SMALL("Apply filtering with limiting difference."),
-    .priv_class    = &limitdiff_class,
+const FFFilter ff_vf_limitdiff = {
+    .p.name        = "limitdiff",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply filtering with limiting difference."),
+    .p.priv_class  = &limitdiff_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS |
+                     AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size     = sizeof(LimitDiffContext),
     .init          = init,
     .uninit        = uninit,
     .activate      = activate,
     FILTER_OUTPUTS(limitdiff_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
-                     AVFILTER_FLAG_SLICE_THREADS |
-                     AVFILTER_FLAG_DYNAMIC_INPUTS,
     .process_command = ff_filter_process_command,
 };

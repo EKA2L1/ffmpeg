@@ -25,12 +25,25 @@
 #include "encode.h"
 #include "mf_utils.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
+#include "codec_internal.h"
 #include "internal.h"
+#include "compat/w32dlfcn.h"
+#if CONFIG_D3D11VA
+#include "libavutil/hwcontext_d3d11va.h"
+#endif
 
 typedef struct MFContext {
     AVClass *av_class;
+    HMODULE library;
+    HMODULE d3d_dll;
+    ID3D11DeviceContext* d3d_context;
+    IMFDXGIDeviceManager *dxgiManager;
+    int resetToken;
+
+    MFFunctions functions;
     AVFrame *frame;
     int is_video, is_audio;
     GUID main_subtype;
@@ -42,6 +55,7 @@ typedef struct MFContext {
     int out_stream_provides_samples;
     int draining, draining_done;
     int sample_sent;
+    int stream_started;
     int async_need_input, async_have_output, async_marker;
     int64_t reorder_delay;
     ICodecAPI *codec_api;
@@ -50,6 +64,7 @@ typedef struct MFContext {
     int opt_enc_quality;
     int opt_enc_scenario;
     int opt_enc_hw;
+    AVD3D11VADeviceContext* device_hwctx;
 } MFContext;
 
 static int mf_choose_output_type(AVCodecContext *avctx);
@@ -131,6 +146,15 @@ static int64_t mf_sample_get_pts(AVCodecContext *avctx, IMFSample *sample)
     if (FAILED(hr))
         return AV_NOPTS_VALUE;
     return mf_from_mf_time(avctx, pts);
+}
+
+static int64_t mf_sample_get_duration(AVCodecContext *avctx, IMFSample *sample)
+{
+    LONGLONG duration;
+    HRESULT hr = IMFSample_GetSampleDuration(sample, &duration);
+    if (FAILED(hr))
+        return 0;
+    return mf_from_mf_time(avctx, duration);
 }
 
 static int mf_enca_output_type_get(AVCodecContext *avctx, IMFMediaType *type)
@@ -244,7 +268,7 @@ static int mf_sample_to_avpacket(AVCodecContext *avctx, IMFSample *sample, AVPac
     if ((ret = ff_get_encode_buffer(avctx, avpkt, len, 0)) < 0)
         return ret;
 
-    IMFSample_ConvertToContiguousBuffer(sample, &buffer);
+    hr = IMFSample_ConvertToContiguousBuffer(sample, &buffer);
     if (FAILED(hr))
         return AVERROR_EXTERNAL;
 
@@ -260,6 +284,7 @@ static int mf_sample_to_avpacket(AVCodecContext *avctx, IMFSample *sample, AVPac
     IMFMediaBuffer_Release(buffer);
 
     avpkt->pts = avpkt->dts = mf_sample_get_pts(avctx, sample);
+    avpkt->duration = mf_sample_get_duration(avctx, sample);
 
     hr = IMFAttributes_GetUINT32(sample, &MFSampleExtension_CleanPoint, &t32);
     if (c->is_audio || (!FAILED(hr) && t32 != 0))
@@ -281,51 +306,139 @@ static int mf_sample_to_avpacket(AVCodecContext *avctx, IMFSample *sample, AVPac
     return 0;
 }
 
-static IMFSample *mf_a_avframe_to_sample(AVCodecContext *avctx, const AVFrame *frame)
+static int mf_a_avframe_to_sample(AVCodecContext *avctx, const AVFrame *frame, IMFSample **out_sample)
 {
     MFContext *c = avctx->priv_data;
     size_t len;
     size_t bps;
     IMFSample *sample;
 
-    bps = av_get_bytes_per_sample(avctx->sample_fmt) * avctx->channels;
+    bps = av_get_bytes_per_sample(avctx->sample_fmt) * avctx->ch_layout.nb_channels;
     len = frame->nb_samples * bps;
 
-    sample = ff_create_memory_sample(frame->data[0], len, c->in_info.cbAlignment);
-    if (sample)
-        IMFSample_SetSampleDuration(sample, mf_to_mf_time(avctx, frame->nb_samples));
-    return sample;
+    sample = ff_create_memory_sample(&c->functions, frame->data[0], len,
+                                     c->in_info.cbAlignment);
+    if (!sample)
+        return AVERROR(ENOMEM);
+
+    IMFSample_SetSampleDuration(sample, mf_to_mf_time(avctx, frame->nb_samples));
+
+    *out_sample = sample;
+    return 0;
 }
 
-static IMFSample *mf_v_avframe_to_sample(AVCodecContext *avctx, const AVFrame *frame)
+static int initialize_dxgi_manager(AVCodecContext *avctx)
 {
     MFContext *c = avctx->priv_data;
-    IMFSample *sample;
-    IMFMediaBuffer *buffer;
-    BYTE *data;
+    MFFunctions *func = &c->functions;
     HRESULT hr;
-    int ret;
-    int size;
+
+    hr = func->MFCreateDXGIDeviceManager(&c->resetToken, &c->dxgiManager);
+    if (FAILED(hr)) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create DXGI device manager: %s\n", ff_hr_str(hr));
+        return AVERROR_EXTERNAL;
+    }
+
+    hr = IMFDXGIDeviceManager_ResetDevice(c->dxgiManager, (IUnknown*)c->device_hwctx->device, c->resetToken);
+    if (FAILED(hr)) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to reset device: %s\n", ff_hr_str(hr));
+        return AVERROR_EXTERNAL;
+    }
+
+    hr = IMFTransform_ProcessMessage(c->mft, MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)c->dxgiManager);
+    if (FAILED(hr)) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to set D3D manager: %s\n", ff_hr_str(hr));
+        return AVERROR_EXTERNAL;
+    }
+
+    return 0;
+}
+
+static int process_d3d11_frame(AVCodecContext *avctx, const AVFrame *frame, IMFSample **out_sample)
+{
+    MFContext *c = avctx->priv_data;
+    MFFunctions *func = &c->functions;
+    AVHWFramesContext *frames_ctx = NULL;
+    ID3D11Texture2D *d3d11_texture = NULL;
+    IMFSample *sample = NULL;
+    IMFMediaBuffer *buffer = NULL;
+    int subIdx = 0;
+    HRESULT hr;
+
+    frames_ctx = (AVHWFramesContext*)frame->hw_frames_ctx->data;
+    c->device_hwctx = (AVD3D11VADeviceContext*)frames_ctx->device_ctx->hwctx;
+
+    if (!c->dxgiManager) {
+        hr = initialize_dxgi_manager(avctx);
+        if (FAILED(hr)) {
+            return AVERROR_EXTERNAL;
+        }
+    }
+
+    d3d11_texture = (ID3D11Texture2D*)frame->data[0];
+    subIdx = (int)(intptr_t)frame->data[1];
+
+    if (!d3d11_texture) {
+        av_log(avctx, AV_LOG_ERROR, "D3D11 texture not found\n");
+        return AVERROR(EINVAL);
+    }
+
+    hr = func->MFCreateSample(&sample);
+    if (FAILED(hr)) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create MF sample: %s\n", ff_hr_str(hr));
+        return AVERROR_EXTERNAL;
+    }
+
+    hr = func->MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown*)d3d11_texture, subIdx, 0, &buffer);
+    if (FAILED(hr)) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create DXGI surface buffer: %s\n", ff_hr_str(hr));
+        IMFSample_Release(sample);
+        return AVERROR_EXTERNAL;
+    }
+
+    hr = IMFSample_AddBuffer(sample, buffer);
+    if (FAILED(hr)) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to add buffer to sample: %s\n", ff_hr_str(hr));
+        IMFMediaBuffer_Release(buffer);
+        IMFSample_Release(sample);
+        return AVERROR_EXTERNAL;
+    }
+
+    IMFMediaBuffer_Release(buffer);
+
+    *out_sample = sample;
+    return 0;
+}
+
+static int process_software_frame(AVCodecContext *avctx, const AVFrame *frame, IMFSample **out_sample)
+{
+    MFContext *c = avctx->priv_data;
+    IMFSample *sample = NULL;
+    IMFMediaBuffer *buffer = NULL;
+    BYTE *data = NULL;
+    HRESULT hr;
+    int size, ret;
 
     size = av_image_get_buffer_size(avctx->pix_fmt, avctx->width, avctx->height, 1);
     if (size < 0)
-        return NULL;
+        return size;
 
-    sample = ff_create_memory_sample(NULL, size, c->in_info.cbAlignment);
+    sample = ff_create_memory_sample(&c->functions, NULL, size,
+                                     c->in_info.cbAlignment);
     if (!sample)
-        return NULL;
+        return AVERROR_EXTERNAL;
 
     hr = IMFSample_GetBufferByIndex(sample, 0, &buffer);
     if (FAILED(hr)) {
         IMFSample_Release(sample);
-        return NULL;
+        return AVERROR_EXTERNAL;
     }
 
     hr = IMFMediaBuffer_Lock(buffer, &data, NULL, NULL);
     if (FAILED(hr)) {
         IMFMediaBuffer_Release(buffer);
         IMFSample_Release(sample);
-        return NULL;
+        return AVERROR_EXTERNAL;
     }
 
     ret = av_image_copy_to_buffer((uint8_t *)data, size, (void *)frame->data, frame->linesize,
@@ -335,29 +448,63 @@ static IMFSample *mf_v_avframe_to_sample(AVCodecContext *avctx, const AVFrame *f
     IMFMediaBuffer_Release(buffer);
     if (ret < 0) {
         IMFSample_Release(sample);
-        return NULL;
+        return ret;
     }
 
-    IMFSample_SetSampleDuration(sample, mf_to_mf_time(avctx, frame->pkt_duration));
+    IMFSample_SetSampleDuration(sample, mf_to_mf_time(avctx, frame->duration));
+    *out_sample = sample;
 
-    return sample;
+    return 0;
 }
 
-static IMFSample *mf_avframe_to_sample(AVCodecContext *avctx, const AVFrame *frame)
+static int mf_v_avframe_to_sample(AVCodecContext *avctx, const AVFrame *frame, IMFSample **out_sample)
+{
+    IMFSample *sample = NULL;
+    HRESULT hr;
+    int ret;
+
+    if (frame->format == AV_PIX_FMT_D3D11) {
+        // Handle D3D11 hardware frames
+        ret = process_d3d11_frame(avctx, frame, &sample);
+        if (ret < 0) {
+            return ret;
+        }
+    } else {
+        // Handle software frames
+        ret = process_software_frame(avctx, frame, &sample);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    // Set sample duration
+    hr = IMFSample_SetSampleDuration(sample, mf_to_mf_time(avctx, frame->duration));
+    if (FAILED(hr)) {
+        av_log(avctx, AV_LOG_WARNING, "Failed to set sample duration: %s\n", ff_hr_str(hr));
+    }
+
+    *out_sample = sample;
+    return 0;
+}
+
+static int mf_avframe_to_sample(AVCodecContext *avctx, const AVFrame *frame, IMFSample **out_sample)
 {
     MFContext *c = avctx->priv_data;
     IMFSample *sample;
+    int ret;
 
     if (c->is_audio) {
-        sample = mf_a_avframe_to_sample(avctx, frame);
+        ret = mf_a_avframe_to_sample(avctx, frame, &sample);
     } else {
-        sample = mf_v_avframe_to_sample(avctx, frame);
+        ret = mf_v_avframe_to_sample(avctx, frame, &sample);
     }
 
-    if (sample)
-        mf_sample_set_pts(avctx, sample, frame->pts);
+    if (ret < 0)
+        return ret;
 
-    return sample;
+    mf_sample_set_pts(avctx, sample, frame->pts);
+    *out_sample = sample;
+    return 0;
 }
 
 static int mf_send_sample(AVCodecContext *avctx, IMFSample *sample)
@@ -421,7 +568,9 @@ static int mf_receive_sample(AVCodecContext *avctx, IMFSample **out_sample)
         }
 
         if (!c->out_stream_provides_samples) {
-            sample = ff_create_memory_sample(NULL, c->out_info.cbSize, c->out_info.cbAlignment);
+            sample = ff_create_memory_sample(&c->functions, NULL,
+                                             c->out_info.cbSize,
+                                             c->out_info.cbAlignment);
             if (!sample)
                 return AVERROR(ENOMEM);
         }
@@ -491,15 +640,32 @@ static int mf_receive_packet(AVCodecContext *avctx, AVPacket *avpkt)
     }
 
     if (c->frame->buf[0]) {
-        sample = mf_avframe_to_sample(avctx, c->frame);
-        if (!sample) {
+        ret = mf_avframe_to_sample(avctx, c->frame, &sample);
+        if (ret < 0) {
             av_frame_unref(c->frame);
-            return AVERROR(ENOMEM);
+            return ret;
         }
         if (c->is_video && c->codec_api) {
             if (c->frame->pict_type == AV_PICTURE_TYPE_I || !c->sample_sent)
                 ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncVideoForceKeyFrame, FF_VAL_VT_UI4(1));
         }
+    }
+
+    if(!c->stream_started)
+    {
+        HRESULT hr = IMFTransform_ProcessMessage(c->mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+        if (FAILED(hr)) {
+            av_log(avctx, AV_LOG_ERROR, "could not start streaming (%s)\n", ff_hr_str(hr));
+            return AVERROR(EBADMSG);
+        }
+
+        hr = IMFTransform_ProcessMessage(c->mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+        if (FAILED(hr)) {
+            av_log(avctx, AV_LOG_ERROR, "could not start stream (%s)\n", ff_hr_str(hr));
+            return AVERROR(EBADMSG);
+        }
+
+        c->stream_started = 1;
     }
 
     ret = mf_send_sample(avctx, sample);
@@ -536,7 +702,7 @@ static int64_t mf_enca_output_score(AVCodecContext *avctx, IMFMediaType *type)
         score |= 1LL << 32;
 
     hr = IMFAttributes_GetUINT32(type, &MF_MT_AUDIO_NUM_CHANNELS, &t);
-    if (!FAILED(hr) && t == avctx->channels)
+    if (!FAILED(hr) && t == avctx->ch_layout.nb_channels)
         score |= 2LL << 32;
 
     hr = IMFAttributes_GetGUID(type, &MF_MT_SUBTYPE, &tg);
@@ -591,7 +757,7 @@ static int64_t mf_enca_input_score(AVCodecContext *avctx, IMFMediaType *type)
         score |= 2;
 
     hr = IMFAttributes_GetUINT32(type, &MF_MT_AUDIO_NUM_CHANNELS, &t);
-    if (!FAILED(hr) && t == avctx->channels)
+    if (!FAILED(hr) && t == avctx->ch_layout.nb_channels)
         score |= 4;
 
     return score;
@@ -615,7 +781,7 @@ static int mf_enca_input_adjust(AVCodecContext *avctx, IMFMediaType *type)
     }
 
     hr = IMFAttributes_GetUINT32(type, &MF_MT_AUDIO_NUM_CHANNELS, &t);
-    if (FAILED(hr) || t != avctx->channels) {
+    if (FAILED(hr) || t != avctx->ch_layout.nb_channels) {
         av_log(avctx, AV_LOG_ERROR, "unsupported input channel number set\n");
         return AVERROR(EINVAL);
     }
@@ -651,7 +817,6 @@ static int mf_encv_output_adjust(AVCodecContext *avctx, IMFMediaType *type)
         framerate = avctx->framerate;
     } else {
         framerate = av_inv_q(avctx->time_base);
-        framerate.den *= avctx->ticks_per_frame;
     }
 
     ff_MFSetAttributeRatio((IMFAttributes *)type, &MF_MT_FRAME_RATE, framerate.num, framerate.den);
@@ -660,10 +825,10 @@ static int mf_encv_output_adjust(AVCodecContext *avctx, IMFMediaType *type)
     if (avctx->codec_id == AV_CODEC_ID_H264) {
         UINT32 profile = ff_eAVEncH264VProfile_Base;
         switch (avctx->profile) {
-        case FF_PROFILE_H264_MAIN:
+        case AV_PROFILE_H264_MAIN:
             profile = ff_eAVEncH264VProfile_Main;
             break;
-        case FF_PROFILE_H264_HIGH:
+        case AV_PROFILE_H264_HIGH:
             profile = ff_eAVEncH264VProfile_High;
             break;
         }
@@ -683,6 +848,21 @@ static int mf_encv_output_adjust(AVCodecContext *avctx, IMFMediaType *type)
         if (c->opt_enc_quality >= 0)
             ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncCommonQuality, FF_VAL_VT_UI4(c->opt_enc_quality));
 
+        if (avctx->rc_max_rate > 0)
+            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncCommonMaxBitRate, FF_VAL_VT_UI4(avctx->rc_max_rate));
+
+        if (avctx->gop_size > 0)
+            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncMPVGOPSize, FF_VAL_VT_UI4(avctx->gop_size));
+
+        if(avctx->rc_buffer_size > 0)
+            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncCommonBufferSize, FF_VAL_VT_UI4(avctx->rc_buffer_size));
+
+        if(avctx->compression_level >= 0)
+            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncCommonQualityVsSpeed, FF_VAL_VT_UI4(avctx->compression_level));
+
+        if(avctx->global_quality > 0)
+            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVEncVideoEncodeQP, FF_VAL_VT_UI4(avctx->global_quality ));
+
         // Always set the number of b-frames. Qualcomm's HEVC encoder on SD835
         // defaults this to 1, and that setting is buggy with many of the
         // rate control modes. (0 or 2 b-frames works fine with most rate
@@ -696,6 +876,9 @@ static int mf_encv_output_adjust(AVCodecContext *avctx, IMFMediaType *type)
 
         if (c->opt_enc_scenario >= 0)
             ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVScenarioInfo, FF_VAL_VT_UI4(c->opt_enc_scenario));
+
+        if (avctx->flags & AV_CODEC_FLAG_LOW_DELAY)
+            ICodecAPI_SetValue(c->codec_api, &ff_CODECAPI_AVLowLatencyMode, FF_VAL_VT_UI4(1));
     }
 
     return 0;
@@ -704,8 +887,16 @@ static int mf_encv_output_adjust(AVCodecContext *avctx, IMFMediaType *type)
 static int64_t mf_encv_input_score(AVCodecContext *avctx, IMFMediaType *type)
 {
     enum AVPixelFormat pix_fmt = ff_media_type_to_pix_fmt((IMFAttributes *)type);
-    if (pix_fmt != avctx->pix_fmt)
-        return -1; // can not use
+
+    if (avctx->pix_fmt == AV_PIX_FMT_D3D11) {
+        if (pix_fmt != AV_PIX_FMT_NV12) {
+            return -1; // can not use
+        }
+    }
+    else {
+        if (pix_fmt != avctx->pix_fmt)
+            return -1; // can not use
+    }
 
     return 0;
 }
@@ -713,12 +904,30 @@ static int64_t mf_encv_input_score(AVCodecContext *avctx, IMFMediaType *type)
 static int mf_encv_input_adjust(AVCodecContext *avctx, IMFMediaType *type)
 {
     enum AVPixelFormat pix_fmt = ff_media_type_to_pix_fmt((IMFAttributes *)type);
-    if (pix_fmt != avctx->pix_fmt) {
-        av_log(avctx, AV_LOG_ERROR, "unsupported input pixel format set\n");
-        return AVERROR(EINVAL);
+    AVRational framerate;
+
+    if (avctx->pix_fmt == AV_PIX_FMT_D3D11) {
+        if (pix_fmt != AV_PIX_FMT_NV12 && pix_fmt != AV_PIX_FMT_D3D11) {
+            av_log(avctx, AV_LOG_ERROR, "unsupported input pixel format set\n");
+            return AVERROR(EINVAL);
+        }
+    } else {
+        if (pix_fmt != avctx->pix_fmt) {
+            av_log(avctx, AV_LOG_ERROR, "unsupported input pixel format set\n");
+            return AVERROR(EINVAL);
+        }
     }
 
-    //ff_MFSetAttributeSize((IMFAttributes *)type, &MF_MT_FRAME_SIZE, avctx->width, avctx->height);
+    ff_MFSetAttributeSize((IMFAttributes *)type, &MF_MT_FRAME_SIZE, avctx->width, avctx->height);
+    IMFAttributes_SetUINT32(type, &MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+
+    if (avctx->framerate.num > 0 && avctx->framerate.den > 0) {
+        framerate = avctx->framerate;
+    } else {
+        framerate = av_inv_q(avctx->time_base);
+    }
+
+    ff_MFSetAttributeRatio((IMFAttributes *)type, &MF_MT_FRAME_RATE, framerate.num, framerate.den);
 
     return 0;
 }
@@ -776,7 +985,7 @@ static int mf_choose_output_type(AVCodecContext *avctx)
     if (out_type) {
         av_log(avctx, AV_LOG_VERBOSE, "picking output type %d.\n", out_type_index);
     } else {
-        hr = MFCreateMediaType(&out_type);
+        hr = c->functions.MFCreateMediaType(&out_type);
         if (FAILED(hr)) {
             ret = AVERROR(ENOMEM);
             goto done;
@@ -1004,7 +1213,8 @@ err:
     return res;
 }
 
-static int mf_create(void *log, IMFTransform **mft, const AVCodec *codec, int use_hw)
+static int mf_create(void *log, MFFunctions *f, IMFTransform **mft,
+                     const AVCodec *codec, int use_hw)
 {
     int is_audio = codec->type == AVMEDIA_TYPE_AUDIO;
     const CLSID *subtype = ff_codec_to_mf_subtype(codec->id);
@@ -1027,13 +1237,13 @@ static int mf_create(void *log, IMFTransform **mft, const AVCodec *codec, int us
         category = MFT_CATEGORY_VIDEO_ENCODER;
     }
 
-    if ((ret = ff_instantiate_mf(log, category, NULL, &reg, use_hw, mft)) < 0)
+    if ((ret = ff_instantiate_mf(log, f, category, NULL, &reg, use_hw, mft)) < 0)
         return ret;
 
     return 0;
 }
 
-static int mf_init(AVCodecContext *avctx)
+static int mf_init_encoder(AVCodecContext *avctx)
 {
     MFContext *c = avctx->priv_data;
     HRESULT hr;
@@ -1057,7 +1267,7 @@ static int mf_init(AVCodecContext *avctx)
 
     c->main_subtype = *subtype;
 
-    if ((ret = mf_create(avctx, &c->mft, avctx->codec, use_hw)) < 0)
+    if ((ret = mf_create(avctx, &c->functions, &c->mft, avctx->codec, use_hw)) < 0)
         return ret;
 
     if ((ret = mf_unlock_async(avctx)) < 0)
@@ -1081,18 +1291,6 @@ static int mf_init(AVCodecContext *avctx)
 
     if ((ret = mf_setup_context(avctx)) < 0)
         return ret;
-
-    hr = IMFTransform_ProcessMessage(c->mft, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
-    if (FAILED(hr)) {
-        av_log(avctx, AV_LOG_ERROR, "could not start streaming (%s)\n", ff_hr_str(hr));
-        return AVERROR_EXTERNAL;
-    }
-
-    hr = IMFTransform_ProcessMessage(c->mft, MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
-    if (FAILED(hr)) {
-        av_log(avctx, AV_LOG_ERROR, "could not start stream (%s)\n", ff_hr_str(hr));
-        return AVERROR_EXTERNAL;
-    }
 
     if (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER && c->async_events &&
         c->is_video && !avctx->extradata) {
@@ -1121,6 +1319,57 @@ static int mf_init(AVCodecContext *avctx)
     return 0;
 }
 
+#if !HAVE_UWP
+#define LOAD_MF_FUNCTION(context, func_name) \
+    context->functions.func_name = (void *)dlsym(context->library, #func_name); \
+    if (!context->functions.func_name) { \
+        av_log(context, AV_LOG_ERROR, "DLL mfplat.dll failed to find function "\
+           #func_name "\n"); \
+        return AVERROR_UNKNOWN; \
+    }
+#else
+// In UWP (which lacks LoadLibrary), just link directly against
+// the functions - this requires building with new/complete enough
+// import libraries.
+#define LOAD_MF_FUNCTION(context, func_name) \
+    context->functions.func_name = func_name; \
+    if (!context->functions.func_name) { \
+        av_log(context, AV_LOG_ERROR, "Failed to find function " #func_name \
+               "\n"); \
+        return AVERROR_UNKNOWN; \
+    }
+#endif
+
+// Windows N editions does not provide MediaFoundation by default.
+// So to avoid DLL loading error, MediaFoundation is dynamically loaded except
+// on UWP build since LoadLibrary is not available on it.
+static int mf_load_library(AVCodecContext *avctx)
+{
+    MFContext *c = avctx->priv_data;
+
+#if !HAVE_UWP
+    c->library = dlopen("mfplat.dll", 0);
+    c->d3d_dll = dlopen("D3D11.dll", 0);
+
+    if (!c->library) {
+        av_log(c, AV_LOG_ERROR, "DLL mfplat.dll failed to open\n");
+        return AVERROR_UNKNOWN;
+    }
+#endif
+
+    LOAD_MF_FUNCTION(c, MFStartup);
+    LOAD_MF_FUNCTION(c, MFShutdown);
+    LOAD_MF_FUNCTION(c, MFCreateAlignedMemoryBuffer);
+    LOAD_MF_FUNCTION(c, MFCreateSample);
+    LOAD_MF_FUNCTION(c, MFCreateMediaType);
+    LOAD_MF_FUNCTION(c, MFCreateDXGISurfaceBuffer);
+    LOAD_MF_FUNCTION(c, MFCreateDXGIDeviceManager);
+    // MFTEnumEx is missing in Windows Vista's mfplat.dll.
+    LOAD_MF_FUNCTION(c, MFTEnumEx);
+
+    return 0;
+}
+
 static int mf_close(AVCodecContext *avctx)
 {
     MFContext *c = avctx->priv_data;
@@ -1131,7 +1380,19 @@ static int mf_close(AVCodecContext *avctx)
     if (c->async_events)
         IMFMediaEventGenerator_Release(c->async_events);
 
-    ff_free_mf(&c->mft);
+    if (c->dxgiManager)
+        IMFDXGIDeviceManager_Release(c->dxgiManager);
+
+#if !HAVE_UWP
+    if (c->library)
+        ff_free_mf(&c->functions, &c->mft);
+
+    dlclose(c->library);
+    dlclose(c->d3d_dll);
+    c->library = NULL;
+#else
+    ff_free_mf(&c->functions, &c->mft);
+#endif
 
     av_frame_free(&c->frame);
 
@@ -1141,71 +1402,90 @@ static int mf_close(AVCodecContext *avctx)
     return 0;
 }
 
+static av_cold int mf_init(AVCodecContext *avctx)
+{
+    int ret;
+    if ((ret = mf_load_library(avctx)) == 0) {
+           if ((ret = mf_init_encoder(avctx)) == 0) {
+                return 0;
+        }
+    }
+    return ret;
+}
+
 #define OFFSET(x) offsetof(MFContext, x)
 
-#define MF_ENCODER(MEDIATYPE, NAME, ID, OPTS, EXTRA) \
+#define MF_ENCODER(MEDIATYPE, NAME, ID, OPTS, FMTS, CAPS, DEFAULTS) \
     static const AVClass ff_ ## NAME ## _mf_encoder_class = {                  \
         .class_name = #NAME "_mf",                                             \
         .item_name  = av_default_item_name,                                    \
         .option     = OPTS,                                                    \
         .version    = LIBAVUTIL_VERSION_INT,                                   \
     };                                                                         \
-    const AVCodec ff_ ## NAME ## _mf_encoder = {                               \
-        .priv_class     = &ff_ ## NAME ## _mf_encoder_class,                   \
-        .name           = #NAME "_mf",                                         \
-        .long_name      = NULL_IF_CONFIG_SMALL(#ID " via MediaFoundation"),    \
-        .type           = AVMEDIA_TYPE_ ## MEDIATYPE,                          \
-        .id             = AV_CODEC_ID_ ## ID,                                  \
+    const FFCodec ff_ ## NAME ## _mf_encoder = {                               \
+        .p.priv_class   = &ff_ ## NAME ## _mf_encoder_class,                   \
+        .p.name         = #NAME "_mf",                                         \
+        CODEC_LONG_NAME(#ID " via MediaFoundation"),                           \
+        .p.type         = AVMEDIA_TYPE_ ## MEDIATYPE,                          \
+        .p.id           = AV_CODEC_ID_ ## ID,                                  \
         .priv_data_size = sizeof(MFContext),                                   \
         .init           = mf_init,                                             \
         .close          = mf_close,                                            \
-        .receive_packet = mf_receive_packet,                                   \
-        EXTRA                                                                  \
-        .capabilities   = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HYBRID |           \
-                          AV_CODEC_CAP_DR1,                                    \
-        .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |                       \
-                          FF_CODEC_CAP_INIT_CLEANUP,                           \
+        FF_CODEC_RECEIVE_PACKET_CB(mf_receive_packet),                         \
+        FMTS                                                                   \
+        CAPS                                                                   \
+        .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,                           \
+        .defaults       = DEFAULTS,                                            \
     };
 
 #define AFMTS \
-        .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,    \
-                                                         AV_SAMPLE_FMT_NONE },
+        CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16),
+#define ACAPS \
+        .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HYBRID |           \
+                          AV_CODEC_CAP_DR1 | AV_CODEC_CAP_VARIABLE_FRAME_SIZE,
 
-MF_ENCODER(AUDIO, aac,         AAC, NULL, AFMTS);
-MF_ENCODER(AUDIO, ac3,         AC3, NULL, AFMTS);
-MF_ENCODER(AUDIO, mp3,         MP3, NULL, AFMTS);
+MF_ENCODER(AUDIO, aac,         AAC, NULL, AFMTS, ACAPS, NULL);
+MF_ENCODER(AUDIO, ac3,         AC3, NULL, AFMTS, ACAPS, NULL);
+MF_ENCODER(AUDIO, mp3,         MP3, NULL, AFMTS, ACAPS, NULL);
 
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption venc_opts[] = {
-    {"rate_control",  "Select rate control mode", OFFSET(opt_enc_rc), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VE, "rate_control"},
-    { "default",      "Default mode", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, VE, "rate_control"},
-    { "cbr",          "CBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_CBR}, 0, 0, VE, "rate_control"},
-    { "pc_vbr",       "Peak constrained VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_PeakConstrainedVBR}, 0, 0, VE, "rate_control"},
-    { "u_vbr",        "Unconstrained VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_UnconstrainedVBR}, 0, 0, VE, "rate_control"},
-    { "quality",      "Quality mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_Quality}, 0, 0, VE, "rate_control" },
+    {"rate_control",  "Select rate control mode", OFFSET(opt_enc_rc), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VE, .unit = "rate_control"},
+    { "default",      "Default mode", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, VE, .unit = "rate_control"},
+    { "cbr",          "CBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_CBR}, 0, 0, VE, .unit = "rate_control"},
+    { "pc_vbr",       "Peak constrained VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_PeakConstrainedVBR}, 0, 0, VE, .unit = "rate_control"},
+    { "u_vbr",        "Unconstrained VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_UnconstrainedVBR}, 0, 0, VE, .unit = "rate_control"},
+    { "quality",      "Quality mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_Quality}, 0, 0, VE, .unit = "rate_control" },
     // The following rate_control modes require Windows 8.
-    { "ld_vbr",       "Low delay VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_LowDelayVBR}, 0, 0, VE, "rate_control"},
-    { "g_vbr",        "Global VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_GlobalVBR}, 0, 0, VE, "rate_control" },
-    { "gld_vbr",      "Global low delay VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_GlobalLowDelayVBR}, 0, 0, VE, "rate_control"},
+    { "ld_vbr",       "Low delay VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_LowDelayVBR}, 0, 0, VE, .unit = "rate_control"},
+    { "g_vbr",        "Global VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_GlobalVBR}, 0, 0, VE, .unit = "rate_control" },
+    { "gld_vbr",      "Global low delay VBR mode", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVEncCommonRateControlMode_GlobalLowDelayVBR}, 0, 0, VE, .unit = "rate_control"},
 
-    {"scenario",          "Select usage scenario", OFFSET(opt_enc_scenario), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VE, "scenario"},
-    { "default",          "Default scenario", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, VE, "scenario"},
-    { "display_remoting", "Display remoting", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_DisplayRemoting}, 0, 0, VE, "scenario"},
-    { "video_conference", "Video conference", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_VideoConference}, 0, 0, VE, "scenario"},
-    { "archive",          "Archive", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_Archive}, 0, 0, VE, "scenario"},
-    { "live_streaming",   "Live streaming", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_LiveStreaming}, 0, 0, VE, "scenario"},
-    { "camera_record",    "Camera record", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_CameraRecord}, 0, 0, VE, "scenario"},
-    { "display_remoting_with_feature_map", "Display remoting with feature map", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_DisplayRemotingWithFeatureMap}, 0, 0, VE, "scenario"},
+    {"scenario",          "Select usage scenario", OFFSET(opt_enc_scenario), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VE, .unit = "scenario"},
+    { "default",          "Default scenario", 0, AV_OPT_TYPE_CONST, {.i64 = -1}, 0, 0, VE, .unit = "scenario"},
+    { "display_remoting", "Display remoting", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_DisplayRemoting}, 0, 0, VE, .unit = "scenario"},
+    { "video_conference", "Video conference", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_VideoConference}, 0, 0, VE, .unit = "scenario"},
+    { "archive",          "Archive", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_Archive}, 0, 0, VE, .unit = "scenario"},
+    { "live_streaming",   "Live streaming", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_LiveStreaming}, 0, 0, VE, .unit = "scenario"},
+    { "camera_record",    "Camera record", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_CameraRecord}, 0, 0, VE, .unit = "scenario"},
+    { "display_remoting_with_feature_map", "Display remoting with feature map", 0, AV_OPT_TYPE_CONST, {.i64 = ff_eAVScenarioInfo_DisplayRemotingWithFeatureMap}, 0, 0, VE, .unit = "scenario"},
 
     {"quality",       "Quality", OFFSET(opt_enc_quality), AV_OPT_TYPE_INT, {.i64 = -1}, -1, 100, VE},
     {"hw_encoding",   "Force hardware encoding", OFFSET(opt_enc_hw), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VE},
     {NULL}
 };
 
-#define VFMTS \
-        .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_NV12,       \
-                                                        AV_PIX_FMT_YUV420P,    \
-                                                        AV_PIX_FMT_NONE },
+static const FFCodecDefault defaults[] = {
+    { "g", "0" },
+    { NULL },
+};
 
-MF_ENCODER(VIDEO, h264,        H264, venc_opts, VFMTS);
-MF_ENCODER(VIDEO, hevc,        HEVC, venc_opts, VFMTS);
+#define VFMTS \
+        CODEC_PIXFMTS(AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_D3D11),
+#define VCAPS \
+        .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HYBRID |           \
+                          AV_CODEC_CAP_DR1,
+
+MF_ENCODER(VIDEO, h264,        H264, venc_opts, VFMTS, VCAPS, defaults);
+MF_ENCODER(VIDEO, hevc,        HEVC, venc_opts, VFMTS, VCAPS, defaults);
+MF_ENCODER(VIDEO, av1,         AV1,  venc_opts, VFMTS, VCAPS, defaults);

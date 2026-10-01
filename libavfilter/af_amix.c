@@ -37,14 +37,13 @@
 #include "libavutil/eval.h"
 #include "libavutil/float_dsp.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/samplefmt.h"
 
 #include "audio.h"
 #include "avfilter.h"
 #include "filters.h"
-#include "formats.h"
-#include "internal.h"
 
 #define INPUT_ON       1    /**< input is active */
 #define INPUT_EOF      2    /**< input has reached EOF (may still be active) */
@@ -187,10 +186,10 @@ static const AVOption amix_options[] = {
     { "inputs", "Number of inputs.",
             OFFSET(nb_inputs), AV_OPT_TYPE_INT, { .i64 = 2 }, 1, INT16_MAX, A|F },
     { "duration", "How to determine the end-of-stream.",
-            OFFSET(duration_mode), AV_OPT_TYPE_INT, { .i64 = DURATION_LONGEST }, 0,  2, A|F, "duration" },
-        { "longest",  "Duration of longest input.",  0, AV_OPT_TYPE_CONST, { .i64 = DURATION_LONGEST  }, 0, 0, A|F, "duration" },
-        { "shortest", "Duration of shortest input.", 0, AV_OPT_TYPE_CONST, { .i64 = DURATION_SHORTEST }, 0, 0, A|F, "duration" },
-        { "first",    "Duration of first input.",    0, AV_OPT_TYPE_CONST, { .i64 = DURATION_FIRST    }, 0, 0, A|F, "duration" },
+            OFFSET(duration_mode), AV_OPT_TYPE_INT, { .i64 = DURATION_LONGEST }, 0,  2, A|F, .unit = "duration" },
+        { "longest",  "Duration of longest input.",  0, AV_OPT_TYPE_CONST, { .i64 = DURATION_LONGEST  }, 0, 0, A|F, .unit = "duration" },
+        { "shortest", "Duration of shortest input.", 0, AV_OPT_TYPE_CONST, { .i64 = DURATION_SHORTEST }, 0, 0, A|F, .unit = "duration" },
+        { "first",    "Duration of first input.",    0, AV_OPT_TYPE_CONST, { .i64 = DURATION_FIRST    }, 0, 0, A|F, .unit = "duration" },
     { "dropout_transition", "Transition time, in seconds, for volume "
                             "renormalization when an input stream ends.",
             OFFSET(dropout_transition), AV_OPT_TYPE_FLOAT, { .dbl = 2.0 }, 0, INT_MAX, A|F },
@@ -261,7 +260,7 @@ static int config_output(AVFilterLink *outlink)
     if (!s->fifos)
         return AVERROR(ENOMEM);
 
-    s->nb_channels = outlink->channels;
+    s->nb_channels = outlink->ch_layout.nb_channels;
     for (i = 0; i < s->nb_inputs; i++) {
         s->fifos[i] = av_audio_fifo_alloc(outlink->format, s->nb_channels, 1024);
         if (!s->fifos[i])
@@ -282,7 +281,7 @@ static int config_output(AVFilterLink *outlink)
         s->scale_norm[i] = s->weight_sum / FFABS(s->weights[i]);
     calculate_scales(s, 0);
 
-    av_get_channel_layout_string(buf, sizeof(buf), -1, outlink->channel_layout);
+    av_channel_layout_describe(&outlink->ch_layout, buf, sizeof(buf));
 
     av_log(ctx, AV_LOG_VERBOSE,
            "inputs:%d fmt:%s srate:%d cl:%s\n", s->nb_inputs,
@@ -380,6 +379,9 @@ static int output_frame(AVFilterLink *outlink)
     av_frame_free(&in_buf);
 
     out_buf->pts = s->next_pts;
+    out_buf->duration = av_rescale_q(out_buf->nb_samples, av_make_q(1, outlink->sample_rate),
+                                     outlink->time_base);
+
     if (s->next_pts != AV_NOPTS_VALUE)
         s->next_pts += nb_samples;
 
@@ -395,6 +397,8 @@ static int request_samples(AVFilterContext *ctx, int min_samples)
     int i;
 
     av_assert0(s->nb_inputs > 1);
+    if (min_samples == 1 && s->duration_mode == DURATION_FIRST)
+        min_samples = av_audio_fifo_size(s->fifos[0]);
 
     for (i = 1; i < s->nb_inputs; i++) {
         if (!(s->input_state[i] & INPUT_ON) ||
@@ -403,6 +407,7 @@ static int request_samples(AVFilterContext *ctx, int min_samples)
         if (av_audio_fifo_size(s->fifos[i]) >= min_samples)
             continue;
         ff_inlink_request_frame(ctx->inputs[i]);
+        return 0;
     }
     return output_frame(ctx->outputs[0]);
 }
@@ -472,16 +477,12 @@ static int activate(AVFilterContext *ctx)
 
         if (ff_inlink_acknowledge_status(ctx->inputs[i], &status, &pts)) {
             if (status == AVERROR_EOF) {
-                if (i == 0) {
-                    s->input_state[i] = 0;
+                s->input_state[i] |= INPUT_EOF;
+                if (av_audio_fifo_size(s->fifos[i]) == 0) {
+                    s->input_state[i] &= ~INPUT_ON;
                     if (s->nb_inputs == 1) {
                         ff_outlink_set_status(outlink, status, pts);
                         return 0;
-                    }
-                } else {
-                    s->input_state[i] |= INPUT_EOF;
-                    if (av_audio_fifo_size(s->fifos[i]) == 0) {
-                        s->input_state[i] = 0;
                     }
                 }
             }
@@ -615,18 +616,18 @@ static const AVFilterPad avfilter_af_amix_outputs[] = {
     },
 };
 
-const AVFilter ff_af_amix = {
-    .name           = "amix",
-    .description    = NULL_IF_CONFIG_SMALL("Audio mixing."),
+const FFFilter ff_af_amix = {
+    .p.name         = "amix",
+    .p.description  = NULL_IF_CONFIG_SMALL("Audio mixing."),
+    .p.priv_class   = &amix_class,
+    .p.inputs       = NULL,
+    .p.flags        = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size      = sizeof(MixContext),
-    .priv_class     = &amix_class,
     .init           = init,
     .uninit         = uninit,
     .activate       = activate,
-    .inputs         = NULL,
     FILTER_OUTPUTS(avfilter_af_amix_outputs),
     FILTER_SAMPLEFMTS(AV_SAMPLE_FMT_FLT, AV_SAMPLE_FMT_FLTP,
                       AV_SAMPLE_FMT_DBL, AV_SAMPLE_FMT_DBLP),
     .process_command = process_command,
-    .flags          = AVFILTER_FLAG_DYNAMIC_INPUTS,
 };

@@ -20,6 +20,7 @@
  */
 
 #include "libavutil/avassert.h"
+#include "libavutil/mem.h"
 #include "framequeue.h"
 
 static inline FFFrameBucket *bucket(FFFrameQueue *fq, size_t idx)
@@ -29,6 +30,8 @@ static inline FFFrameBucket *bucket(FFFrameQueue *fq, size_t idx)
 
 void ff_framequeue_global_init(FFFrameQueueGlobal *fqg)
 {
+    fqg->max_queued = SIZE_MAX;
+    fqg->queued = 0;
 }
 
 static void check_consistency(FFFrameQueue *fq)
@@ -48,6 +51,7 @@ void ff_framequeue_init(FFFrameQueue *fq, FFFrameQueueGlobal *fqg)
 {
     fq->queue = &fq->first_bucket;
     fq->allocated = 1;
+    fq->global = fqg;
 }
 
 void ff_framequeue_free(FFFrameQueue *fq)
@@ -65,6 +69,8 @@ int ff_framequeue_add(FFFrameQueue *fq, AVFrame *frame)
     FFFrameBucket *b;
 
     check_consistency(fq);
+    if (fq->global->queued >= fq->global->max_queued)
+        return AVERROR(ENOMEM);
     if (fq->queued == fq->allocated) {
         if (fq->allocated == 1) {
             size_t na = 8;
@@ -79,9 +85,8 @@ int ff_framequeue_add(FFFrameQueue *fq, AVFrame *frame)
             FFFrameBucket *nq = av_realloc_array(fq->queue, na, sizeof(*nq));
             if (!nq)
                 return AVERROR(ENOMEM);
-            if (fq->tail + fq->queued > fq->allocated)
-                memmove(nq + fq->allocated, nq,
-                        (fq->tail + fq->queued - fq->allocated) * sizeof(*nq));
+            if (fq->tail)
+                memmove(nq + fq->allocated, nq, fq->tail * sizeof(*nq));
             fq->queue = nq;
             fq->allocated = na;
         }
@@ -89,6 +94,7 @@ int ff_framequeue_add(FFFrameQueue *fq, AVFrame *frame)
     b = bucket(fq, fq->queued);
     b->frame = frame;
     fq->queued++;
+    fq->global->queued++;
     fq->total_frames_head++;
     fq->total_samples_head += frame->nb_samples;
     check_consistency(fq);
@@ -103,6 +109,7 @@ AVFrame *ff_framequeue_take(FFFrameQueue *fq)
     av_assert1(fq->queued);
     b = bucket(fq, 0);
     fq->queued--;
+    fq->global->queued--;
     fq->tail++;
     fq->tail &= fq->allocated - 1;
     fq->total_frames_tail++;
@@ -134,10 +141,10 @@ void ff_framequeue_skip_samples(FFFrameQueue *fq, size_t samples, AVRational tim
     b = bucket(fq, 0);
     av_assert1(samples < b->frame->nb_samples);
     planar = av_sample_fmt_is_planar(b->frame->format);
-    planes = planar ? b->frame->channels : 1;
+    planes = planar ? b->frame->ch_layout.nb_channels : 1;
     bytes = samples * av_get_bytes_per_sample(b->frame->format);
     if (!planar)
-        bytes *= b->frame->channels;
+        bytes *= b->frame->ch_layout.nb_channels;
     if (b->frame->pts != AV_NOPTS_VALUE)
         b->frame->pts += av_rescale_q(samples, av_make_q(1, b->frame->sample_rate), time_base);
     b->frame->nb_samples -= samples;

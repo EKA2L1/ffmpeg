@@ -22,25 +22,17 @@
 #include "libavcodec/diracdsp.h"
 #include "fpel.h"
 
-void ff_add_rect_clamped_mmx(uint8_t *, const uint16_t *, int, const int16_t *, int, int, int);
 void ff_add_rect_clamped_sse2(uint8_t *, const uint16_t *, int, const int16_t *, int, int, int);
 
-void ff_add_dirac_obmc8_mmx(uint16_t *dst, const uint8_t *src, int stride, const uint8_t *obmc_weight, int yblen);
-void ff_add_dirac_obmc16_mmx(uint16_t *dst, const uint8_t *src, int stride, const uint8_t *obmc_weight, int yblen);
-void ff_add_dirac_obmc32_mmx(uint16_t *dst, const uint8_t *src, int stride, const uint8_t *obmc_weight, int yblen);
-
+void ff_add_dirac_obmc8_sse2(uint16_t *dst, const uint8_t *src, int stride, const uint8_t *obmc_weight, int yblen);
 void ff_add_dirac_obmc16_sse2(uint16_t *dst, const uint8_t *src, int stride, const uint8_t *obmc_weight, int yblen);
 void ff_add_dirac_obmc32_sse2(uint16_t *dst, const uint8_t *src, int stride, const uint8_t *obmc_weight, int yblen);
 
-void ff_put_rect_clamped_mmx(uint8_t *dst, int dst_stride, const int16_t *src, int src_stride, int width, int height);
 void ff_put_rect_clamped_sse2(uint8_t *dst, int dst_stride, const int16_t *src, int src_stride, int width, int height);
-void ff_put_signed_rect_clamped_mmx(uint8_t *dst, int dst_stride, const int16_t *src, int src_stride, int width, int height);
 void ff_put_signed_rect_clamped_sse2(uint8_t *dst, int dst_stride, const int16_t *src, int src_stride, int width, int height);
 void ff_put_signed_rect_clamped_10_sse4(uint8_t *dst, int dst_stride, const uint8_t *src, int src_stride, int width, int height);
 
 void ff_dequant_subband_32_sse4(uint8_t *src, uint8_t *dst, ptrdiff_t stride, const int qf, const int qs, int tot_v, int tot_h);
-
-#if HAVE_X86ASM
 
 #define HPEL_FILTER(MMSIZE, EXT)                                                             \
     void ff_dirac_hpel_filter_v_ ## EXT(uint8_t *, const uint8_t *, int, int);               \
@@ -62,11 +54,6 @@ void ff_dequant_subband_32_sse4(uint8_t *src, uint8_t *dst, ptrdiff_t stride, co
         }                                                                                    \
     }
 
-#define PIXFUNC(PFX, IDX, EXT)                                                   \
-    /*MMXDISABLEDc->PFX ## _dirac_pixels_tab[0][IDX] = PFX ## _dirac_pixels8_ ## EXT;*/  \
-    c->PFX ## _dirac_pixels_tab[1][IDX] = PFX ## _dirac_pixels16_ ## EXT; \
-    c->PFX ## _dirac_pixels_tab[2][IDX] = PFX ## _dirac_pixels32_ ## EXT
-
 #define DIRAC_PIXOP(OPNAME, EXT)\
 static void OPNAME ## _dirac_pixels16_ ## EXT(uint8_t *dst, const uint8_t *src[5], \
                                               int stride, int h) \
@@ -87,47 +74,21 @@ static void OPNAME ## _dirac_pixels32_ ## EXT(uint8_t *dst, const uint8_t *src[5
     }\
 }
 
-DIRAC_PIXOP(put, mmx)
-DIRAC_PIXOP(avg, mmx)
-DIRAC_PIXOP(avg, mmxext)
-
 DIRAC_PIXOP(put, sse2)
 DIRAC_PIXOP(avg, sse2)
 
-#if !ARCH_X86_64
-HPEL_FILTER(8, mmx)
-#endif
 HPEL_FILTER(16, sse2)
-
-#endif // HAVE_X86ASM
 
 void ff_diracdsp_init_x86(DiracDSPContext* c)
 {
-#if HAVE_X86ASM
     int mm_flags = av_get_cpu_flags();
-
-    if (EXTERNAL_MMX(mm_flags)) {
-        c->add_dirac_obmc[0] = ff_add_dirac_obmc8_mmx;
-#if !ARCH_X86_64
-        c->add_dirac_obmc[1] = ff_add_dirac_obmc16_mmx;
-        c->add_dirac_obmc[2] = ff_add_dirac_obmc32_mmx;
-        c->dirac_hpel_filter = dirac_hpel_filter_mmx;
-        c->add_rect_clamped = ff_add_rect_clamped_mmx;
-        c->put_signed_rect_clamped[0] = (void *)ff_put_signed_rect_clamped_mmx;
-#endif
-        PIXFUNC(put, 0, mmx);
-        PIXFUNC(avg, 0, mmx);
-    }
-
-    if (EXTERNAL_MMXEXT(mm_flags)) {
-        PIXFUNC(avg, 0, mmxext);
-    }
 
     if (EXTERNAL_SSE2(mm_flags)) {
         c->dirac_hpel_filter = dirac_hpel_filter_sse2;
         c->add_rect_clamped = ff_add_rect_clamped_sse2;
         c->put_signed_rect_clamped[0] = (void *)ff_put_signed_rect_clamped_sse2;
 
+        c->add_dirac_obmc[0] = ff_add_dirac_obmc8_sse2;
         c->add_dirac_obmc[1] = ff_add_dirac_obmc16_sse2;
         c->add_dirac_obmc[2] = ff_add_dirac_obmc32_sse2;
 
@@ -141,5 +102,4 @@ void ff_diracdsp_init_x86(DiracDSPContext* c)
         c->dequant_subband[1]         = ff_dequant_subband_32_sse4;
         c->put_signed_rect_clamped[1] = ff_put_signed_rect_clamped_10_sse4;
     }
-#endif
 }

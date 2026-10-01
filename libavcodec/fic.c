@@ -22,16 +22,18 @@
  */
 
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
 #include "golomb.h"
 
 typedef struct FICThreadContext {
     DECLARE_ALIGNED(16, int16_t, block)[64];
-    uint8_t *src;
+    const uint8_t *src;
     int slice_h;
     int src_size;
     int y_off;
@@ -54,7 +56,6 @@ typedef struct FICContext {
     int aligned_width, aligned_height;
     int num_slices, slice_h;
 
-    uint8_t cursor_buf[4096];
     int skip_cursor;
 } FICContext;
 
@@ -84,6 +85,7 @@ static const uint8_t fic_header[7] = { 0, 0, 1, 'F', 'I', 'C', 'V' };
 
 #define FIC_HEADER_SIZE 27
 #define CURSOR_OFFSET 59
+#define CURSOR_SIZE   4096
 
 static av_always_inline void fic_idct(int16_t *blk, int step, int shift, int rnd)
 {
@@ -173,7 +175,7 @@ static int fic_decode_slice(AVCodecContext *avctx, void *tdata)
     FICContext *ctx        = avctx->priv_data;
     FICThreadContext *tctx = tdata;
     GetBitContext gb;
-    uint8_t *src = tctx->src;
+    const uint8_t *src = tctx->src;
     int slice_h  = tctx->slice_h;
     int src_size = tctx->src_size;
     int y_off    = tctx->y_off;
@@ -212,10 +214,11 @@ static av_always_inline void fic_alpha_blend(uint8_t *dst, uint8_t *src,
         dst[i] += ((src[i] - dst[i]) * alpha[i]) >> 8;
 }
 
-static void fic_draw_cursor(AVCodecContext *avctx, int cur_x, int cur_y)
+static void fic_draw_cursor(AVCodecContext *avctx, const uint8_t cursor_buf[CURSOR_SIZE],
+                            int cur_x, int cur_y)
 {
     FICContext *ctx = avctx->priv_data;
-    uint8_t *ptr    = ctx->cursor_buf;
+    const uint8_t *ptr = cursor_buf;
     uint8_t *dstptr[3];
     uint8_t planes[4][1024];
     uint8_t chroma[3][256];
@@ -266,21 +269,18 @@ static void fic_draw_cursor(AVCodecContext *avctx, int cur_x, int cur_y)
     }
 }
 
-static int fic_decode_frame(AVCodecContext *avctx, void *data,
+static int fic_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                             int *got_frame, AVPacket *avpkt)
 {
     FICContext *ctx = avctx->priv_data;
-    uint8_t *src = avpkt->data;
+    const uint8_t *src = avpkt->data;
     int ret;
     int slice, nslices;
     int msize;
     int tsize;
     int cur_x, cur_y;
     int skip_cursor = ctx->skip_cursor;
-    uint8_t *sdata;
-
-    if ((ret = ff_reget_buffer(avctx, ctx->frame, 0)) < 0)
-        return ret;
+    const uint8_t *sdata;
 
     /* Header + at least one slice (4) */
     if (avpkt->size < FIC_HEADER_SIZE + 4) {
@@ -294,10 +294,14 @@ static int fic_decode_frame(AVCodecContext *avctx, void *data,
 
     /* Is it a skip frame? */
     if (src[17]) {
-        if (!ctx->final_frame) {
+        if (!ctx->final_frame->data[0]) {
             av_log(avctx, AV_LOG_WARNING, "Initial frame is skipped\n");
             return AVERROR_INVALIDDATA;
         }
+        ret = ff_reget_buffer(avctx, ctx->final_frame,
+                              FF_REGET_BUFFER_FLAG_READONLY);
+        if (ret < 0)
+            return ret;
         goto skip;
     }
 
@@ -344,9 +348,8 @@ static int fic_decode_frame(AVCodecContext *avctx, void *data,
         skip_cursor = 1;
     }
 
-    if (!skip_cursor && avpkt->size < CURSOR_OFFSET + sizeof(ctx->cursor_buf)) {
+    if (!skip_cursor && avpkt->size < CURSOR_OFFSET + CURSOR_SIZE)
         skip_cursor = 1;
-    }
 
     /* Slice height for all but the last slice. */
     ctx->slice_h = 16 * (ctx->aligned_height >> 4) / nslices;
@@ -401,42 +404,40 @@ static int fic_decode_frame(AVCodecContext *avctx, void *data,
         ctx->slice_data[slice].y_off    = y_off;
     }
 
+    if ((ret = ff_reget_buffer(avctx, ctx->frame, 0)) < 0)
+        return ret;
+
     if ((ret = avctx->execute(avctx, fic_decode_slice, ctx->slice_data,
                               NULL, nslices, sizeof(ctx->slice_data[0]))) < 0)
         return ret;
 
-    ctx->frame->key_frame = 1;
+    ctx->frame->flags |= AV_FRAME_FLAG_KEY;
     ctx->frame->pict_type = AV_PICTURE_TYPE_I;
     for (slice = 0; slice < nslices; slice++) {
         if (ctx->slice_data[slice].p_frame) {
-            ctx->frame->key_frame = 0;
+            ctx->frame->flags &= ~AV_FRAME_FLAG_KEY;
             ctx->frame->pict_type = AV_PICTURE_TYPE_P;
             break;
         }
     }
-    av_frame_free(&ctx->final_frame);
-    ctx->final_frame = av_frame_clone(ctx->frame);
-    if (!ctx->final_frame) {
-        av_log(avctx, AV_LOG_ERROR, "Could not clone frame buffer.\n");
-        return AVERROR(ENOMEM);
-    }
-
-    /* Make sure we use a user-supplied buffer. */
-    if ((ret = ff_reget_buffer(avctx, ctx->final_frame, 0)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Could not make frame writable.\n");
+    ret = av_frame_replace(ctx->final_frame, ctx->frame);
+    if (ret < 0)
         return ret;
-    }
 
-    /* Draw cursor. */
+    /* Draw cursor if needed. */
     if (!skip_cursor) {
-        memcpy(ctx->cursor_buf, src + CURSOR_OFFSET, sizeof(ctx->cursor_buf));
-        fic_draw_cursor(avctx, cur_x, cur_y);
+        /* Make frame writable. */
+        ret = ff_reget_buffer(avctx, ctx->final_frame, 0);
+        if (ret < 0)
+            return ret;
+
+        fic_draw_cursor(avctx, src + CURSOR_OFFSET, cur_x, cur_y);
     }
 
 skip:
-    *got_frame = 1;
-    if ((ret = av_frame_ref(data, ctx->final_frame)) < 0)
+    if ((ret = av_frame_ref(rframe, ctx->final_frame)) < 0)
         return ret;
+    *got_frame = 1;
 
     return avpkt->size;
 }
@@ -467,6 +468,9 @@ static av_cold int fic_decode_init(AVCodecContext *avctx)
     ctx->frame = av_frame_alloc();
     if (!ctx->frame)
         return AVERROR(ENOMEM);
+    ctx->final_frame = av_frame_alloc();
+    if (!ctx->final_frame)
+        return AVERROR(ENOMEM);
 
     return 0;
 }
@@ -483,16 +487,16 @@ static const AVClass fic_decoder_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_fic_decoder = {
-    .name           = "fic",
-    .long_name      = NULL_IF_CONFIG_SMALL("Mirillis FIC"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_FIC,
+const FFCodec ff_fic_decoder = {
+    .p.name         = "fic",
+    CODEC_LONG_NAME("Mirillis FIC"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_FIC,
     .priv_data_size = sizeof(FICContext),
     .init           = fic_decode_init,
-    .decode         = fic_decode_frame,
+    FF_CODEC_DECODE_CB(fic_decode_frame),
     .close          = fic_decode_close,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SLICE_THREADS,
-    .priv_class     = &fic_decoder_class,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SLICE_THREADS,
+    .p.priv_class   = &fic_decoder_class,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

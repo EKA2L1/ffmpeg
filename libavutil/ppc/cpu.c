@@ -20,6 +20,11 @@
 
 #ifdef __APPLE__
 #include <sys/sysctl.h>
+#elif HAVE_GETAUXVAL || HAVE_ELF_AUX_INFO
+#ifdef __FreeBSD__
+#include <machine/cpu.h>
+#endif
+#include <sys/auxv.h>
 #elif defined(__linux__)
 #include <asm/cputable.h>
 #include <linux/auxvec.h>
@@ -27,8 +32,8 @@
 #if HAVE_UNISTD_H
 #include <unistd.h>
 #endif
-#elif defined(__OpenBSD__)
-#include <sys/param.h>
+#elif defined(__NetBSD__) || defined(__OpenBSD__)
+#include <sys/types.h>
 #include <sys/sysctl.h>
 #include <machine/cpu.h>
 #elif defined(__AMIGAOS4__)
@@ -40,6 +45,17 @@
 #include "libavutil/avassert.h"
 #include "libavutil/cpu.h"
 #include "libavutil/cpu_internal.h"
+
+#ifndef AT_HWCAP
+#define AT_HWCAP             16
+#endif
+#ifndef AT_HWCAP2
+#define AT_HWCAP2            26
+#endif
+
+#define HWCAP_PPC_VSX        (1U << 7)
+#define HWCAP_PPC_ALTIVEC    (1U << 28)
+#define HWCAP2_PPC_ARCH_2_07 (1U << 31)
 
 /**
  * This function MAY rely on signal() or fork() in order to make sure AltiVec
@@ -56,8 +72,22 @@ int ff_get_cpu_flags_ppc(void)
     if (result == VECTORTYPE_ALTIVEC)
         return AV_CPU_FLAG_ALTIVEC;
     return 0;
-#elif defined(__APPLE__) || defined(__OpenBSD__)
-#ifdef __OpenBSD__
+#elif HAVE_GETAUXVAL || HAVE_ELF_AUX_INFO
+    int flags = 0;
+
+    unsigned long hwcap = ff_getauxval(AT_HWCAP);
+    unsigned long hwcap2 = ff_getauxval(AT_HWCAP2);
+
+    if (hwcap & HWCAP_PPC_ALTIVEC)
+       flags |= AV_CPU_FLAG_ALTIVEC;
+    if (hwcap & HWCAP_PPC_VSX)
+       flags |= AV_CPU_FLAG_VSX;
+    if (hwcap2 & HWCAP2_PPC_ARCH_2_07)
+       flags |= AV_CPU_FLAG_POWER8;
+
+    return flags;
+#elif defined(__APPLE__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#if defined(__NetBSD__) || defined(__OpenBSD__)
     int sels[2] = {CTL_MACHDEP, CPU_ALTIVEC};
 #else
     int sels[2] = {CTL_HW, HW_VECTORUNIT};
@@ -87,58 +117,22 @@ int ff_get_cpu_flags_ppc(void)
             if (buf[i] == AT_NULL)
                 goto out;
             if (buf[i] == AT_HWCAP) {
-                if (buf[i + 1] & PPC_FEATURE_HAS_ALTIVEC)
+                if (buf[i + 1] & HWCAP_PPC_ALTIVEC)
                     ret = AV_CPU_FLAG_ALTIVEC;
-#ifdef PPC_FEATURE_HAS_VSX
-                if (buf[i + 1] & PPC_FEATURE_HAS_VSX)
+                if (buf[i + 1] & HWCAP_PPC_VSX)
                     ret |= AV_CPU_FLAG_VSX;
-#endif
                 if (ret & AV_CPU_FLAG_VSX)
                     av_assert0(ret & AV_CPU_FLAG_ALTIVEC);
-            } else if (buf[i] == AT_HWCAP2) {
-#ifdef PPC_FEATURE2_ARCH_2_07
-                if (buf[i + 1] & PPC_FEATURE2_ARCH_2_07)
+            }
+            else if (buf[i] == AT_HWCAP2) {
+                if (buf[i + 1] & HWCAP2_PPC_ARCH_2_07)
                     ret |= AV_CPU_FLAG_POWER8;
-#endif
             }
         }
     }
 
 out:
     close(fd);
-    return ret;
-#elif CONFIG_RUNTIME_CPUDETECT && defined(__linux__)
-#define PVR_G4_7400  0x000C
-#define PVR_G5_970   0x0039
-#define PVR_G5_970FX 0x003C
-#define PVR_G5_970MP 0x0044
-#define PVR_G5_970GX 0x0045
-#define PVR_POWER6   0x003E
-#define PVR_POWER7   0x003F
-#define PVR_POWER8   0x004B
-#define PVR_CELL_PPU 0x0070
-    int ret = 0;
-    int proc_ver;
-    // Support of mfspr PVR emulation added in Linux 2.6.17.
-    __asm__ volatile("mfspr %0, 287" : "=r" (proc_ver));
-    proc_ver >>= 16;
-    if (proc_ver  & 0x8000 ||
-        proc_ver == PVR_G4_7400  ||
-        proc_ver == PVR_G5_970   ||
-        proc_ver == PVR_G5_970FX ||
-        proc_ver == PVR_G5_970MP ||
-        proc_ver == PVR_G5_970GX ||
-        proc_ver == PVR_POWER6   ||
-        proc_ver == PVR_POWER7   ||
-        proc_ver == PVR_POWER8   ||
-        proc_ver == PVR_CELL_PPU)
-        ret = AV_CPU_FLAG_ALTIVEC;
-    if (proc_ver == PVR_POWER7 ||
-        proc_ver == PVR_POWER8)
-        ret |= AV_CPU_FLAG_VSX;
-    if (proc_ver == PVR_POWER8)
-        ret |= AV_CPU_FLAG_POWER8;
-
     return ret;
 #else
     // Since we were compiled for AltiVec, just assume we have it

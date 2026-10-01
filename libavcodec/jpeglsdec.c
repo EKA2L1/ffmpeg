@@ -25,12 +25,13 @@
  * JPEG-LS decoder.
  */
 
+#include "libavutil/attributes.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
+#include "codec_internal.h"
 #include "get_bits.h"
 #include "golomb.h"
-#include "internal.h"
 #include "mathops.h"
-#include "mjpeg.h"
 #include "mjpegdec.h"
 #include "jpegls.h"
 #include "jpeglsdec.h"
@@ -53,21 +54,21 @@ int ff_jpegls_decode_lse(MJpegDecodeContext *s)
     int id;
     int tid, wt, maxtab, i, j;
 
-    int len = get_bits(&s->gb, 16);
-    id = get_bits(&s->gb, 8);
+    int len = bytestream2_get_be16(&s->gB);
+    id = bytestream2_get_byte(&s->gB);
 
     switch (id) {
     case 1:
         if (len < 13)
             return AVERROR_INVALIDDATA;
 
-        s->maxval = get_bits(&s->gb, 16);
-        s->t1     = get_bits(&s->gb, 16);
-        s->t2     = get_bits(&s->gb, 16);
-        s->t3     = get_bits(&s->gb, 16);
-        s->reset  = get_bits(&s->gb, 16);
+        s->maxval = bytestream2_get_be16u(&s->gB);
+        s->t1     = bytestream2_get_be16u(&s->gB);
+        s->t2     = bytestream2_get_be16u(&s->gB);
+        s->t3     = bytestream2_get_be16u(&s->gB);
+        s->reset  = bytestream2_get_be16u(&s->gB);
 
-        if(s->avctx->debug & FF_DEBUG_PICT_INFO) {
+        if (s->avctx->debug & FF_DEBUG_PICT_INFO) {
             av_log(s->avctx, AV_LOG_DEBUG, "Coding parameters maxval:%d T1:%d T2:%d T3:%d reset:%d\n",
                    s->maxval, s->t1, s->t2, s->t3, s->reset);
         }
@@ -77,9 +78,10 @@ int ff_jpegls_decode_lse(MJpegDecodeContext *s)
         break;
     case 2:
         s->palette_index = 0;
+        av_fallthrough;
     case 3:
-        tid= get_bits(&s->gb, 8);
-        wt = get_bits(&s->gb, 8);
+        tid= bytestream2_get_byte(&s->gB);
+        wt = bytestream2_get_byte(&s->gB);
 
         if (len < 5)
             return AVERROR_INVALIDDATA;
@@ -96,7 +98,7 @@ int ff_jpegls_decode_lse(MJpegDecodeContext *s)
         else
             maxtab = 65530/wt - 1;
 
-        if(s->avctx->debug & FF_DEBUG_PICT_INFO) {
+        if (s->avctx->debug & FF_DEBUG_PICT_INFO) {
             av_log(s->avctx, AV_LOG_DEBUG, "LSE palette %d tid:%d wt:%d maxtab:%d\n", id, tid, wt, maxtab);
         }
         if (maxtab >= 256) {
@@ -129,7 +131,7 @@ int ff_jpegls_decode_lse(MJpegDecodeContext *s)
                 uint8_t k = i << shift;
                 pal[k] = wt < 4 ? 0xFF000000 : 0;
                 for (j=0; j<wt; j++) {
-                    pal[k] |= get_bits(&s->gb, 8) << (8*(wt-j-1));
+                    pal[k] |= bytestream2_get_byte(&s->gB) << (8*(wt-j-1));
                 }
             }
             s->palette_index = i;
@@ -191,7 +193,7 @@ static inline int ls_get_code_runterm(GetBitContext *gb, JLSState *state,
     if (RItype)
         temp += state->N[Q] >> 1;
 
-    for (k = 0; (state->N[Q] << k) < temp; k++)
+    for (k = 0; ((unsigned)state->N[Q] << k) < temp; k++)
         ;
 
 #ifdef JLS_BROKEN
@@ -200,6 +202,8 @@ static inline int ls_get_code_runterm(GetBitContext *gb, JLSState *state,
 #endif
     ret = get_ur_golomb_jpegls(gb, k, state->limit - limit_add - 1,
                                state->qbpp);
+    if (ret < 0)
+        return -0x10000;
 
     /* decode mapped error */
     map = 0;
@@ -214,7 +218,7 @@ static inline int ls_get_code_runterm(GetBitContext *gb, JLSState *state,
         ret = ret >> 1;
     }
 
-    if(FFABS(ret) > 0xFFFF)
+    if (FFABS(ret) > 0xFFFF)
         return -0x10000;
     /* update state */
     state->A[Q] += FFABS(ret) - RItype;
@@ -350,14 +354,25 @@ static inline int ls_decode_line(JLSState *state, MJpegDecodeContext *s,
     return 0;
 }
 
-int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
-                             int point_transform, int ilv)
+int ff_jpegls_decode_picture(MJpegDecodeContext *s)
 {
+    int near = s->Ss;
+    int point_transform = s->Al;
+    int ilv = s->Se;
     int i, t = 0;
     uint8_t *zero, *last, *cur;
     JLSState *state = s->jls_state;
     int off = 0, stride = 1, width, shift, ret = 0;
     int decoded_height = 0;
+
+    /* Bound the total amount of JPEG-LS decoding work per packet:
+     * Per T.87, ILV=0 uses one scan per component while ILV=1/2 use a single
+     * interleaved scan, and ff_mjpeg_decode_sof() rejects subsampled JPEG-LS,
+     * so a valid image needs at most height * nb_components
+     * (<= height * MAX_COMPONENTS) rows of decoding. The extra factor of 2
+     * is slack so odd, damaged and weird files are not rejected. */
+    if (s->total_ls_decoded_height > s->height * 2LL * MAX_COMPONENTS)
+        return AVERROR_INVALIDDATA;
 
     if (!state) {
         state = av_malloc(sizeof(*state));
@@ -372,7 +387,6 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
     cur  = s->picture_ptr->data[0];
 
     /* initialize JPEG-LS state from JPEG parameters */
-    memset(state, 0, sizeof(*state));
     state->near   = near;
     state->bpp    = (s->bits < 2) ? 2 : s->bits;
     state->maxval = s->maxval;
@@ -381,7 +395,18 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
     state->T3     = s->t3;
     state->reset  = s->reset;
     ff_jpegls_reset_coding_parameters(state, 0);
-    ff_jpegls_init_state(state);
+
+    /* Testing parameters here, we cannot test in LSE or SOF because
+     * these interdepend and are allowed in either order
+     */
+    if (state->maxval >= (1<<state->bpp) ||
+        state->T1 > state->T2 ||
+        state->T2 > state->T3 ||
+        state->T3 > state->maxval ||
+        state->reset > FFMAX(255, state->maxval)) {
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
 
     if (s->bits <= 8)
         shift = point_transform + (8 - s->bits);
@@ -403,10 +428,9 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
         av_log(s->avctx, AV_LOG_DEBUG, "JPEG params: ILV=%i Pt=%i BPP=%i, scan = %i\n",
                 ilv, point_transform, s->bits, s->cur_scan);
     }
-    if (get_bits_left(&s->gb) < s->height) {
-        ret = AVERROR_INVALIDDATA;
-        goto end;
-    }
+
+    s->restart_count = -1;
+
     if (ilv == 0) { /* separate planes */
         if (s->cur_scan > s->nb_components) {
             ret = AVERROR_INVALIDDATA;
@@ -417,7 +441,15 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
         width  = s->width * stride;
         cur   += off;
         for (i = 0; i < s->height; i++) {
-            int ret;
+            int restart;
+            ret = ff_mjpeg_handle_restart(s, &restart);
+            if (ret < 0)
+                goto end;
+            if (restart) {
+                ff_jpegls_init_state(state);
+                t = 0;
+                last = zero;
+            }
             if (s->bits <= 8) {
                 ret = ls_decode_line(state, s, last, cur, t, width, stride, off, 8);
                 t = last[0];
@@ -429,11 +461,6 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
                 break;
             last = cur;
             cur += s->picture_ptr->linesize[0];
-
-            if (s->restart_interval && !--s->restart_count) {
-                align_get_bits(&s->gb);
-                skip_bits(&s->gb, 16); /* skip RSTn */
-            }
         }
         decoded_height = i;
     } else if (ilv == 1) { /* line interleaving */
@@ -443,18 +470,21 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
         memset(cur, 0, s->picture_ptr->linesize[0]);
         width = s->width * stride;
         for (i = 0; i < s->height; i++) {
-            int ret;
+            int restart;
+            ret = ff_mjpeg_handle_restart(s, &restart);
+            if (ret < 0)
+                goto end;
+            if (restart) {
+                ff_jpegls_init_state(state);
+                memset(Rc, 0, sizeof(Rc));
+                last = zero;
+            }
             for (j = 0; j < stride; j++) {
                 ret = ls_decode_line(state, s, last + j, cur + j,
                                Rc[j], width, stride, j, 8);
                 if (ret < 0)
                     break;
                 Rc[j] = last[j];
-
-                if (s->restart_interval && !--s->restart_count) {
-                    align_get_bits(&s->gb);
-                    skip_bits(&s->gb, 16); /* skip RSTn */
-                }
             }
             if (ret < 0)
                 break;
@@ -472,6 +502,8 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
         goto end;
     }
 
+    s->total_ls_decoded_height += decoded_height;
+
     if (s->xfrm && s->nb_components == 3) {
         int x, w;
 
@@ -480,22 +512,22 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
         if (s->bits <= 8) {
             uint8_t *src = s->picture_ptr->data[0];
 
-            for (i = 0; i < s->height; i++) {
+            for (i = 0; i < decoded_height; i++) {
                 switch(s->xfrm) {
                 case 1:
-                    for (x = off; x < w; x += 3) {
+                    for (x = off; x + 2 < w; x += 3) {
                         src[x  ] += src[x+1] + 128;
                         src[x+2] += src[x+1] + 128;
                     }
                     break;
                 case 2:
-                    for (x = off; x < w; x += 3) {
+                    for (x = off; x + 2 < w; x += 3) {
                         src[x  ] += src[x+1] + 128;
                         src[x+2] += ((src[x  ] + src[x+1])>>1) + 128;
                     }
                     break;
                 case 3:
-                    for (x = off; x < w; x += 3) {
+                    for (x = off; x + 2 < w; x += 3) {
                         int g = src[x+0] - ((src[x+2]+src[x+1])>>2) + 64;
                         src[x+0] = src[x+2] + g + 128;
                         src[x+2] = src[x+1] + g + 128;
@@ -503,7 +535,7 @@ int ff_jpegls_decode_picture(MJpegDecodeContext *s, int near,
                     }
                     break;
                 case 4:
-                    for (x = off; x < w; x += 3) {
+                    for (x = off; x + 2 < w; x += 3) {
                         int r    = src[x+0] - ((                       359 * (src[x+2]-128) + 490) >> 8);
                         int g    = src[x+0] - (( 88 * (src[x+1]-128) - 183 * (src[x+2]-128) +  30) >> 8);
                         int b    = src[x+0] + ((454 * (src[x+1]-128)                        + 574) >> 8);
@@ -549,16 +581,15 @@ end:
     return ret;
 }
 
-const AVCodec ff_jpegls_decoder = {
-    .name           = "jpegls",
-    .long_name      = NULL_IF_CONFIG_SMALL("JPEG-LS"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_JPEGLS,
+const FFCodec ff_jpegls_decoder = {
+    .p.name         = "jpegls",
+    CODEC_LONG_NAME("JPEG-LS"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_JPEGLS,
     .priv_data_size = sizeof(MJpegDecodeContext),
     .init           = ff_mjpeg_decode_init,
     .close          = ff_mjpeg_decode_end,
-    .receive_frame  = ff_mjpeg_receive_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP |
-                      FF_CODEC_CAP_SETS_PKT_DTS,
+    FF_CODEC_DECODE_CB(ff_mjpeg_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

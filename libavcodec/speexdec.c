@@ -52,11 +52,15 @@
  */
 
 #include "libavutil/avassert.h"
+#include "libavutil/avstring.h"
 #include "libavutil/float_dsp.h"
+#include "libavutil/intfloat.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
-#include "internal.h"
 #include "speexdata.h"
 
 #define SPEEX_NB_MODES 3
@@ -164,39 +168,39 @@ typedef struct SpeexSubmode {
 } SpeexSubmode;
 
 typedef struct SpeexMode {
-    int modeID; /** ID of the mode */
-    int (*decode)(AVCodecContext *avctx, void *dec, GetBitContext *gb, float *out);
-    int frame_size; /**< Size of frames used for decoding */
-    int subframe_size; /**< Size of sub-frames used for decoding */
-    int lpc_size; /**< Order of LPC filter */
-    float folding_gain; /**< Folding gain */
+    int modeID;                 /**< ID of the mode */
+    int (*decode)(AVCodecContext *avctx, void *dec, GetBitContext *gb, float *out, int packets_left);
+    int frame_size;             /**< Size of frames used for decoding */
+    int subframe_size;          /**< Size of sub-frames used for decoding */
+    int lpc_size;               /**< Order of LPC filter */
+    float folding_gain;         /**< Folding gain */
     const SpeexSubmode *submodes[NB_SUBMODES]; /**< Sub-mode data for the mode */
-    int default_submode; /**< Default sub-mode to use when decoding */
+    int default_submode;        /**< Default sub-mode to use when decoding */
 } SpeexMode;
 
 typedef struct DecoderState {
     const SpeexMode *mode;
-    int modeID; /** ID of the decoder mode */
-    int first; /** Is first frame  */
-    int full_frame_size; /**< Length of full-band frames */
-    int is_wideband; /**< If wideband is present */
-    int count_lost; /**< Was the last frame lost? */
-    int frame_size; /**< Length of high-band frames */
-    int subframe_size; /**< Length of high-band sub-frames */
-    int nb_subframes; /**< Number of high-band sub-frames */
-    int lpc_size; /**< Order of high-band LPC analysis */
-    float last_ol_gain; /**< Open-loop gain for previous frame */
-    float *innov_save; /** If non-NULL, innovation is copied here */
+    int modeID;             /**< ID of the decoder mode */
+    int first;              /**< Is first frame  */
+    int full_frame_size;    /**< Length of full-band frames */
+    int is_wideband;        /**< If wideband is present */
+    int count_lost;         /**< Was the last frame lost? */
+    int frame_size;         /**< Length of high-band frames */
+    int subframe_size;      /**< Length of high-band sub-frames */
+    int nb_subframes;       /**< Number of high-band sub-frames */
+    int lpc_size;           /**< Order of high-band LPC analysis */
+    float last_ol_gain;     /**< Open-loop gain for previous frame */
+    float *innov_save;      /**< If non-NULL, innovation is copied here */
 
     /* This is used in packet loss concealment */
-    int last_pitch; /**< Pitch of last correctly decoded frame */
-    float last_pitch_gain; /**< Pitch gain of last correctly decoded frame */
-    uint32_t seed; /** Seed used for random number generation */
+    int last_pitch;         /**< Pitch of last correctly decoded frame */
+    float last_pitch_gain;  /**< Pitch gain of last correctly decoded frame */
+    uint32_t seed;          /**< Seed used for random number generation */
 
     int encode_submode;
     const SpeexSubmode *const *submodes; /**< Sub-mode data */
-    int submodeID; /**< Activated sub-mode */
-    int lpc_enh_enabled; /**< 1 when LPC enhancer is on, 0 otherwise */
+    int submodeID;          /**< Activated sub-mode */
+    int lpc_enh_enabled;    /**< 1 when LPC enhancer is on, 0 otherwise */
 
     /* Vocoder data */
     float voc_m1;
@@ -205,10 +209,10 @@ typedef struct DecoderState {
     int voc_offset;
 
     int dtx_enabled;
-    int highpass_enabled; /**< Is the input filter enabled */
+    int highpass_enabled;   /**< Is the input filter enabled */
 
-    float *exc; /**< Start of excitation frame */
-    float mem_hp[2]; /**< High-pass filter memory */
+    float *exc;             /**< Start of excitation frame */
+    float mem_hp[2];        /**< High-pass filter memory */
     float exc_buf[NB_DEC_BUFFER]; /**< Excitation buffer */
     float old_qlsp[NB_ORDER]; /**< Quantized LSPs for previous frame */
     float interp_qlpc[NB_ORDER]; /**< Interpolated quantized LPCs */
@@ -517,8 +521,8 @@ static const SpeexSubmode wb_submode4 = {
     split_cb_shape_sign_unquant, &split_cb_high, -1.f
 };
 
-static int nb_decode(AVCodecContext *, void *, GetBitContext *, float *);
-static int sb_decode(AVCodecContext *, void *, GetBitContext *, float *);
+static int nb_decode(AVCodecContext *, void *, GetBitContext *, float *, int packets_left);
+static int sb_decode(AVCodecContext *, void *, GetBitContext *, float *, int packets_left);
 
 static const SpeexMode speex_modes[SPEEX_NB_MODES] = {
     {
@@ -863,7 +867,7 @@ static void lsp_to_lpc(const float *freq, float *ak, int lpcrdr)
 }
 
 static int nb_decode(AVCodecContext *avctx, void *ptr_st,
-                     GetBitContext *gb, float *out)
+                     GetBitContext *gb, float *out, int packets_left)
 {
     DecoderState *st = ptr_st;
     float ol_gain = 0, ol_pitch_coef = 0, best_pitch_gain = 0, pitch_average = 0;
@@ -1214,7 +1218,7 @@ static void qmf_synth(const float *x1, const float *x2, const float *a, float *y
 }
 
 static int sb_decode(AVCodecContext *avctx, void *ptr_st,
-                     GetBitContext *gb, float *out)
+                     GetBitContext *gb, float *out, int packets_left)
 {
     SpeexContext *s = avctx->priv_data;
     DecoderState *st = ptr_st;
@@ -1230,9 +1234,11 @@ static int sb_decode(AVCodecContext *avctx, void *ptr_st,
     mode = st->mode;
 
     if (st->modeID > 0) {
+        if (packets_left * s->frame_size < 2*st->frame_size)
+            return AVERROR_INVALIDDATA;
         low_innov_alias = out + st->frame_size;
         s->st[st->modeID - 1].innov_save = low_innov_alias;
-        ret = speex_modes[st->modeID - 1].decode(avctx, &s->st[st->modeID - 1], gb, out);
+        ret = speex_modes[st->modeID - 1].decode(avctx, &s->st[st->modeID - 1], gb, out, packets_left);
         if (ret < 0)
             return ret;
     }
@@ -1293,7 +1299,7 @@ static int sb_decode(AVCodecContext *avctx, void *ptr_st,
         lsp_interpolate(st->old_qlsp, qlsp, interp_qlsp, st->lpc_size, sub, st->nb_subframes, 0.05f);
         lsp_to_lpc(interp_qlsp, ak, st->lpc_size);
 
-        /* Calculate reponse ratio between the low and high filter in the middle
+        /* Calculate response ratio between the low and high filter in the middle
            of the band (4000 Hz) */
         st->pi_gain[sub] = 1.f;
         rh = 1.f;
@@ -1396,9 +1402,9 @@ static int parse_speex_extradata(AVCodecContext *avctx,
     const uint8_t *extradata, int extradata_size)
 {
     SpeexContext *s = avctx->priv_data;
-    const uint8_t *buf = extradata;
+    const uint8_t *buf = av_strnstr(extradata, "Speex   ", extradata_size);
 
-    if (memcmp(buf, "Speex   ", 8))
+    if (!buf)
         return AVERROR_INVALIDDATA;
 
     buf += 28;
@@ -1419,8 +1425,10 @@ static int parse_speex_extradata(AVCodecContext *avctx,
         return AVERROR_INVALIDDATA;
     s->bitrate = bytestream_get_le32(&buf);
     s->frame_size = bytestream_get_le32(&buf);
-    if (s->frame_size < NB_FRAME_SIZE << s->mode)
+    if (s->frame_size < NB_FRAME_SIZE << (s->mode > 1) ||
+        s->frame_size >     INT32_MAX >> (s->mode > 1))
         return AVERROR_INVALIDDATA;
+    s->frame_size = FFMIN(s->frame_size << (s->mode > 1), NB_FRAME_SIZE << s->mode);
     s->vbr = bytestream_get_le32(&buf);
     s->frames_per_packet = bytestream_get_le32(&buf);
     if (s->frames_per_packet <= 0 ||
@@ -1450,8 +1458,8 @@ static av_cold int speex_decode_init(AVCodecContext *avctx)
         if (s->rate <= 0)
             return AVERROR_INVALIDDATA;
 
-        s->nb_channels = avctx->channels;
-        if (s->nb_channels <= 0)
+        s->nb_channels = avctx->ch_layout.nb_channels;
+        if (s->nb_channels <= 0 || s->nb_channels > 2)
             return AVERROR_INVALIDDATA;
 
         switch (s->rate) {
@@ -1461,7 +1469,7 @@ static av_cold int speex_decode_init(AVCodecContext *avctx)
         default: s->mode = 2;
         }
 
-        s->frames_per_packet = 1;
+        s->frames_per_packet = 64;
         s->frame_size = NB_FRAME_SIZE << s->mode;
     }
 
@@ -1492,7 +1500,9 @@ static av_cold int speex_decode_init(AVCodecContext *avctx)
 
     if (s->bitrate > 0)
         avctx->bit_rate = s->bitrate;
-    avctx->channels = s->nb_channels;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    avctx->ch_layout.nb_channels = s->nb_channels;
     avctx->sample_rate = s->rate;
     avctx->sample_fmt = AV_SAMPLE_FMT_FLT;
 
@@ -1530,11 +1540,11 @@ static void speex_decode_stereo(float *data, int frame_size, StereoState *stereo
     }
 }
 
-static int speex_decode_frame(AVCodecContext *avctx, void *data,
+static int speex_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                               int *got_frame_ptr, AVPacket *avpkt)
 {
     SpeexContext *s = avctx->priv_data;
-    AVFrame *frame = data;
+    int frames_per_packet = s->frames_per_packet;
     const float scale = 1.f / 32768.f;
     int buf_size = avpkt->size;
     float *dst;
@@ -1545,26 +1555,31 @@ static int speex_decode_frame(AVCodecContext *avctx, void *data,
     if ((ret = init_get_bits8(&s->gb, avpkt->data, buf_size)) < 0)
         return ret;
 
-    frame->nb_samples = FFALIGN(s->frame_size * s->frames_per_packet, 4);
+    frame->nb_samples = FFALIGN(s->frame_size * frames_per_packet, 4);
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
         return ret;
 
     dst = (float *)frame->extended_data[0];
-    for (int i = 0; i < s->frames_per_packet; i++) {
-        ret = speex_modes[s->mode].decode(avctx, &s->st[s->mode], &s->gb, dst + i * s->frame_size);
+    for (int i = 0; i < frames_per_packet; i++) {
+        ret = speex_modes[s->mode].decode(avctx, &s->st[s->mode], &s->gb, dst + i * s->frame_size, frames_per_packet - i);
         if (ret < 0)
             return ret;
-        if (avctx->channels == 2)
+        if (avctx->ch_layout.nb_channels == 2)
             speex_decode_stereo(dst + i * s->frame_size, s->frame_size, &s->stereo);
+        if (get_bits_left(&s->gb) < 5 ||
+            show_bits(&s->gb, 5) == 15) {
+            frames_per_packet = i + 1;
+            break;
+        }
     }
 
     dst = (float *)frame->extended_data[0];
-    s->fdsp->vector_fmul_scalar(dst, dst, scale, frame->nb_samples * frame->channels);
-    frame->nb_samples = s->frame_size * s->frames_per_packet;
+    s->fdsp->vector_fmul_scalar(dst, dst, scale, frame->nb_samples * frame->ch_layout.nb_channels);
+    frame->nb_samples = s->frame_size * frames_per_packet;
 
     *got_frame_ptr = 1;
 
-    return buf_size;
+    return (get_bits_count(&s->gb) + 7) >> 3;
 }
 
 static av_cold int speex_decode_close(AVCodecContext *avctx)
@@ -1574,15 +1589,15 @@ static av_cold int speex_decode_close(AVCodecContext *avctx)
     return 0;
 }
 
-const AVCodec ff_speex_decoder = {
-    .name           = "speex",
-    .long_name      = NULL_IF_CONFIG_SMALL("Speex"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_SPEEX,
+const FFCodec ff_speex_decoder = {
+    .p.name         = "speex",
+    CODEC_LONG_NAME("Speex"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_SPEEX,
     .init           = speex_decode_init,
-    .decode         = speex_decode_frame,
+    FF_CODEC_DECODE_CB(speex_decode_frame),
     .close          = speex_decode_close,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
     .priv_data_size = sizeof(SpeexContext),
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

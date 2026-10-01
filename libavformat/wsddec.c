@@ -21,9 +21,11 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/timecode.h"
 #include "avformat.h"
-#include "internal.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "rawdec.h"
 
 static int wsd_probe(const AVProbeData *p)
@@ -72,6 +74,7 @@ static int wsd_to_av_channel_layoyt(AVFormatContext *s, int bit)
 static int get_metadata(AVFormatContext *s, const char *const tag, const unsigned size)
 {
     uint8_t *buf;
+    int ret;
     if (!(size + 1))
         return AVERROR(ENOMEM);
 
@@ -79,9 +82,9 @@ static int get_metadata(AVFormatContext *s, const char *const tag, const unsigne
     if (!buf)
         return AVERROR(ENOMEM);
 
-    if (avio_read(s->pb, buf, size) != size) {
+    if ((ret = ffio_read_size(s->pb, buf, size)) < 0) {
         av_free(buf);
-        return AVERROR(EIO);
+        return ret;
     }
 
     if (empty_string(buf, size)) {
@@ -125,21 +128,24 @@ static int wsd_read_header(AVFormatContext *s)
     av_dict_set(&s->metadata, "playback_time", playback_time, 0);
 
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
-    st->codecpar->codec_id    = s->iformat->raw_codec_id;
+    st->codecpar->codec_id    = AV_CODEC_ID_DSD_MSBF;
     st->codecpar->sample_rate = avio_rb32(pb) / 8;
     avio_skip(pb, 4);
-    st->codecpar->channels    = avio_r8(pb) & 0xF;
-    st->codecpar->bit_rate    = (int64_t)st->codecpar->channels * st->codecpar->sample_rate * 8LL;
-    if (!st->codecpar->channels)
+    st->codecpar->ch_layout.nb_channels = avio_r8(pb) & 0xF;
+    st->codecpar->bit_rate    = (int64_t)st->codecpar->ch_layout.nb_channels *
+                                st->codecpar->sample_rate * 8LL;
+    if (!st->codecpar->ch_layout.nb_channels)
         return AVERROR_INVALIDDATA;
 
     avio_skip(pb, 3);
     channel_assign         = avio_rb32(pb);
     if (!(channel_assign & 1)) {
+        uint64_t ch_mask = 0;
         int i;
         for (i = 1; i < 32; i++)
             if ((channel_assign >> i) & 1)
-                st->codecpar->channel_layout |= wsd_to_av_channel_layoyt(s, i);
+                ch_mask |= wsd_to_av_channel_layoyt(s, i);
+        av_channel_layout_from_mask(&st->codecpar->ch_layout, ch_mask);
     }
 
     avio_skip(pb, 16);
@@ -162,15 +168,15 @@ static int wsd_read_header(AVFormatContext *s)
     return avio_seek(pb, data_offset, SEEK_SET);
 }
 
-const AVInputFormat ff_wsd_demuxer = {
-    .name         = "wsd",
-    .long_name    = NULL_IF_CONFIG_SMALL("Wideband Single-bit Data (WSD)"),
+const FFInputFormat ff_wsd_demuxer = {
+    .p.name         = "wsd",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Wideband Single-bit Data (WSD)"),
+    .p.extensions   = "wsd",
+    .p.flags        = AVFMT_GENERIC_INDEX | AVFMT_NO_BYTE_SEEK,
+    .p.priv_class   = &ff_raw_demuxer_class,
     .read_probe   = wsd_probe,
     .read_header  = wsd_read_header,
     .read_packet  = ff_raw_read_partial_packet,
-    .extensions   = "wsd",
-    .flags        = AVFMT_GENERIC_INDEX | AVFMT_NO_BYTE_SEEK,
     .raw_codec_id = AV_CODEC_ID_DSD_MSBF,
     .priv_data_size = sizeof(FFRawDemuxerContext),
-    .priv_class     = &ff_raw_demuxer_class,
 };

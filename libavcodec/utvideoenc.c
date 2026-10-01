@@ -24,19 +24,37 @@
  * Ut Video encoder
  */
 
+#include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
 #include "avcodec.h"
+#include "codec_internal.h"
 #include "encode.h"
-#include "internal.h"
 #include "bswapdsp.h"
 #include "bytestream.h"
+#include "lossless_videoencdsp.h"
 #include "put_bits.h"
-#include "mathops.h"
 #include "utvideo.h"
 #include "huffman.h"
+
+typedef struct UtvideoContext {
+    const AVClass *class;
+    BswapDSPContext bdsp;
+    LLVidEncDSPContext llvidencdsp;
+
+    uint32_t frame_info_size, flags;
+    int      planes;
+    int      slices;
+    int      compression;
+    int      frame_pred;
+
+    ptrdiff_t slice_stride;
+    uint8_t  *slice_bits, *slice_buffer[4];
+    int       slice_bits_size;
+} UtvideoContext;
 
 typedef struct HuffEntry {
     uint16_t sym;
@@ -76,7 +94,6 @@ static av_cold int utvideo_encode_init(AVCodecContext *avctx)
     int i, subsampled_height;
     uint32_t original_format;
 
-    c->avctx           = avctx;
     c->frame_info_size = 4;
     c->slice_stride    = FFALIGN(avctx->width, 32);
 
@@ -127,9 +144,7 @@ static av_cold int utvideo_encode_init(AVCodecContext *avctx)
         original_format  = UTVIDEO_444;
         break;
     default:
-        av_log(avctx, AV_LOG_ERROR, "Unknown pixel format: %d\n",
-               avctx->pix_fmt);
-        return AVERROR_INVALIDDATA;
+        av_unreachable("Already checked via CODEC_PIXFMTS");
     }
 
     ff_bswapdsp_init(&c->bdsp);
@@ -137,7 +152,7 @@ static av_cold int utvideo_encode_init(AVCodecContext *avctx)
 
     if (c->frame_pred == PRED_GRADIENT) {
         av_log(avctx, AV_LOG_ERROR, "Gradient prediction is not supported.\n");
-        return AVERROR_OPTION_NOT_FOUND;
+        return AVERROR_PATCHWELCOME;
     }
 
     /*
@@ -223,7 +238,7 @@ static av_cold int utvideo_encode_init(AVCodecContext *avctx)
      * - Compression mode (none/huff)
      * And write the flags.
      */
-    c->flags  = (c->slices - 1) << 24;
+    c->flags  = (c->slices - 1U) << 24;
     c->flags |= 0 << 11; // bit field to signal interlaced encoding mode
     c->flags |= c->compression;
 
@@ -277,7 +292,7 @@ static void mangle_rgb_planes(uint8_t *dst[4], ptrdiff_t dst_stride,
 #undef B
 
 /* Write data to a plane with median prediction */
-static void median_predict(UtvideoContext *c, uint8_t *src, uint8_t *dst,
+static void median_predict(UtvideoContext *c, const uint8_t *src, uint8_t *dst,
                            ptrdiff_t stride, int width, int height)
 {
     int i, j;
@@ -376,7 +391,7 @@ static int write_huff_codes(uint8_t *src, uint8_t *dst, int dst_size,
     return put_bytes_output(&pb);
 }
 
-static int encode_plane(AVCodecContext *avctx, uint8_t *src,
+static int encode_plane(AVCodecContext *avctx, const uint8_t *src,
                         uint8_t *dst, ptrdiff_t stride, int plane_no,
                         int width, int height, PutByteContext *pb)
 {
@@ -627,11 +642,10 @@ static int utvideo_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 #define OFFSET(x) offsetof(UtvideoContext, x)
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-{ "pred", "Prediction method", OFFSET(frame_pred), AV_OPT_TYPE_INT, { .i64 = PRED_LEFT }, PRED_NONE, PRED_MEDIAN, VE, "pred" },
-    { "none",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = PRED_NONE }, INT_MIN, INT_MAX, VE, "pred" },
-    { "left",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = PRED_LEFT }, INT_MIN, INT_MAX, VE, "pred" },
-    { "gradient", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = PRED_GRADIENT }, INT_MIN, INT_MAX, VE, "pred" },
-    { "median",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = PRED_MEDIAN }, INT_MIN, INT_MAX, VE, "pred" },
+{ "pred", "Prediction method", OFFSET(frame_pred), AV_OPT_TYPE_INT, { .i64 = PRED_LEFT }, PRED_NONE, PRED_MEDIAN, VE, .unit = "pred" },
+    { "none",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = PRED_NONE }, INT_MIN, INT_MAX, VE, .unit = "pred" },
+    { "left",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = PRED_LEFT }, INT_MIN, INT_MAX, VE, .unit = "pred" },
+    { "median",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = PRED_MEDIAN }, INT_MIN, INT_MAX, VE, .unit = "pred" },
 
     { NULL},
 };
@@ -643,20 +657,20 @@ static const AVClass utvideo_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_utvideo_encoder = {
-    .name           = "utvideo",
-    .long_name      = NULL_IF_CONFIG_SMALL("Ut Video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_UTVIDEO,
+const FFCodec ff_utvideo_encoder = {
+    .p.name         = "utvideo",
+    CODEC_LONG_NAME("Ut Video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_UTVIDEO,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(UtvideoContext),
-    .priv_class     = &utvideo_class,
+    .p.priv_class   = &utvideo_class,
     .init           = utvideo_encode_init,
-    .encode2        = utvideo_encode_frame,
+    FF_CODEC_ENCODE_CB(utvideo_encode_frame),
     .close          = utvideo_encode_close,
-    .capabilities   = AV_CODEC_CAP_FRAME_THREADS,
-    .pix_fmts       = (const enum AVPixelFormat[]) {
-                          AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRAP, AV_PIX_FMT_YUV422P,
-                          AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P, AV_PIX_FMT_NONE
-                      },
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
+    CODEC_PIXFMTS(AV_PIX_FMT_GBRP, AV_PIX_FMT_GBRAP,
+                  AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV444P),
+    .color_ranges   = AVCOL_RANGE_MPEG,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

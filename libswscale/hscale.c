@@ -18,6 +18,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "swscale_internal.h"
 
 /// Scaler instance data
@@ -35,7 +36,7 @@ typedef struct ColorContext
     uint32_t *pal;
 } ColorContext;
 
-static int lum_h_scale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
+static int lum_h_scale(SwsInternal *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
 {
     FilterContext *instance = desc->instance;
     int srcW = desc->src->width;
@@ -58,7 +59,8 @@ static int lum_h_scale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int
         }
 
         if (c->lumConvertRange)
-            c->lumConvertRange((int16_t*)dst[dst_pos], dstW);
+            c->lumConvertRange((int16_t*)dst[dst_pos], dstW,
+                               c->lumConvertRange_coeff, c->lumConvertRange_offset);
 
         desc->dst->plane[0].sliceH += 1;
 
@@ -83,7 +85,7 @@ static int lum_h_scale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int
     return sliceH;
 }
 
-static int lum_convert(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
+static int lum_convert(SwsInternal *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
 {
     int srcW = desc->src->width;
     ColorContext * instance = desc->instance;
@@ -105,18 +107,18 @@ static int lum_convert(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int
         uint8_t * dst = desc->dst->plane[0].line[i];
 
         if (c->lumToYV12) {
-            c->lumToYV12(dst, src[0], src[1], src[2], srcW, pal);
+            c->lumToYV12(dst, src[0], src[1], src[2], srcW, pal, c->input_opaque);
         } else if (c->readLumPlanar) {
-            c->readLumPlanar(dst, src, srcW, c->input_rgb2yuv_table);
+            c->readLumPlanar(dst, src, srcW, c->input_rgb2yuv_table, c->input_opaque);
         }
 
 
         if (desc->alpha) {
             dst = desc->dst->plane[3].line[i];
             if (c->alpToYV12) {
-                c->alpToYV12(dst, src[3], src[1], src[2], srcW, pal);
+                c->alpToYV12(dst, src[3], src[1], src[2], srcW, pal, c->input_opaque);
             } else if (c->readAlpPlanar) {
-                c->readAlpPlanar(dst, src, srcW, NULL);
+                c->readAlpPlanar(dst, src, srcW, NULL, c->input_opaque);
             }
         }
     }
@@ -163,7 +165,7 @@ int ff_init_desc_hscale(SwsFilterDescriptor *desc, SwsSlice *src, SwsSlice *dst,
     return 0;
 }
 
-static int chr_h_scale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
+static int chr_h_scale(SwsInternal *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
 {
     FilterContext *instance = desc->instance;
     int srcW = AV_CEIL_RSHIFT(desc->src->width, desc->src->h_chr_sub_sample);
@@ -191,7 +193,8 @@ static int chr_h_scale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int
         }
 
         if (c->chrConvertRange)
-            c->chrConvertRange((uint16_t*)dst1[dst_pos1+i], (uint16_t*)dst2[dst_pos2+i], dstW);
+            c->chrConvertRange((uint16_t*)dst1[dst_pos1+i], (uint16_t*)dst2[dst_pos2+i], dstW,
+                               c->chrConvertRange_coeff, c->chrConvertRange_offset);
 
         desc->dst->plane[1].sliceH += 1;
         desc->dst->plane[2].sliceH += 1;
@@ -199,7 +202,7 @@ static int chr_h_scale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int
     return sliceH;
 }
 
-static int chr_convert(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
+static int chr_convert(SwsInternal *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
 {
     int srcW = AV_CEIL_RSHIFT(desc->src->width, desc->src->h_chr_sub_sample);
     ColorContext * instance = desc->instance;
@@ -224,9 +227,9 @@ static int chr_convert(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int
         uint8_t * dst1 = desc->dst->plane[1].line[i];
         uint8_t * dst2 = desc->dst->plane[2].line[i];
         if (c->chrToYV12) {
-            c->chrToYV12(dst1, dst2, src[0], src[1], src[2], srcW, pal);
+            c->chrToYV12(dst1, dst2, src[0], src[1], src[2], srcW, pal, c->input_opaque);
         } else if (c->readChrPlanar) {
-            c->readChrPlanar(dst1, dst2, src, srcW, c->input_rgb2yuv_table);
+            c->readChrPlanar(dst1, dst2, src, srcW, c->input_rgb2yuv_table, c->input_opaque);
         }
     }
     return sliceH;
@@ -269,7 +272,7 @@ int ff_init_desc_chscale(SwsFilterDescriptor *desc, SwsSlice *src, SwsSlice *dst
     return 0;
 }
 
-static int no_chr_scale(SwsContext *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
+static int no_chr_scale(SwsInternal *c, SwsFilterDescriptor *desc, int sliceY, int sliceH)
 {
     desc->dst->plane[1].sliceY = sliceY + sliceH - desc->dst->plane[1].available_lines;
     desc->dst->plane[1].sliceH = desc->dst->plane[1].available_lines;

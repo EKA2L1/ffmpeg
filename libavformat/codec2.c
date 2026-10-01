@@ -19,14 +19,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <memory.h>
+#include "config_components.h"
+
 #include "libavcodec/codec2utils.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
 #include "avio_internal.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
+#include "mux.h"
 #include "rawenc.h"
 #include "pcm.h"
 
@@ -129,9 +132,8 @@ static int codec2_read_header_common(AVFormatContext *s, AVStream *st)
     st->codecpar->codec_type        = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id          = AV_CODEC_ID_CODEC2;
     st->codecpar->sample_rate       = 8000;
-    st->codecpar->channels          = 1;
     st->codecpar->format            = AV_SAMPLE_FMT_S16;
-    st->codecpar->channel_layout    = AV_CH_LAYOUT_MONO;
+    st->codecpar->ch_layout         = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     st->codecpar->bit_rate          = codec2_mode_bit_rate(s, mode);
     st->codecpar->frame_size        = codec2_mode_frame_size(s, mode);
     st->codecpar->block_align       = codec2_mode_block_align(s, mode);
@@ -196,6 +198,8 @@ static int codec2_read_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     //try to read desired number of frames, compute n from to actual number of bytes read
+    if (c2->frames_per_packet > INT_MAX / block_align)
+        return AVERROR(EINVAL);
     size = c2->frames_per_packet * block_align;
     ret = av_get_packet(s->pb, pkt, size);
     if (ret < 0) {
@@ -205,21 +209,14 @@ static int codec2_read_packet(AVFormatContext *s, AVPacket *pkt)
     //only set duration - compute_pkt_fields() and ff_pcm_read_seek() takes care of everything else
     //tested by spamming the seek functionality in ffplay
     n = ret / block_align;
-    pkt->duration = n * frame_size;
+    pkt->duration = (int64_t)n * frame_size;
 
     return ret;
 }
 
 static int codec2_write_header(AVFormatContext *s)
 {
-    AVStream *st;
-
-    if (s->nb_streams != 1 || s->streams[0]->codecpar->codec_id != AV_CODEC_ID_CODEC2) {
-        av_log(s, AV_LOG_ERROR, ".c2 files must have exactly one codec2 stream\n");
-        return AVERROR(EINVAL);
-    }
-
-    st = s->streams[0];
+    AVStream *st = s->streams[0];
 
     if (st->codecpar->extradata_size != CODEC2_EXTRADATA_SIZE) {
         av_log(s, AV_LOG_ERROR, ".c2 files require exactly %i bytes of extradata (got %i)\n",
@@ -293,45 +290,47 @@ static const AVClass codec2raw_demux_class = {
 };
 
 #if CONFIG_CODEC2_DEMUXER
-const AVInputFormat ff_codec2_demuxer = {
-    .name           = "codec2",
-    .long_name      = NULL_IF_CONFIG_SMALL("codec2 .c2 demuxer"),
+const FFInputFormat ff_codec2_demuxer = {
+    .p.name         = "codec2",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("codec2 .c2 demuxer"),
+    .p.extensions   = "c2",
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.priv_class   = &codec2_demux_class,
     .priv_data_size = sizeof(Codec2Context),
-    .extensions     = "c2",
     .read_probe     = codec2_probe,
     .read_header    = codec2_read_header,
     .read_packet    = codec2_read_packet,
     .read_seek      = ff_pcm_read_seek,
-    .flags          = AVFMT_GENERIC_INDEX,
     .raw_codec_id   = AV_CODEC_ID_CODEC2,
-    .priv_class     = &codec2_demux_class,
 };
 #endif
 
 #if CONFIG_CODEC2_MUXER
-const AVOutputFormat ff_codec2_muxer = {
-    .name           = "codec2",
-    .long_name      = NULL_IF_CONFIG_SMALL("codec2 .c2 muxer"),
-    .priv_data_size = sizeof(Codec2Context),
-    .extensions     = "c2",
-    .audio_codec    = AV_CODEC_ID_CODEC2,
-    .video_codec    = AV_CODEC_ID_NONE,
+const FFOutputFormat ff_codec2_muxer = {
+    .p.name         = "codec2",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("codec2 .c2 muxer"),
+    .p.extensions   = "c2",
+    .p.audio_codec  = AV_CODEC_ID_CODEC2,
+    .p.video_codec  = AV_CODEC_ID_NONE,
+    .p.subtitle_codec = AV_CODEC_ID_NONE,
+    .p.flags        = AVFMT_NOTIMESTAMPS,
+    .flags_internal   = FF_OFMT_FLAG_MAX_ONE_OF_EACH |
+                        FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
     .write_header   = codec2_write_header,
     .write_packet   = ff_raw_write_packet,
-    .flags          = AVFMT_NOTIMESTAMPS,
 };
 #endif
 
 #if CONFIG_CODEC2RAW_DEMUXER
-const AVInputFormat ff_codec2raw_demuxer = {
-    .name           = "codec2raw",
-    .long_name      = NULL_IF_CONFIG_SMALL("raw codec2 demuxer"),
+const FFInputFormat ff_codec2raw_demuxer = {
+    .p.name         = "codec2raw",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw codec2 demuxer"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.priv_class   = &codec2raw_demux_class,
     .priv_data_size = sizeof(Codec2Context),
     .read_header    = codec2raw_read_header,
     .read_packet    = codec2_read_packet,
     .read_seek      = ff_pcm_read_seek,
-    .flags          = AVFMT_GENERIC_INDEX,
     .raw_codec_id   = AV_CODEC_ID_CODEC2,
-    .priv_class     = &codec2raw_demux_class,
 };
 #endif

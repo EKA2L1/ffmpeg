@@ -28,7 +28,9 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "formats.h"
+#include "video.h"
 
 enum FilterMode {
     MODE_NONE,
@@ -49,27 +51,27 @@ typedef struct IlContext {
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
 static const AVOption il_options[] = {
-    {"luma_mode",   "select luma mode", OFFSET(luma_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, "luma_mode"},
-    {"l",           "select luma mode", OFFSET(luma_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, "luma_mode"},
-    {"none",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_NONE},         0, 0, FLAGS, "luma_mode"},
-    {"interleave",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, "luma_mode"},
-    {"i",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, "luma_mode"},
-    {"deinterleave", NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, "luma_mode"},
-    {"d",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, "luma_mode"},
-    {"chroma_mode", "select chroma mode", OFFSET(chroma_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, "chroma_mode"},
-    {"c",           "select chroma mode", OFFSET(chroma_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, "chroma_mode"},
-    {"none",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_NONE},         0, 0, FLAGS, "chroma_mode"},
-    {"interleave",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, "chroma_mode"},
-    {"i",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, "chroma_mode"},
-    {"deinterleave", NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, "chroma_mode"},
-    {"d",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, "chroma_mode"},
-    {"alpha_mode", "select alpha mode", OFFSET(alpha_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, "alpha_mode"},
-    {"a",          "select alpha mode", OFFSET(alpha_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, "alpha_mode"},
-    {"none",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_NONE},         0, 0, FLAGS, "alpha_mode"},
-    {"interleave",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, "alpha_mode"},
-    {"i",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, "alpha_mode"},
-    {"deinterleave", NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, "alpha_mode"},
-    {"d",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, "alpha_mode"},
+    {"luma_mode",   "select luma mode", OFFSET(luma_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, .unit = "luma_mode"},
+    {"l",           "select luma mode", OFFSET(luma_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, .unit = "luma_mode"},
+    {"none",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_NONE},         0, 0, FLAGS, .unit = "luma_mode"},
+    {"interleave",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, .unit = "luma_mode"},
+    {"i",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, .unit = "luma_mode"},
+    {"deinterleave", NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, .unit = "luma_mode"},
+    {"d",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, .unit = "luma_mode"},
+    {"chroma_mode", "select chroma mode", OFFSET(chroma_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, .unit = "chroma_mode"},
+    {"c",           "select chroma mode", OFFSET(chroma_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, .unit = "chroma_mode"},
+    {"none",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_NONE},         0, 0, FLAGS, .unit = "chroma_mode"},
+    {"interleave",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, .unit = "chroma_mode"},
+    {"i",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, .unit = "chroma_mode"},
+    {"deinterleave", NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, .unit = "chroma_mode"},
+    {"d",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, .unit = "chroma_mode"},
+    {"alpha_mode", "select alpha mode", OFFSET(alpha_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, .unit = "alpha_mode"},
+    {"a",          "select alpha mode", OFFSET(alpha_mode), AV_OPT_TYPE_INT, {.i64=MODE_NONE}, MODE_NONE, MODE_DEINTERLEAVE, FLAGS, .unit = "alpha_mode"},
+    {"none",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_NONE},         0, 0, FLAGS, .unit = "alpha_mode"},
+    {"interleave",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, .unit = "alpha_mode"},
+    {"i",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_INTERLEAVE},   0, 0, FLAGS, .unit = "alpha_mode"},
+    {"deinterleave", NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, .unit = "alpha_mode"},
+    {"d",            NULL, 0, AV_OPT_TYPE_CONST, {.i64=MODE_DEINTERLEAVE}, 0, 0, FLAGS, .unit = "alpha_mode"},
     {"luma_swap",   "swap luma fields",   OFFSET(luma_swap),   AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
     {"ls",          "swap luma fields",   OFFSET(luma_swap),   AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
     {"chroma_swap", "swap chroma fields", OFFSET(chroma_swap), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS},
@@ -81,11 +83,14 @@ static const AVOption il_options[] = {
 
 AVFILTER_DEFINE_CLASS(il);
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     int reject_flags = AV_PIX_FMT_FLAG_PAL | AV_PIX_FMT_FLAG_HWACCEL;
 
-    return ff_set_common_formats(ctx, ff_formats_pixdesc_filter(0, reject_flags));
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out,
+                                  ff_formats_pixdesc_filter(0, reject_flags));
 }
 
 static int config_input(AVFilterLink *inlink)
@@ -183,21 +188,14 @@ static const AVFilterPad inputs[] = {
     },
 };
 
-static const AVFilterPad outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_il = {
-    .name          = "il",
-    .description   = NULL_IF_CONFIG_SMALL("Deinterleave or interleave fields."),
+const FFFilter ff_vf_il = {
+    .p.name        = "il",
+    .p.description = NULL_IF_CONFIG_SMALL("Deinterleave or interleave fields."),
+    .p.priv_class  = &il_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(IlContext),
     FILTER_INPUTS(inputs),
-    FILTER_OUTPUTS(outputs),
-    FILTER_QUERY_FUNC(query_formats),
-    .priv_class    = &il_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
     .process_command = ff_filter_process_command,
 };

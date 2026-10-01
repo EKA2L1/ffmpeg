@@ -26,22 +26,24 @@
  */
 
 #include "config.h"
+#include "libavutil/attributes.h"
 #if CONFIG_ZLIB
 #include <zlib.h>
 #endif
 
-#include "libavutil/imgutils.h"
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
 #include "encode.h"
-#include "internal.h"
 #include "lzw.h"
-#include "put_bits.h"
 #include "rle.h"
 #include "tiff.h"
+#include "tiff_common.h"
+#include "version.h"
 
 #define TIFF_MAX_ENTRY 32
 
@@ -104,7 +106,7 @@ static inline int check_size(TiffEncoderContext *s, uint64_t need)
  * @param type type of values
  * @param flip = 0 - normal copy, >0 - flip
  */
-static void tnput(uint8_t **p, int n, const uint8_t *val, enum TiffTypes type,
+static void tnput(uint8_t **p, int n, const uint8_t *val, enum AVTiffDataType type,
                   int flip)
 {
     int i;
@@ -125,7 +127,7 @@ static void tnput(uint8_t **p, int n, const uint8_t *val, enum TiffTypes type,
  * @param ptr_val pointer to values
  */
 static int add_entry(TiffEncoderContext *s, enum TiffTags tag,
-                     enum TiffTypes type, int count, const void *ptr_val)
+                     enum AVTiffDataType type, int count, const void *ptr_val)
 {
     uint8_t *entries_ptr = s->entries + 12 * s->num_entries;
 
@@ -149,12 +151,12 @@ static int add_entry(TiffEncoderContext *s, enum TiffTags tag,
 }
 
 static int add_entry1(TiffEncoderContext *s,
-                      enum TiffTags tag, enum TiffTypes type, int val)
+                      enum TiffTags tag, enum AVTiffDataType type, int val)
 {
     uint16_t w  = val;
     uint32_t dw = val;
     return add_entry(s, tag, type, 1,
-                     type == TIFF_SHORT ? (void *)&w : (void *)&dw);
+                     type == AV_TIFF_SHORT ? (void *)&w : (void *)&dw);
 }
 
 /**
@@ -206,8 +208,8 @@ static void pack_yuv(TiffEncoderContext *s, const AVFrame *p,
 {
     int i, j, k;
     int w       = (s->width - 1) / s->subsampling[0] + 1;
-    uint8_t *pu = &p->data[1][lnum / s->subsampling[1] * p->linesize[1]];
-    uint8_t *pv = &p->data[2][lnum / s->subsampling[1] * p->linesize[2]];
+    const uint8_t *pu = &p->data[1][lnum / s->subsampling[1] * p->linesize[1]];
+    const uint8_t *pv = &p->data[2][lnum / s->subsampling[1] * p->linesize[2]];
     if (s->width % s->subsampling[0] || s->height % s->subsampling[1]) {
         for (i = 0; i < w; i++) {
             for (j = 0; j < s->subsampling[1]; j++)
@@ -277,15 +279,18 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     case AV_PIX_FMT_RGBA64LE:
     case AV_PIX_FMT_RGBA:
         alpha = 1;
+        av_fallthrough;
     case AV_PIX_FMT_RGB48LE:
     case AV_PIX_FMT_RGB24:
         s->photometric_interpretation = TIFF_PHOTOMETRIC_RGB;
         break;
     case AV_PIX_FMT_GRAY8:
         avctx->bits_per_coded_sample = 0x28;
+        av_fallthrough;
     case AV_PIX_FMT_GRAY8A:
     case AV_PIX_FMT_YA16LE:
         alpha = avctx->pix_fmt == AV_PIX_FMT_GRAY8A || avctx->pix_fmt == AV_PIX_FMT_YA16LE;
+        av_fallthrough;
     case AV_PIX_FMT_GRAY16LE:
     case AV_PIX_FMT_MONOBLACK:
         s->photometric_interpretation = TIFF_PHOTOMETRIC_BLACK_IS_ZERO;
@@ -333,7 +338,7 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     bytes_per_row = (((s->width - 1) / s->subsampling[0] + 1) * s->bpp *
                      s->subsampling[0] * s->subsampling[1] + 7) >> 3;
     packet_size = avctx->height * bytes_per_row * 2 +
-                  avctx->height * 4 + AV_INPUT_BUFFER_MIN_SIZE;
+                  avctx->height * 4 + FF_INPUT_BUFFER_MIN_SIZE;
 
     if ((ret = ff_alloc_packet(avctx, pkt, packet_size)) < 0)
         return ret;
@@ -452,23 +457,30 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
 
     s->num_entries = 0;
 
-    ADD_ENTRY1(s, TIFF_SUBFILE, TIFF_LONG, 0);
-    ADD_ENTRY1(s, TIFF_WIDTH,   TIFF_LONG, s->width);
-    ADD_ENTRY1(s, TIFF_HEIGHT,  TIFF_LONG, s->height);
+    ADD_ENTRY1(s, TIFF_SUBFILE, AV_TIFF_LONG, 0);
+    ADD_ENTRY1(s, TIFF_WIDTH,   AV_TIFF_LONG, s->width);
+    ADD_ENTRY1(s, TIFF_HEIGHT,  AV_TIFF_LONG, s->height);
 
     if (s->bpp_tab_size)
-        ADD_ENTRY(s, TIFF_BPP, TIFF_SHORT, s->bpp_tab_size, bpp_tab);
+        ADD_ENTRY(s, TIFF_BPP, AV_TIFF_SHORT, s->bpp_tab_size, bpp_tab);
 
-    ADD_ENTRY1(s, TIFF_COMPR,       TIFF_SHORT, s->compr);
-    ADD_ENTRY1(s, TIFF_PHOTOMETRIC, TIFF_SHORT, s->photometric_interpretation);
-    ADD_ENTRY(s,  TIFF_STRIP_OFFS,  TIFF_LONG,  strips, s->strip_offsets);
+    ADD_ENTRY1(s, TIFF_COMPR,       AV_TIFF_SHORT, s->compr);
+    ADD_ENTRY1(s, TIFF_PHOTOMETRIC, AV_TIFF_SHORT, s->photometric_interpretation);
+    ADD_ENTRY(s,  TIFF_STRIP_OFFS,  AV_TIFF_LONG,  strips, s->strip_offsets);
+
+    AVFrameSideData *sd = av_frame_get_side_data(pict, AV_FRAME_DATA_DISPLAYMATRIX);
+    if (sd) {
+        int orientation = av_exif_matrix_to_orientation((int32_t *) sd->data);
+        if (orientation >= 1 && orientation <= 8)
+            ADD_ENTRY1(s, TIFF_ORIENTATION, AV_TIFF_SHORT, orientation);
+    }
 
     if (s->bpp_tab_size)
-        ADD_ENTRY1(s, TIFF_SAMPLES_PER_PIXEL, TIFF_SHORT, s->bpp_tab_size);
+        ADD_ENTRY1(s, TIFF_SAMPLES_PER_PIXEL, AV_TIFF_SHORT, s->bpp_tab_size);
 
-    ADD_ENTRY1(s, TIFF_ROWSPERSTRIP, TIFF_LONG,     s->rps);
-    ADD_ENTRY(s,  TIFF_STRIP_SIZE,   TIFF_LONG,     strips, s->strip_sizes);
-    ADD_ENTRY(s,  TIFF_XRES,         TIFF_RATIONAL, 1,      res);
+    ADD_ENTRY1(s, TIFF_ROWSPERSTRIP, AV_TIFF_LONG,     s->rps);
+    ADD_ENTRY(s,  TIFF_STRIP_SIZE,   AV_TIFF_LONG,     strips, s->strip_sizes);
+    ADD_ENTRY(s,  TIFF_XRES,         AV_TIFF_RATIONAL, 1,      res);
     if (avctx->sample_aspect_ratio.num > 0 &&
         avctx->sample_aspect_ratio.den > 0) {
         AVRational y = av_mul_q(av_make_q(s->dpi, 1),
@@ -476,11 +488,11 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         res[0] = y.num;
         res[1] = y.den;
     }
-    ADD_ENTRY(s,  TIFF_YRES,         TIFF_RATIONAL, 1,      res);
-    ADD_ENTRY1(s, TIFF_RES_UNIT,     TIFF_SHORT,    2);
+    ADD_ENTRY(s,  TIFF_YRES,         AV_TIFF_RATIONAL, 1,      res);
+    ADD_ENTRY1(s, TIFF_RES_UNIT,     AV_TIFF_SHORT,    2);
 
     if (!(avctx->flags & AV_CODEC_FLAG_BITEXACT))
-        ADD_ENTRY(s, TIFF_SOFTWARE_NAME, TIFF_STRING,
+        ADD_ENTRY(s, TIFF_SOFTWARE_NAME, AV_TIFF_STRING,
                   strlen(LIBAVCODEC_IDENT) + 1, LIBAVCODEC_IDENT);
 
     if (avctx->pix_fmt == AV_PIX_FMT_PAL8) {
@@ -491,17 +503,17 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
             pal[i + 256] = ((rgb >>  8) & 0xff) * 257;
             pal[i + 512] =  (rgb        & 0xff) * 257;
         }
-        ADD_ENTRY(s, TIFF_PAL, TIFF_SHORT, 256 * 3, pal);
+        ADD_ENTRY(s, TIFF_PAL, AV_TIFF_SHORT, 256 * 3, pal);
     }
     if (alpha)
-        ADD_ENTRY1(s,TIFF_EXTRASAMPLES,      TIFF_SHORT,            2);
+        ADD_ENTRY1(s,TIFF_EXTRASAMPLES,      AV_TIFF_SHORT,            2);
     if (is_yuv) {
         /** according to CCIR Recommendation 601.1 */
         uint32_t refbw[12] = { 15, 1, 235, 1, 128, 1, 240, 1, 128, 1, 240, 1 };
-        ADD_ENTRY(s, TIFF_YCBCR_SUBSAMPLING, TIFF_SHORT,    2, s->subsampling);
+        ADD_ENTRY(s, TIFF_YCBCR_SUBSAMPLING, AV_TIFF_SHORT,    2, s->subsampling);
         if (avctx->chroma_sample_location == AVCHROMA_LOC_TOPLEFT)
-            ADD_ENTRY1(s, TIFF_YCBCR_POSITIONING, TIFF_SHORT, 2);
-        ADD_ENTRY(s, TIFF_REFERENCE_BW,      TIFF_RATIONAL, 6, refbw);
+            ADD_ENTRY1(s, TIFF_YCBCR_POSITIONING, AV_TIFF_SHORT, 2);
+        ADD_ENTRY(s, TIFF_REFERENCE_BW,      AV_TIFF_RATIONAL, 6, refbw);
     }
     // write offset to dir
     bytestream_put_le32(&offset, ptr - pkt->data);
@@ -553,11 +565,11 @@ static av_cold int encode_close(AVCodecContext *avctx)
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
     {"dpi", "set the image resolution (in dpi)", OFFSET(dpi), AV_OPT_TYPE_INT, {.i64 = 72}, 1, 0x10000, AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_ENCODING_PARAM},
-    { "compression_algo", NULL, OFFSET(compr), AV_OPT_TYPE_INT,   { .i64 = TIFF_PACKBITS }, TIFF_RAW, TIFF_DEFLATE, VE, "compression_algo" },
-    { "packbits",         NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_PACKBITS }, 0,        0,            VE, "compression_algo" },
-    { "raw",              NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_RAW      }, 0,        0,            VE, "compression_algo" },
-    { "lzw",              NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_LZW      }, 0,        0,            VE, "compression_algo" },
-    { "deflate",          NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_DEFLATE  }, 0,        0,            VE, "compression_algo" },
+    { "compression_algo", NULL, OFFSET(compr), AV_OPT_TYPE_INT,   { .i64 = TIFF_PACKBITS }, TIFF_RAW, TIFF_DEFLATE, VE, .unit = "compression_algo" },
+    { "packbits",         NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_PACKBITS }, 0,        0,            VE, .unit = "compression_algo" },
+    { "raw",              NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_RAW      }, 0,        0,            VE, .unit = "compression_algo" },
+    { "lzw",              NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_LZW      }, 0,        0,            VE, .unit = "compression_algo" },
+    { "deflate",          NULL, 0,             AV_OPT_TYPE_CONST, { .i64 = TIFF_DEFLATE  }, 0,        0,            VE, .unit = "compression_algo" },
     { NULL },
 };
 
@@ -568,25 +580,24 @@ static const AVClass tiffenc_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_tiff_encoder = {
-    .name           = "tiff",
-    .long_name      = NULL_IF_CONFIG_SMALL("TIFF image"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_TIFF,
+const FFCodec ff_tiff_encoder = {
+    .p.name         = "tiff",
+    CODEC_LONG_NAME("TIFF image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_TIFF,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(TiffEncoderContext),
     .init           = encode_init,
     .close          = encode_close,
-    .capabilities   = AV_CODEC_CAP_FRAME_THREADS,
-    .encode2        = encode_frame,
-    .pix_fmts       = (const enum AVPixelFormat[]) {
+    FF_CODEC_ENCODE_CB(encode_frame),
+    CODEC_PIXFMTS(
         AV_PIX_FMT_RGB24, AV_PIX_FMT_RGB48LE, AV_PIX_FMT_PAL8,
         AV_PIX_FMT_RGBA, AV_PIX_FMT_RGBA64LE,
         AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY8A, AV_PIX_FMT_GRAY16LE, AV_PIX_FMT_YA16LE,
         AV_PIX_FMT_MONOBLACK, AV_PIX_FMT_MONOWHITE,
         AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV444P,
-        AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P,
-        AV_PIX_FMT_NONE
-    },
-    .priv_class     = &tiffenc_class,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+        AV_PIX_FMT_YUV410P, AV_PIX_FMT_YUV411P),
+    .color_ranges   = AVCOL_RANGE_MPEG,
+    .p.priv_class   = &tiffenc_class,
 };

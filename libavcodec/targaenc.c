@@ -21,14 +21,15 @@
 
 #include <string.h>
 
+#include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avcodec.h"
+#include "codec_internal.h"
 #include "encode.h"
-#include "internal.h"
 #include "rle.h"
 #include "targa.h"
 
@@ -72,7 +73,7 @@ static int targa_encode_normal(uint8_t *outbuf, const AVFrame *pic, int bpp, int
 {
     int i, n = bpp * w;
     uint8_t *out = outbuf;
-    uint8_t *ptr = pic->data[0];
+    const uint8_t *ptr = pic->data[0];
 
     for(i=0; i < h; i++) {
         memcpy(out, ptr, n);
@@ -89,10 +90,11 @@ static int targa_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     TargaContext *s = avctx->priv_data;
     int bpp, picsize, datasize = -1, ret, i;
     uint8_t *out;
+    int maxpal = 32*32;
 
     picsize = av_image_get_buffer_size(avctx->pix_fmt,
                                        avctx->width, avctx->height, 1);
-    if ((ret = ff_alloc_packet(avctx, pkt, picsize + 45)) < 0)
+    if ((ret = ff_alloc_packet(avctx, pkt, picsize + 45 + maxpal)) < 0)
         return ret;
 
     /* zero out the header and only set applicable fields */
@@ -125,6 +127,7 @@ static int targa_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
             AV_WL24(pkt->data + 18 + 3 * i, *(uint32_t *)(p->data[1] + i * 4));
             }
         out += 32 * pal_bpp;        /* skip past the palette we just output */
+        av_assert0(32 * pal_bpp <= maxpal);
         break;
         }
     case AV_PIX_FMT_GRAY8:
@@ -202,18 +205,16 @@ static const AVClass targa_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_targa_encoder = {
-    .name           = "targa",
-    .long_name      = NULL_IF_CONFIG_SMALL("Truevision Targa image"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_TARGA,
+const FFCodec ff_targa_encoder = {
+    .p.name         = "targa",
+    CODEC_LONG_NAME("Truevision Targa image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_TARGA,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(TargaContext),
-    .priv_class     = &targa_class,
+    .p.priv_class   = &targa_class,
     .init           = targa_encode_init,
-    .encode2        = targa_encode_frame,
-    .pix_fmts       = (const enum AVPixelFormat[]){
-        AV_PIX_FMT_BGR24, AV_PIX_FMT_BGRA, AV_PIX_FMT_RGB555LE, AV_PIX_FMT_GRAY8, AV_PIX_FMT_PAL8,
-        AV_PIX_FMT_NONE
-    },
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    FF_CODEC_ENCODE_CB(targa_encode_frame),
+    CODEC_PIXFMTS(AV_PIX_FMT_BGR24, AV_PIX_FMT_BGRA, AV_PIX_FMT_RGB555LE,
+                  AV_PIX_FMT_GRAY8, AV_PIX_FMT_PAL8),
 };

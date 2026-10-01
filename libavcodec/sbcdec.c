@@ -31,7 +31,8 @@
  */
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem_internal.h"
@@ -44,7 +45,6 @@ struct sbc_decoder_state {
 };
 
 typedef struct SBCDecContext {
-    AVClass *class;
     DECLARE_ALIGNED(SBC_ALIGN, struct sbc_frame, frame);
     DECLARE_ALIGNED(SBC_ALIGN, struct sbc_decoder_state, dsp);
 } SBCDecContext;
@@ -228,10 +228,10 @@ static inline void sbc_synthesize_four(struct sbc_decoder_state *state,
 
         /* Distribute the new matrix value to the shifted position */
         v[offset[i]] =
-            (int)( (unsigned)ff_synmatrix4[i][0] * frame->sb_sample[blk][ch][0] +
-                   (unsigned)ff_synmatrix4[i][1] * frame->sb_sample[blk][ch][1] +
-                   (unsigned)ff_synmatrix4[i][2] * frame->sb_sample[blk][ch][2] +
-                   (unsigned)ff_synmatrix4[i][3] * frame->sb_sample[blk][ch][3] ) >> 15;
+            (int)( (unsigned)synmatrix4[i][0] * frame->sb_sample[blk][ch][0] +
+                   (unsigned)synmatrix4[i][1] * frame->sb_sample[blk][ch][1] +
+                   (unsigned)synmatrix4[i][2] * frame->sb_sample[blk][ch][2] +
+                   (unsigned)synmatrix4[i][3] * frame->sb_sample[blk][ch][3] ) >> 15;
     }
 
     /* Compute the samples */
@@ -240,16 +240,16 @@ static inline void sbc_synthesize_four(struct sbc_decoder_state *state,
 
         /* Store in output, Q0 */
         AV_WN16A(&output_frame->data[ch][blk * 8 + i * 2], av_clip_int16(
-         (int)( (unsigned)v[offset[i] + 0] * ff_sbc_proto_4_40m0[idx + 0] +
-                (unsigned)v[offset[k] + 1] * ff_sbc_proto_4_40m1[idx + 0] +
-                (unsigned)v[offset[i] + 2] * ff_sbc_proto_4_40m0[idx + 1] +
-                (unsigned)v[offset[k] + 3] * ff_sbc_proto_4_40m1[idx + 1] +
-                (unsigned)v[offset[i] + 4] * ff_sbc_proto_4_40m0[idx + 2] +
-                (unsigned)v[offset[k] + 5] * ff_sbc_proto_4_40m1[idx + 2] +
-                (unsigned)v[offset[i] + 6] * ff_sbc_proto_4_40m0[idx + 3] +
-                (unsigned)v[offset[k] + 7] * ff_sbc_proto_4_40m1[idx + 3] +
-                (unsigned)v[offset[i] + 8] * ff_sbc_proto_4_40m0[idx + 4] +
-                (unsigned)v[offset[k] + 9] * ff_sbc_proto_4_40m1[idx + 4] ) >> 15));
+         (int)( (unsigned)v[offset[i] + 0] * sbc_proto_4_40m0[idx + 0] +
+                (unsigned)v[offset[k] + 1] * sbc_proto_4_40m1[idx + 0] +
+                (unsigned)v[offset[i] + 2] * sbc_proto_4_40m0[idx + 1] +
+                (unsigned)v[offset[k] + 3] * sbc_proto_4_40m1[idx + 1] +
+                (unsigned)v[offset[i] + 4] * sbc_proto_4_40m0[idx + 2] +
+                (unsigned)v[offset[k] + 5] * sbc_proto_4_40m1[idx + 2] +
+                (unsigned)v[offset[i] + 6] * sbc_proto_4_40m0[idx + 3] +
+                (unsigned)v[offset[k] + 7] * sbc_proto_4_40m1[idx + 3] +
+                (unsigned)v[offset[i] + 8] * sbc_proto_4_40m0[idx + 4] +
+                (unsigned)v[offset[k] + 9] * sbc_proto_4_40m1[idx + 4] ) >> 15));
     }
 }
 
@@ -271,14 +271,14 @@ static inline void sbc_synthesize_eight(struct sbc_decoder_state *state,
 
         /* Distribute the new matrix value to the shifted position */
         v[offset[i]] =
-             (int)( (unsigned)ff_synmatrix8[i][0] * frame->sb_sample[blk][ch][0] +
-                    (unsigned)ff_synmatrix8[i][1] * frame->sb_sample[blk][ch][1] +
-                    (unsigned)ff_synmatrix8[i][2] * frame->sb_sample[blk][ch][2] +
-                    (unsigned)ff_synmatrix8[i][3] * frame->sb_sample[blk][ch][3] +
-                    (unsigned)ff_synmatrix8[i][4] * frame->sb_sample[blk][ch][4] +
-                    (unsigned)ff_synmatrix8[i][5] * frame->sb_sample[blk][ch][5] +
-                    (unsigned)ff_synmatrix8[i][6] * frame->sb_sample[blk][ch][6] +
-                    (unsigned)ff_synmatrix8[i][7] * frame->sb_sample[blk][ch][7] ) >> 15;
+             (int)( (unsigned)synmatrix8[i][0] * frame->sb_sample[blk][ch][0] +
+                    (unsigned)synmatrix8[i][1] * frame->sb_sample[blk][ch][1] +
+                    (unsigned)synmatrix8[i][2] * frame->sb_sample[blk][ch][2] +
+                    (unsigned)synmatrix8[i][3] * frame->sb_sample[blk][ch][3] +
+                    (unsigned)synmatrix8[i][4] * frame->sb_sample[blk][ch][4] +
+                    (unsigned)synmatrix8[i][5] * frame->sb_sample[blk][ch][5] +
+                    (unsigned)synmatrix8[i][6] * frame->sb_sample[blk][ch][6] +
+                    (unsigned)synmatrix8[i][7] * frame->sb_sample[blk][ch][7] ) >> 15;
     }
 
     /* Compute the samples */
@@ -287,16 +287,16 @@ static inline void sbc_synthesize_eight(struct sbc_decoder_state *state,
 
         /* Store in output, Q0 */
         AV_WN16A(&output_frame->data[ch][blk * 16 + i * 2], av_clip_int16(
-         (int)( (unsigned)v[offset[i] + 0] * ff_sbc_proto_8_80m0[idx + 0] +
-                (unsigned)v[offset[k] + 1] * ff_sbc_proto_8_80m1[idx + 0] +
-                (unsigned)v[offset[i] + 2] * ff_sbc_proto_8_80m0[idx + 1] +
-                (unsigned)v[offset[k] + 3] * ff_sbc_proto_8_80m1[idx + 1] +
-                (unsigned)v[offset[i] + 4] * ff_sbc_proto_8_80m0[idx + 2] +
-                (unsigned)v[offset[k] + 5] * ff_sbc_proto_8_80m1[idx + 2] +
-                (unsigned)v[offset[i] + 6] * ff_sbc_proto_8_80m0[idx + 3] +
-                (unsigned)v[offset[k] + 7] * ff_sbc_proto_8_80m1[idx + 3] +
-                (unsigned)v[offset[i] + 8] * ff_sbc_proto_8_80m0[idx + 4] +
-                (unsigned)v[offset[k] + 9] * ff_sbc_proto_8_80m1[idx + 4] ) >> 15));
+         (int)( (unsigned)v[offset[i] + 0] * sbc_proto_8_80m0[idx + 0] +
+                (unsigned)v[offset[k] + 1] * sbc_proto_8_80m1[idx + 0] +
+                (unsigned)v[offset[i] + 2] * sbc_proto_8_80m0[idx + 1] +
+                (unsigned)v[offset[k] + 3] * sbc_proto_8_80m1[idx + 1] +
+                (unsigned)v[offset[i] + 4] * sbc_proto_8_80m0[idx + 2] +
+                (unsigned)v[offset[k] + 5] * sbc_proto_8_80m1[idx + 2] +
+                (unsigned)v[offset[i] + 6] * sbc_proto_8_80m0[idx + 3] +
+                (unsigned)v[offset[k] + 7] * sbc_proto_8_80m1[idx + 3] +
+                (unsigned)v[offset[i] + 8] * sbc_proto_8_80m0[idx + 4] +
+                (unsigned)v[offset[k] + 9] * sbc_proto_8_80m1[idx + 4] ) >> 15));
     }
 }
 
@@ -320,7 +320,7 @@ static void sbc_synthesize_audio(struct sbc_decoder_state *state,
     }
 }
 
-static int sbc_decode_init(AVCodecContext *avctx)
+static av_cold int sbc_decode_init(AVCodecContext *avctx)
 {
     SBCDecContext *sbc = avctx->priv_data;
     int i, ch;
@@ -336,22 +336,19 @@ static int sbc_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int sbc_decode_frame(AVCodecContext *avctx,
-                            void *data, int *got_frame_ptr,
-                            AVPacket *avpkt)
+static int sbc_decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                            int *got_frame_ptr, AVPacket *avpkt)
 {
     SBCDecContext *sbc = avctx->priv_data;
-    AVFrame *frame = data;
     int ret, frame_length;
-
-    if (!sbc)
-        return AVERROR(EIO);
 
     frame_length = sbc_unpack_frame(avpkt->data, &sbc->frame, avpkt->size);
     if (frame_length <= 0)
         return frame_length;
 
-    avctx->channels = sbc->frame.channels;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    avctx->ch_layout.nb_channels = sbc->frame.channels;
 
     frame->nb_samples = sbc->frame.blocks * sbc->frame.subbands;
     if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
@@ -364,19 +361,13 @@ static int sbc_decode_frame(AVCodecContext *avctx,
     return frame_length;
 }
 
-const AVCodec ff_sbc_decoder = {
-    .name                  = "sbc",
-    .long_name             = NULL_IF_CONFIG_SMALL("SBC (low-complexity subband codec)"),
-    .type                  = AVMEDIA_TYPE_AUDIO,
-    .id                    = AV_CODEC_ID_SBC,
+const FFCodec ff_sbc_decoder = {
+    .p.name                = "sbc",
+    CODEC_LONG_NAME("SBC (low-complexity subband codec)"),
+    .p.type                = AVMEDIA_TYPE_AUDIO,
+    .p.id                  = AV_CODEC_ID_SBC,
     .priv_data_size        = sizeof(SBCDecContext),
     .init                  = sbc_decode_init,
-    .decode                = sbc_decode_frame,
-    .capabilities          = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
-    .caps_internal         = FF_CODEC_CAP_INIT_THREADSAFE,
-    .channel_layouts       = (const uint64_t[]) { AV_CH_LAYOUT_MONO,
-                                                  AV_CH_LAYOUT_STEREO, 0},
-    .sample_fmts           = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S16P,
-                                                             AV_SAMPLE_FMT_NONE },
-    .supported_samplerates = (const int[]) { 16000, 32000, 44100, 48000, 0 },
+    FF_CODEC_DECODE_CB(sbc_decode_frame),
+    .p.capabilities        = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
 };

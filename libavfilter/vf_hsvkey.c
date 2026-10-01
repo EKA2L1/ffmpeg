@@ -21,12 +21,10 @@
 #include <float.h>
 
 #include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
-#include "video.h"
+#include "filters.h"
 
 typedef struct HSVKeyContext {
     const AVClass *class;
@@ -90,8 +88,8 @@ static int do_hsvkey_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_
 {
     HSVKeyContext *s = avctx->priv;
     AVFrame *frame = arg;
-    const int slice_start = (frame->height * jobnr) / nb_jobs;
-    const int slice_end = (frame->height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(frame->height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(frame->height, jobnr + 1, nb_jobs);
     const int hsub_log2 = s->hsub_log2;
     const int vsub_log2 = s->vsub_log2;
     const float hue = s->hue;
@@ -115,8 +113,8 @@ static int do_hsvkey16_slice(AVFilterContext *avctx, void *arg, int jobnr, int n
 {
     HSVKeyContext *s = avctx->priv;
     AVFrame *frame = arg;
-    const int slice_start = (frame->height * jobnr) / nb_jobs;
-    const int slice_end = (frame->height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(frame->height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(frame->height, jobnr + 1, nb_jobs);
     const int hsub_log2 = s->hsub_log2;
     const int vsub_log2 = s->vsub_log2;
     const float hue = s->hue;
@@ -145,8 +143,8 @@ static int do_hsvhold_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb
     const int vsub_log2 = s->vsub_log2;
     const int width = frame->width >> hsub_log2;
     const int height = frame->height >> vsub_log2;
-    const int slice_start = (height * jobnr) / nb_jobs;
-    const int slice_end = (height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);
     const float scale = s->scale;
     const float hue = s->hue;
     const float sat = s->sat;
@@ -181,8 +179,8 @@ static int do_hsvhold16_slice(AVFilterContext *avctx, void *arg, int jobnr, int 
     const int vsub_log2 = s->vsub_log2;
     const int width = frame->width >> hsub_log2;
     const int height = frame->height >> vsub_log2;
-    const int slice_start = (height * jobnr) / nb_jobs;
-    const int slice_end = (height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);
     const float scale = s->scale;
     const float half = s->half;
     const float hue = s->hue;
@@ -267,7 +265,7 @@ static const enum AVPixelFormat key_pixel_fmts[] = {
     AV_PIX_FMT_NONE
 };
 
-static const AVFilterPad hsvkey_inputs[] = {
+static const AVFilterPad inputs[] = {
     {
         .name           = "default",
         .type           = AVMEDIA_TYPE_VIDEO,
@@ -277,7 +275,7 @@ static const AVFilterPad hsvkey_inputs[] = {
     },
 };
 
-static const AVFilterPad hsvkey_outputs[] = {
+static const AVFilterPad outputs[] = {
     {
         .name           = "default",
         .type           = AVMEDIA_TYPE_VIDEO,
@@ -299,15 +297,15 @@ static const AVOption hsvkey_options[] = {
 
 AVFILTER_DEFINE_CLASS(hsvkey);
 
-const AVFilter ff_vf_hsvkey = {
-    .name          = "hsvkey",
-    .description   = NULL_IF_CONFIG_SMALL("Turns a certain HSV range into transparency. Operates on YUV colors."),
+const FFFilter ff_vf_hsvkey = {
+    .p.name        = "hsvkey",
+    .p.description = NULL_IF_CONFIG_SMALL("Turns a certain HSV range into transparency. Operates on YUV colors."),
+    .p.priv_class  = &hsvkey_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(HSVKeyContext),
-    .priv_class    = &hsvkey_class,
-    FILTER_INPUTS(hsvkey_inputs),
-    FILTER_OUTPUTS(hsvkey_outputs),
+    FILTER_INPUTS(inputs),
+    FILTER_OUTPUTS(outputs),
     FILTER_PIXFMTS_ARRAY(key_pixel_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = ff_filter_process_command,
 };
 
@@ -339,34 +337,16 @@ static const AVOption hsvhold_options[] = {
     { NULL }
 };
 
-static const AVFilterPad hsvhold_inputs[] = {
-    {
-        .name           = "default",
-        .type           = AVMEDIA_TYPE_VIDEO,
-        .flags          = AVFILTERPAD_FLAG_NEEDS_WRITABLE,
-        .filter_frame   = filter_frame,
-        .config_props   = config_input,
-    },
-};
-
-static const AVFilterPad hsvhold_outputs[] = {
-    {
-        .name           = "default",
-        .type           = AVMEDIA_TYPE_VIDEO,
-        .config_props   = config_output,
-    },
-};
-
 AVFILTER_DEFINE_CLASS(hsvhold);
 
-const AVFilter ff_vf_hsvhold = {
-    .name          = "hsvhold",
-    .description   = NULL_IF_CONFIG_SMALL("Turns a certain HSV range into gray."),
+const FFFilter ff_vf_hsvhold = {
+    .p.name        = "hsvhold",
+    .p.description = NULL_IF_CONFIG_SMALL("Turns a certain HSV range into gray."),
+    .p.priv_class  = &hsvhold_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(HSVKeyContext),
-    .priv_class    = &hsvhold_class,
-    FILTER_INPUTS(hsvhold_inputs),
-    FILTER_OUTPUTS(hsvhold_outputs),
+    FILTER_INPUTS(inputs),
+    FILTER_OUTPUTS(outputs),
     FILTER_PIXFMTS_ARRAY(hold_pixel_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = ff_filter_process_command,
 };

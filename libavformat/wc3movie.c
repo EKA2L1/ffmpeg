@@ -31,7 +31,10 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/dict.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 
 #define FORM_TAG MKTAG('F', 'O', 'R', 'M')
@@ -54,7 +57,6 @@
 
 /* always use the same PCM audio parameters */
 #define WC3_SAMPLE_RATE 22050
-#define WC3_AUDIO_CHANNELS 1
 #define WC3_AUDIO_BITS 16
 
 /* nice, constant framerate */
@@ -140,9 +142,9 @@ static int wc3_read_header(AVFormatContext *s)
             buffer = av_malloc(size+1);
             if (!buffer)
                 return AVERROR(ENOMEM);
-            if ((ret = avio_read(pb, buffer, size)) != size) {
+            if ((ret = ffio_read_size(pb, buffer, size)) < 0) {
                 av_freep(&buffer);
-                return AVERROR(EIO);
+                return ret;
             }
             buffer[size] = 0;
             av_dict_set(&s->metadata, "title", buffer,
@@ -171,7 +173,7 @@ static int wc3_read_header(AVFormatContext *s)
         /* chunk sizes are 16-bit aligned */
         size = (avio_rb32(pb) + 1) & (~1);
         if (avio_feof(pb))
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
 
     } while (fourcc_tag != BRCH_TAG);
 
@@ -195,13 +197,12 @@ static int wc3_read_header(AVFormatContext *s)
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id = AV_CODEC_ID_PCM_S16LE;
     st->codecpar->codec_tag = 1;
-    st->codecpar->channels = WC3_AUDIO_CHANNELS;
-    st->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+    st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     st->codecpar->bits_per_coded_sample = WC3_AUDIO_BITS;
     st->codecpar->sample_rate = WC3_SAMPLE_RATE;
-    st->codecpar->bit_rate = st->codecpar->channels * st->codecpar->sample_rate *
+    st->codecpar->bit_rate = st->codecpar->ch_layout.nb_channels * st->codecpar->sample_rate *
         st->codecpar->bits_per_coded_sample;
-    st->codecpar->block_align = WC3_AUDIO_BITS * WC3_AUDIO_CHANNELS;
+    st->codecpar->block_align = WC3_AUDIO_BITS * st->codecpar->ch_layout.nb_channels;
 
     return 0;
 }
@@ -223,7 +224,7 @@ static int wc3_read_packet(AVFormatContext *s,
         /* chunk sizes are 16-bit aligned */
         size = (avio_rb32(pb) + 1) & (~1);
         if (avio_feof(pb))
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
 
         switch (fourcc_tag) {
 
@@ -252,9 +253,9 @@ static int wc3_read_packet(AVFormatContext *s,
 
         case TEXT_TAG:
             /* subtitle chunk */
-            if ((unsigned)size > sizeof(text) || (ret = avio_read(pb, text, size)) != size)
-                ret = AVERROR(EIO);
-            else {
+            if ((unsigned)size > sizeof(text))
+                ret = AVERROR_INVALIDDATA;
+            else if ((ret = ffio_read_size(pb, text, size)) == size) {
                 int i = 0;
                 av_log (s, AV_LOG_DEBUG, "Subtitle time!\n");
                 if (i >= size || av_strnlen(&text[i + 1], size - i - 1) >= size - i - 1)
@@ -295,11 +296,11 @@ static int wc3_read_packet(AVFormatContext *s,
     return ret;
 }
 
-const AVInputFormat ff_wc3_demuxer = {
-    .name           = "wc3movie",
-    .long_name      = NULL_IF_CONFIG_SMALL("Wing Commander III movie"),
+const FFInputFormat ff_wc3_demuxer = {
+    .p.name         = "wc3movie",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Wing Commander III movie"),
     .priv_data_size = sizeof(Wc3DemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = wc3_probe,
     .read_header    = wc3_read_header,
     .read_packet    = wc3_read_packet,

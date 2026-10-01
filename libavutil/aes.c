@@ -20,11 +20,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "common.h"
+#include <string.h>
+
+#include "config.h"
 #include "aes.h"
 #include "aes_internal.h"
+#include "attributes.h"
+#include "error.h"
 #include "intreadwrite.h"
-#include "timer.h"
+#include "macros.h"
+#include "mem.h"
+#include "thread.h"
 
 const int av_aes_size= sizeof(AVAES);
 
@@ -76,25 +82,27 @@ static inline void addkey_d(uint8_t *dst, const av_aes_block *src,
 
 static void subshift(av_aes_block s0[2], int s, const uint8_t *box)
 {
-    av_aes_block *s1 = (av_aes_block *) (s0[0].u8 - s);
-    av_aes_block *s3 = (av_aes_block *) (s0[0].u8 + s);
+    unsigned char *s1_dst = (unsigned char*)s0[0].u8 + 3 - s;
+    const unsigned char *s1_src = s1_dst + sizeof(*s0);
+    unsigned char *s3_dst = (unsigned char*)s0[0].u8 + s + 1;
+    const unsigned char *s3_src = s3_dst + sizeof(*s0);
 
     s0[0].u8[ 0] = box[s0[1].u8[ 0]];
     s0[0].u8[ 4] = box[s0[1].u8[ 4]];
     s0[0].u8[ 8] = box[s0[1].u8[ 8]];
     s0[0].u8[12] = box[s0[1].u8[12]];
-    s1[0].u8[ 3] = box[s1[1].u8[ 7]];
-    s1[0].u8[ 7] = box[s1[1].u8[11]];
-    s1[0].u8[11] = box[s1[1].u8[15]];
-    s1[0].u8[15] = box[s1[1].u8[ 3]];
+    s1_dst[ 0] = box[s1_src[ 4]];
+    s1_dst[ 4] = box[s1_src[ 8]];
+    s1_dst[ 8] = box[s1_src[12]];
+    s1_dst[12] = box[s1_src[ 0]];
     s0[0].u8[ 2] = box[s0[1].u8[10]];
     s0[0].u8[10] = box[s0[1].u8[ 2]];
     s0[0].u8[ 6] = box[s0[1].u8[14]];
     s0[0].u8[14] = box[s0[1].u8[ 6]];
-    s3[0].u8[ 1] = box[s3[1].u8[13]];
-    s3[0].u8[13] = box[s3[1].u8[ 9]];
-    s3[0].u8[ 9] = box[s3[1].u8[ 5]];
-    s3[0].u8[ 5] = box[s3[1].u8[ 1]];
+    s3_dst[ 0] = box[s3_src[12]];
+    s3_dst[12] = box[s3_src[ 8]];
+    s3_dst[ 8] = box[s3_src[ 4]];
+    s3_dst[ 4] = box[s3_src[ 0]];
 }
 
 static inline int mix_core(uint32_t multbl[][256], int a, int b, int c, int d)
@@ -115,7 +123,7 @@ static inline void mix(av_aes_block state[2], uint32_t multbl[][256], int s1, in
     state[0].u32[3] = mix_core(multbl, src[3][0], src[s1 - 1][1], src[1][2], src[s3 - 1][3]);
 }
 
-static inline void aes_crypt(AVAES *a, int s, const uint8_t *sbox,
+static inline void aes_crypt(AVAES *a, int s, const uint8_t *sbox_arg,
                          uint32_t multbl[][256])
 {
     int r;
@@ -125,7 +133,7 @@ static inline void aes_crypt(AVAES *a, int s, const uint8_t *sbox,
         addkey(&a->state[1], &a->state[0], &a->round_key[r]);
     }
 
-    subshift(&a->state[0], s, sbox);
+    subshift(&a->state[0], s, sbox_arg);
 }
 
 static void aes_encrypt(AVAES *a, uint8_t *dst, const uint8_t *src,
@@ -168,12 +176,12 @@ void av_aes_crypt(AVAES *a, uint8_t *dst, const uint8_t *src,
 
 static void init_multbl2(uint32_t tbl[][256], const int c[4],
                          const uint8_t *log8, const uint8_t *alog8,
-                         const uint8_t *sbox)
+                         const uint8_t *sbox_arg)
 {
     int i;
 
     for (i = 0; i < 256; i++) {
-        int x = sbox[i];
+        int x = sbox_arg[i];
         if (x) {
             int k, l, m, n;
             x = log8[x];
@@ -191,6 +199,34 @@ static void init_multbl2(uint32_t tbl[][256], const int c[4],
     }
 }
 
+static AVOnce aes_static_init = AV_ONCE_INIT;
+
+static av_cold void aes_init_static(void)
+{
+    uint8_t log8[256];
+    uint8_t alog8[512];
+    int i, j = 1;
+
+    for (i = 0; i < 255; i++) {
+        alog8[i] = alog8[i + 255] = j;
+        log8[j] = i;
+        j ^= j + j;
+        if (j > 255)
+            j ^= 0x11B;
+    }
+    for (i = 0; i < 256; i++) {
+        j = i ? alog8[255 - log8[i]] : 0;
+        j ^= (j << 1) ^ (j << 2) ^ (j << 3) ^ (j << 4);
+        j = (j ^ (j >> 8) ^ 99) & 255;
+        inv_sbox[j] = i;
+        sbox[i]     = j;
+    }
+    init_multbl2(dec_multbl, (const int[4]) { 0xe, 0x9, 0xd, 0xb },
+                 log8, alog8, inv_sbox);
+    init_multbl2(enc_multbl, (const int[4]) { 0x2, 0x1, 0x1, 0x3 },
+                 log8, alog8, sbox);
+}
+
 // this is based on the reference AES code by Paulo Barreto and Vincent Rijmen
 int av_aes_init(AVAES *a, const uint8_t *key, int key_bits, int decrypt)
 {
@@ -198,37 +234,17 @@ int av_aes_init(AVAES *a, const uint8_t *key, int key_bits, int decrypt)
     uint8_t tk[8][4];
     int KC = key_bits >> 5;
     int rounds = KC + 6;
-    uint8_t log8[256];
-    uint8_t alog8[512];
 
+    a->rounds = rounds;
     a->crypt = decrypt ? aes_decrypt : aes_encrypt;
+#if ARCH_X86 && HAVE_X86ASM && HAVE_AESNI_EXTERNAL
+    ff_init_aes_x86(a, decrypt);
+#endif
 
-    if (!enc_multbl[FF_ARRAY_ELEMS(enc_multbl) - 1][FF_ARRAY_ELEMS(enc_multbl[0]) - 1]) {
-        j = 1;
-        for (i = 0; i < 255; i++) {
-            alog8[i] = alog8[i + 255] = j;
-            log8[j] = i;
-            j ^= j + j;
-            if (j > 255)
-                j ^= 0x11B;
-        }
-        for (i = 0; i < 256; i++) {
-            j = i ? alog8[255 - log8[i]] : 0;
-            j ^= (j << 1) ^ (j << 2) ^ (j << 3) ^ (j << 4);
-            j = (j ^ (j >> 8) ^ 99) & 255;
-            inv_sbox[j] = i;
-            sbox[i]     = j;
-        }
-        init_multbl2(dec_multbl, (const int[4]) { 0xe, 0x9, 0xd, 0xb },
-                     log8, alog8, inv_sbox);
-        init_multbl2(enc_multbl, (const int[4]) { 0x2, 0x1, 0x1, 0x3 },
-                     log8, alog8, sbox);
-    }
+    ff_thread_once(&aes_static_init, aes_init_static);
 
     if (key_bits != 128 && key_bits != 192 && key_bits != 256)
         return AVERROR(EINVAL);
-
-    a->rounds = rounds;
 
     memcpy(tk, key, KC * 4);
     memcpy(a->round_key[0].u8, key, KC * 4);
@@ -247,7 +263,7 @@ int av_aes_init(AVAES *a, const uint8_t *key, int key_bits, int decrypt)
                     tk[j][i] ^= sbox[tk[j - 1][i]];
         }
 
-        memcpy(a->round_key[0].u8 + t, tk, KC * 4);
+        memcpy((unsigned char*)a->round_key + t, tk, KC * 4);
     }
 
     if (decrypt) {
@@ -265,4 +281,3 @@ int av_aes_init(AVAES *a, const uint8_t *key, int key_bits, int decrypt)
 
     return 0;
 }
-

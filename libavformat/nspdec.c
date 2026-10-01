@@ -22,6 +22,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "pcm.h"
 
@@ -88,7 +89,7 @@ static int nsp_read_header(AVFormatContext *s)
     }
 
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
-    st->codecpar->channels    = channels;
+    st->codecpar->ch_layout.nb_channels = channels;
     st->codecpar->sample_rate = rate;
     st->codecpar->codec_id    = AV_CODEC_ID_PCM_S16LE;
     st->codecpar->block_align = 2 * channels;
@@ -96,13 +97,13 @@ static int nsp_read_header(AVFormatContext *s)
     return 0;
 }
 
-const AVInputFormat ff_nsp_demuxer = {
-    .name           = "nsp",
-    .long_name      = NULL_IF_CONFIG_SMALL("Computerized Speech Lab NSP"),
+const FFInputFormat ff_nsp_demuxer = {
+    .p.name         = "nsp",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Computerized Speech Lab NSP"),
+    .p.extensions   = "nsp",
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe     = nsp_probe,
     .read_header    = nsp_read_header,
     .read_packet    = ff_pcm_read_packet,
     .read_seek      = ff_pcm_read_seek,
-    .extensions     = "nsp",
-    .flags          = AVFMT_GENERIC_INDEX,
 };

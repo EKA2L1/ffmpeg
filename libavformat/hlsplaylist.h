@@ -25,7 +25,6 @@
 
 #include <stdint.h>
 
-#include "libavutil/common.h"
 #include "avformat.h"
 #include "avio.h"
 
@@ -39,11 +38,12 @@ typedef enum {
 void ff_hls_write_playlist_version(AVIOContext *out, int version);
 void ff_hls_write_audio_rendition(AVIOContext *out, const char *agroup,
                                   const char *filename, const char *language,
-                                  int name_id, int is_default);
+                                  int name_id, int is_default, int nb_channels);
 void ff_hls_write_subtitle_rendition(AVIOContext *out, const char *sgroup,
                                      const char *filename, const char *language,
-                                     int name_id, int is_default);
+                                     const char *sname, int name_id, int is_default);
 void ff_hls_write_stream_info(AVStream *st, AVIOContext *out, int bandwidth,
+                              int avg_bandwidth,
                               const char *filename, const char *agroup,
                               const char *codecs, const char *ccgroup,
                               const char *sgroup);
@@ -58,7 +58,6 @@ int ff_hls_write_file_entry(AVIOContext *out, int insert_discont,
                             int64_t pos /* Used only if HLS_SINGLE_FILE flag is set */,
                             const char *baseurl /* Ignored if NULL */,
                             const char *filename, double *prog_date_time,
-                            int64_t video_keyframe_size, int64_t video_keyframe_pos,
                             int iframe_mode);
 void ff_hls_write_end_list (AVIOContext *out);
 

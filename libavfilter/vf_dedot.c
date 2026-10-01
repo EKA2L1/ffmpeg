@@ -18,14 +18,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/imgutils.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
 #include "filters.h"
-#include "formats.h"
-#include "internal.h"
 #include "video.h"
 
 typedef struct DedotContext {
@@ -87,8 +84,8 @@ static int dedotcrawl##name(AVFilterContext *ctx, void *arg,     \
     int p3_linesize = s->frames[3]->linesize[0] / div;           \
     int p4_linesize = s->frames[4]->linesize[0] / div;           \
     const int h = s->planeheight[0];                             \
-    int slice_start = (h * jobnr) / nb_jobs;                     \
-    int slice_end = (h * (jobnr+1)) / nb_jobs;                   \
+    int slice_start = ff_slice_pos(h, jobnr, nb_jobs);           \
+    int slice_end = ff_slice_pos(h, jobnr + 1, nb_jobs);         \
     type *p0 = (type *)s->frames[0]->data[0];                    \
     type *p1 = (type *)s->frames[1]->data[0];                    \
     type *p3 = (type *)s->frames[3]->data[0];                    \
@@ -113,12 +110,12 @@ static int dedotcrawl##name(AVFilterContext *ctx, void *arg,     \
     for (int y = slice_start; y < slice_end; y++) {              \
         for (int x = 1; x < s->planewidth[0] - 1; x++) {         \
             int above = src[x - src_linesize];                   \
-            int bellow = src[x + src_linesize];                  \
+            int below = src[x + src_linesize];                   \
             int cur = src[x];                                    \
             int left = src[x - 1];                               \
             int right = src[x + 1];                              \
                                                                  \
-            if (FFABS(above + bellow - 2 * cur) <= luma2d &&     \
+            if (FFABS(above + below - 2 * cur) <= luma2d &&      \
                 FFABS(left + right - 2 * cur) <= luma2d)         \
                 continue;                                        \
                                                                  \
@@ -162,8 +159,8 @@ static int derainbow##name(AVFilterContext *ctx, void *arg,  \
     AVFrame *out = td->out;                                  \
     const int plane = td->plane;                             \
     const int h = s->planeheight[plane];                     \
-    int slice_start = (h * jobnr) / nb_jobs;                 \
-    int slice_end = (h * (jobnr+1)) / nb_jobs;               \
+    int slice_start = ff_slice_pos(h, jobnr, nb_jobs);       \
+    int slice_end = ff_slice_pos(h, jobnr + 1, nb_jobs);     \
     int src_linesize = s->frames[2]->linesize[plane] / div;  \
     int dst_linesize = out->linesize[plane] / div;           \
     int p0_linesize = s->frames[0]->linesize[plane] / div;   \
@@ -289,7 +286,7 @@ static int activate(AVFilterContext *ctx)
             s->frames[4]) {
             out = av_frame_clone(s->frames[2]);
             if (out && !ctx->is_disabled) {
-                ret = av_frame_make_writable(out);
+                ret = ff_inlink_make_frame_writable(inlink, &out);
                 if (ret >= 0) {
                     if (s->m & 1)
                         ff_filter_execute(ctx, s->dedotcrawl, out, NULL,
@@ -365,21 +362,14 @@ static av_cold void uninit(AVFilterContext *ctx)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
 
 static const AVOption dedot_options[] = {
-    { "m",   "set filtering mode",                          OFFSET( m), AV_OPT_TYPE_FLAGS, {.i64=3},    0, 3, FLAGS, "m" },
-    { "dotcrawl",                                           0,       0, AV_OPT_TYPE_CONST, {.i64=1},    0, 0, FLAGS, "m" },
-    { "rainbows",                                           0,       0, AV_OPT_TYPE_CONST, {.i64=2},    0, 0, FLAGS, "m" },
+    { "m",   "set filtering mode",                          OFFSET( m), AV_OPT_TYPE_FLAGS, {.i64=3},    0, 3, FLAGS, .unit = "m" },
+    { "dotcrawl",                                           0,       0, AV_OPT_TYPE_CONST, {.i64=1},    0, 0, FLAGS, .unit = "m" },
+    { "rainbows",                                           0,       0, AV_OPT_TYPE_CONST, {.i64=2},    0, 0, FLAGS, .unit = "m" },
     { "lt",  "set spatial luma threshold",                  OFFSET(lt), AV_OPT_TYPE_FLOAT, {.dbl=.079}, 0, 1, FLAGS },
     { "tl",  "set tolerance for temporal luma",             OFFSET(tl), AV_OPT_TYPE_FLOAT, {.dbl=.079}, 0, 1, FLAGS },
     { "tc",  "set tolerance for chroma temporal variation", OFFSET(tc), AV_OPT_TYPE_FLOAT, {.dbl=.058}, 0, 1, FLAGS },
     { "ct",  "set temporal chroma threshold",               OFFSET(ct), AV_OPT_TYPE_FLOAT, {.dbl=.019}, 0, 1, FLAGS },
     { NULL },
-};
-
-static const AVFilterPad inputs[] = {
-    {
-        .name           = "default",
-        .type           = AVMEDIA_TYPE_VIDEO,
-    },
 };
 
 static const AVFilterPad outputs[] = {
@@ -392,15 +382,15 @@ static const AVFilterPad outputs[] = {
 
 AVFILTER_DEFINE_CLASS(dedot);
 
-const AVFilter ff_vf_dedot = {
-    .name          = "dedot",
-    .description   = NULL_IF_CONFIG_SMALL("Reduce cross-luminance and cross-color."),
+const FFFilter ff_vf_dedot = {
+    .p.name        = "dedot",
+    .p.description = NULL_IF_CONFIG_SMALL("Reduce cross-luminance and cross-color."),
+    .p.priv_class  = &dedot_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(DedotContext),
-    .priv_class    = &dedot_class,
     .activate      = activate,
     .uninit        = uninit,
-    FILTER_INPUTS(inputs),
+    FILTER_INPUTS(ff_video_default_filterpad),
     FILTER_OUTPUTS(outputs),
     FILTER_PIXFMTS_ARRAY(pixel_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
 };

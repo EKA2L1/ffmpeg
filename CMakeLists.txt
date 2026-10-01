@@ -40,7 +40,7 @@ endif()
 
 set(ffmpeg_options
     --disable-everything --disable-autodetect --disable-shared --enable-static
-    --enable-pic --disable-avdevice --disable-avfilter --disable-postproc
+    --enable-pic --disable-avdevice --disable-avfilter
     --disable-programs --disable-doc --disable-network
     --enable-decoder=h264,mpeg4,h263,h263p,mpeg2video,mjpeg,mjpegb
     --enable-decoder=aac,aac_latm,wavpack,amrnb,amrwb,mp3,pcm_alaw,pcm_s16le,pcm_s8
@@ -102,7 +102,6 @@ else()
         set(apple_arch "${ffmpeg_arch}")
         if(apple_arch STREQUAL aarch64)
             set(apple_arch arm64)
-            list(APPEND ffmpeg_options --disable-asm)
         endif()
         string(APPEND ffmpeg_cflags " -arch ${apple_arch}")
         string(APPEND ffmpeg_ldflags " -arch ${apple_arch}")

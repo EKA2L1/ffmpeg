@@ -47,10 +47,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define FFT_FLOAT 0
+#include "config_components.h"
 #define USE_FIXED 1
 #include "ac3dec.h"
+#include "codec_internal.h"
+#define IMDCT_TYPE AV_TX_INT32_MDCT
 
+#include "ac3dec.h"
 
 static const int end_freq_inv_tab[8] =
 {
@@ -150,13 +153,16 @@ static void ac3_downmix_c_fixed16(int16_t **samples, int16_t **matrix,
     }
 }
 
+#if CONFIG_EAC3_DECODER
 #include "eac3dec.c"
+#endif
 #include "ac3dec.c"
 
 static const AVOption options[] = {
     { "cons_noisegen", "enable consistent noise generation", OFFSET(consistent_noise_generation), AV_OPT_TYPE_BOOL, {.i64 = 0 }, 0, 1, PAR },
     { "drc_scale", "percentage of dynamic range compression to apply", OFFSET(drc_scale), AV_OPT_TYPE_FLOAT, {.dbl = 1.0}, 0.0, 6.0, PAR },
     { "heavy_compr", "enable heavy dynamic range compression", OFFSET(heavy_compression), AV_OPT_TYPE_BOOL, {.i64 = 0 }, 0, 1, PAR },
+    { "downmix", "Request a specific channel layout from the decoder", OFFSET(downmix_layout), AV_OPT_TYPE_CHLAYOUT, {.str = NULL}, .flags = PAR },
     { NULL},
 };
 
@@ -167,19 +173,19 @@ static const AVClass ac3_decoder_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_ac3_fixed_decoder = {
-    .name           = "ac3_fixed",
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_AC3,
+const FFCodec ff_ac3_fixed_decoder = {
+    .p.name         = "ac3_fixed",
+    CODEC_LONG_NAME("ATSC A/52A (AC-3)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_AC3,
+    .p.priv_class   = &ac3_decoder_class,
     .priv_data_size = sizeof (AC3DecodeContext),
     .init           = ac3_decode_init,
+    .flush          = ac3_decode_flush,
     .close          = ac3_decode_end,
-    .decode         = ac3_decode_frame,
-    .capabilities   = AV_CODEC_CAP_CHANNEL_CONF |
+    FF_CODEC_DECODE_CB(ac3_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_CHANNEL_CONF |
                       AV_CODEC_CAP_DR1,
-    .long_name      = NULL_IF_CONFIG_SMALL("ATSC A/52A (AC-3)"),
-    .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S16P,
-                                                      AV_SAMPLE_FMT_NONE },
-    .priv_class     = &ac3_decoder_class,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16P),
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

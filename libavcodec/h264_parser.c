@@ -27,9 +27,9 @@
 
 #define UNCHECKED_BITSTREAM_READER 1
 
-#include <assert.h>
 #include <stdint.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/avutil.h"
 #include "libavutil/error.h"
 #include "libavutil/log.h"
@@ -40,12 +40,17 @@
 #include "get_bits.h"
 #include "golomb.h"
 #include "h264.h"
+#include "h264dsp.h"
+#include "h264_parse.h"
 #include "h264_sei.h"
 #include "h264_ps.h"
+#include "h2645_parse.h"
 #include "h264data.h"
-#include "internal.h"
 #include "mpegutils.h"
 #include "parser.h"
+#include "libavutil/refstruct.h"
+#include "parser_internal.h"
+#include "startcode.h"
 
 typedef struct H264ParseContext {
     ParseContext pc;
@@ -64,6 +69,15 @@ typedef struct H264ParseContext {
     int last_frame_num, last_picture_structure;
 } H264ParseContext;
 
+static int find_start_code(const uint8_t *buf, int buf_size,
+                                  int buf_index, int next_avc)
+{
+    uint32_t state = -1;
+
+    buf_index = avpriv_find_start_code(buf + buf_index, buf + next_avc + 1, &state) - buf - 1;
+
+    return FFMIN(buf_index, buf_size);
+}
 
 static int h264_find_frame_end(H264ParseContext *p, const uint8_t *buf,
                                int buf_size, void *logctx)
@@ -210,7 +224,10 @@ static int scan_mmco_reset(AVCodecParserContext *s, GetBitContext *gb,
 
     if (get_bits1(gb)) { // adaptive_ref_pic_marking_mode_flag
         int i;
-        for (i = 0; i < MAX_MMCO_COUNT; i++) {
+        for (i = 0; i < H264_MAX_MMCO_COUNT; i++) {
+            if (get_bits_left(gb) < 1)
+                return AVERROR_INVALIDDATA;
+
             MMCOOpcode opcode = get_ue_golomb_31(gb);
             if (opcode > (unsigned) MMCO_LONG) {
                 av_log(logctx, AV_LOG_ERROR,
@@ -247,7 +264,6 @@ static inline int parse_nal_units(AVCodecParserContext *s,
                                   const uint8_t * const buf, int buf_size)
 {
     H264ParseContext *p = s->priv_data;
-    H264Context *h = avctx->priv_data;
     H2645RBSP rbsp = { NULL };
     H2645NAL nal = { NULL };
     int buf_index, next_avc;
@@ -264,8 +280,8 @@ static inline int parse_nal_units(AVCodecParserContext *s,
     s->picture_structure = AV_PICTURE_STRUCTURE_UNKNOWN;
 
     ff_h264_sei_uninit(&p->sei);
-    p->sei.frame_packing.arrangement_cancel_flag = -1;
-    p->sei.unregistered.x264_build = -1;
+    p->sei.common.frame_packing.arrangement_cancel_flag = -1;
+    p->sei.common.unregistered.x264_build = -1;
 
     if (!buf_size)
         return 0;
@@ -342,7 +358,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
             p->poc.prev_frame_num_offset = 0;
             p->poc.prev_poc_msb          =
             p->poc.prev_poc_lsb          = 0;
-        /* fall through */
+            av_fallthrough;
         case H264_NAL_SLICE:
             get_ue_golomb_long(&nal.gb);  // skip first_mb_in_slice
             slice_type   = get_ue_golomb_31(&nal.gb);
@@ -363,13 +379,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
                 goto fail;
             }
 
-            av_buffer_unref(&p->ps.pps_ref);
-            p->ps.pps = NULL;
-            p->ps.sps = NULL;
-            p->ps.pps_ref = av_buffer_ref(p->ps.pps_list[pps_id]);
-            if (!p->ps.pps_ref)
-                goto fail;
-            p->ps.pps = (const PPS*)p->ps.pps_ref->data;
+            av_refstruct_replace(&p->ps.pps, p->ps.pps_list[pps_id]);
             p->ps.sps = p->ps.pps->sps;
             sps       = p->ps.sps;
 
@@ -553,14 +563,12 @@ static inline int parse_nal_units(AVCodecParserContext *s,
                 p->last_picture_structure = s->picture_structure;
                 p->last_frame_num = p->poc.frame_num;
             }
-            if (h && sps->timing_info_present_flag) {
+            if (sps->timing_info_present_flag) {
                 int64_t den = sps->time_scale;
-                if (p->sei.unregistered.x264_build >= 0)
-                    h->x264_build = p->sei.unregistered.x264_build;
-                if (h->x264_build < 44U)
+                if (p->sei.common.unregistered.x264_build < 44U)
                     den *= 2;
                 av_reduce(&avctx->framerate.den, &avctx->framerate.num,
-                          sps->num_units_in_tick * avctx->ticks_per_frame, den, 1 << 30);
+                          sps->num_units_in_tick * 2, den, 1 << 30);
             }
 
             av_freep(&rbsp.rbsp_buffer);
@@ -585,6 +593,7 @@ static int h264_parse(AVCodecParserContext *s,
 {
     H264ParseContext *p = s->priv_data;
     ParseContext *pc = &p->pc;
+    AVRational time_base = { 0, 1 };
     int next;
 
     if (!p->got_first) {
@@ -616,7 +625,7 @@ static int h264_parse(AVCodecParserContext *s,
     parse_nal_units(s, avctx, buf, buf_size);
 
     if (avctx->framerate.num)
-        avctx->time_base = av_inv_q(av_mul_q(avctx->framerate, (AVRational){avctx->ticks_per_frame, 1}));
+        time_base = av_inv_q(av_mul_q(avctx->framerate, (AVRational){2, 1}));
     if (p->sei.picture_timing.cpb_removal_delay >= 0) {
         s->dts_sync_point    = p->sei.buffering_period.present;
         s->dts_ref_dts_delta = p->sei.picture_timing.cpb_removal_delay;
@@ -632,19 +641,23 @@ static int h264_parse(AVCodecParserContext *s,
     }
 
     if (s->dts_sync_point >= 0) {
-        int64_t den = avctx->time_base.den * (int64_t)avctx->pkt_timebase.num;
+        int64_t den = time_base.den * (int64_t)avctx->pkt_timebase.num;
         if (den > 0) {
-            int64_t num = avctx->time_base.num * (int64_t)avctx->pkt_timebase.den;
+            int64_t num = time_base.num * (int64_t)avctx->pkt_timebase.den;
             if (s->dts != AV_NOPTS_VALUE) {
                 // got DTS from the stream, update reference timestamp
-                p->reference_dts = s->dts - av_rescale(s->dts_ref_dts_delta, num, den);
+                p->reference_dts = av_sat_sub64(s->dts, av_rescale(s->dts_ref_dts_delta, num, den));
             } else if (p->reference_dts != AV_NOPTS_VALUE) {
                 // compute DTS based on reference timestamp
-                s->dts = p->reference_dts + av_rescale(s->dts_ref_dts_delta, num, den);
+                s->dts = av_sat_add64(p->reference_dts, av_rescale(s->dts_ref_dts_delta, num, den));
             }
 
-            if (p->reference_dts != AV_NOPTS_VALUE && s->pts == AV_NOPTS_VALUE)
-                s->pts = s->dts + av_rescale(s->pts_dts_delta, num, den);
+            if (p->reference_dts != AV_NOPTS_VALUE && s->pts == AV_NOPTS_VALUE) {
+                int64_t pts_dts_delta = av_rescale(s->pts_dts_delta, num, den);
+                uint64_t pts = (uint64_t)s->dts + pts_dts_delta;
+                if (pts == av_sat_add64(s->dts, pts_dts_delta))
+                    s->pts = pts;
+            }
 
             if (s->dts_sync_point > 0)
                 p->reference_dts = s->dts; // new reference
@@ -656,7 +669,7 @@ static int h264_parse(AVCodecParserContext *s,
     return next;
 }
 
-static void h264_close(AVCodecParserContext *s)
+static av_cold void h264_close(AVCodecParserContext *s)
 {
     H264ParseContext *p = s->priv_data;
     ParseContext *pc = &p->pc;
@@ -677,10 +690,10 @@ static av_cold int init(AVCodecParserContext *s)
     return 0;
 }
 
-const AVCodecParser ff_h264_parser = {
-    .codec_ids      = { AV_CODEC_ID_H264 },
+const FFCodecParser ff_h264_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_H264),
     .priv_data_size = sizeof(H264ParseContext),
-    .parser_init    = init,
-    .parser_parse   = h264_parse,
-    .parser_close   = h264_close,
+    .init           = init,
+    .parse          = h264_parse,
+    .close          = h264_close,
 };

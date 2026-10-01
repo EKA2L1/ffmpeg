@@ -21,13 +21,11 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
 #include "libavutil/float_dsp.h"
-#include "libavutil/opt.h"
+#include "libavutil/mem.h"
 
 #include "audio.h"
 #include "avfilter.h"
-#include "formats.h"
 #include "filters.h"
-#include "internal.h"
 
 typedef struct AudioMultiplyContext {
     const AVClass *class;
@@ -76,6 +74,7 @@ static int activate(AVFilterContext *ctx)
             return AVERROR(ENOMEM);
 
         out->pts = s->frames[0]->pts;
+        out->duration = s->frames[0]->duration;
 
         if (av_get_packed_sample_fmt(ctx->inputs[0]->format) == AV_SAMPLE_FMT_FLT) {
             for (i = 0; i < s->planes; i++) {
@@ -92,7 +91,6 @@ static int activate(AVFilterContext *ctx)
                                      plane_samples);
             }
         }
-        emms_c();
 
         av_frame_free(&s->frames[0]);
         av_frame_free(&s->frames[1]);
@@ -113,7 +111,7 @@ static int activate(AVFilterContext *ctx)
 
     if (ff_outlink_frame_wanted(ctx->outputs[0])) {
         for (i = 0; i < 2; i++) {
-            if (ff_inlink_queued_samples(ctx->inputs[i]) > 0)
+            if (s->frames[i] || ff_inlink_queued_samples(ctx->inputs[i]) > 0)
                 continue;
             ff_inlink_request_frame(ctx->inputs[i]);
             return 0;
@@ -128,8 +126,8 @@ static int config_output(AVFilterLink *outlink)
     AudioMultiplyContext *s = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
 
-    s->channels = inlink->channels;
-    s->planes = av_sample_fmt_is_planar(inlink->format) ? inlink->channels : 1;
+    s->channels = inlink->ch_layout.nb_channels;
+    s->planes = av_sample_fmt_is_planar(inlink->format) ? inlink->ch_layout.nb_channels : 1;
     s->samples_align = 16;
 
     return 0;
@@ -171,9 +169,9 @@ static const AVFilterPad outputs[] = {
     },
 };
 
-const AVFilter ff_af_amultiply = {
-    .name           = "amultiply",
-    .description    = NULL_IF_CONFIG_SMALL("Multiply two audio streams."),
+const FFFilter ff_af_amultiply = {
+    .p.name         = "amultiply",
+    .p.description  = NULL_IF_CONFIG_SMALL("Multiply two audio streams."),
     .priv_size      = sizeof(AudioMultiplyContext),
     .init           = init,
     .uninit         = uninit,

@@ -19,12 +19,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
+#include "libavutil/thread.h"
+#include "libavutil/version.h"
+#include "codec_internal.h"
 #include "dirac.h"
 #include "encode.h"
 #include "put_bits.h"
-#include "internal.h"
 #include "version.h"
 
 #include "vc2enc_dwt.h"
@@ -39,8 +42,9 @@
 typedef struct VC2BaseVideoFormat {
     enum AVPixelFormat pix_fmt;
     AVRational time_base;
-    int width, height, interlaced, level;
-    const char *name;
+    int width, height;
+    uint8_t interlaced, level;
+    char name[13];
 } VC2BaseVideoFormat;
 
 static const VC2BaseVideoFormat base_video_fmts[] = {
@@ -102,9 +106,11 @@ typedef struct Plane {
 } Plane;
 
 typedef struct SliceArgs {
-    PutBitContext pb;
-    int cache[DIRAC_MAX_QUANT_INDEX];
-    void *ctx;
+    const struct VC2EncContext *ctx;
+    union {
+        int cache[DIRAC_MAX_QUANT_INDEX];
+        uint8_t *buf;
+    };
     int x;
     int y;
     int quant_idx;
@@ -114,9 +120,9 @@ typedef struct SliceArgs {
 } SliceArgs;
 
 typedef struct TransformArgs {
-    void *ctx;
+    const struct VC2EncContext *ctx;
     Plane *plane;
-    void *idata;
+    const void *idata;
     ptrdiff_t istride;
     int field;
     VC2TransformContext t;
@@ -181,48 +187,53 @@ typedef struct VC2EncContext {
     enum DiracParseCodes last_parse_code;
 } VC2EncContext;
 
-static av_always_inline void put_vc2_ue_uint(PutBitContext *pb, uint32_t val)
+/// x_k x_{k-1} ... x_0 -> 0 x_k 0 x_{k - 1} ... 0 x_0
+static uint16_t interleaved_ue_golomb_tab[256];
+/// 1 x_{k-1} ... x_0 -> 0 0 0 x_{k - 1} ... 0 x_0
+static uint16_t top_interleaved_ue_golomb_tab[256];
+/// 1 x_{k-1} ... x_0 -> 2 * k
+static uint8_t golomb_len_tab[256];
+/// quant -> av_log2(ff_dirac_qscale_tab[quant]) + 32
+static uint8_t qscale_len_tab[FF_ARRAY_ELEMS(ff_dirac_qscale_tab)];
+
+static av_cold void vc2_init_static_data(void)
 {
-    int i;
-    int pbits = 0, bits = 0, topbit = 1, maxval = 1;
-
-    if (!val++) {
-        put_bits(pb, 1, 1);
-        return;
+    interleaved_ue_golomb_tab[1] = 1;
+    for (unsigned i = 2; i < 256; ++i) {
+        golomb_len_tab[i] = golomb_len_tab[i >> 1] + 2;
+        interleaved_ue_golomb_tab[i] = (interleaved_ue_golomb_tab[i >> 1] << 2) | (i & 1);
+        top_interleaved_ue_golomb_tab[i] = interleaved_ue_golomb_tab[i] ^ (1 << golomb_len_tab[i]);
     }
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(qscale_len_tab); ++i)
+        qscale_len_tab[i] = av_log2(ff_dirac_qscale_tab[i]) + 32;
+}
 
-    while (val > maxval) {
-        topbit <<= 1;
-        maxval <<= 1;
-        maxval |=  1;
+static av_always_inline void put_vc2_ue_uint_inline(PutBitContext *pb, uint32_t val)
+{
+    uint64_t pbits = 1;
+    int bits = 1;
+
+    ++val;
+
+    while (val >> 8) {
+        pbits |= (uint64_t)interleaved_ue_golomb_tab[val & 0xff] << bits;
+        val  >>= 8;
+        bits  += 16;
     }
+    pbits |= (uint64_t)top_interleaved_ue_golomb_tab[val] << bits;
+    bits  += golomb_len_tab[val];
 
-    bits = ff_log2(topbit);
+    put_bits63(pb, bits, pbits);
+}
 
-    for (i = 0; i < bits; i++) {
-        topbit >>= 1;
-        pbits <<= 2;
-        if (val & topbit)
-            pbits |= 0x1;
-    }
-
-    put_bits(pb, bits*2 + 1, (pbits << 1) | 1);
+static av_noinline void put_vc2_ue_uint(PutBitContext *pb, uint32_t val)
+{
+    put_vc2_ue_uint_inline(pb, val);
 }
 
 static av_always_inline int count_vc2_ue_uint(uint32_t val)
 {
-    int topbit = 1, maxval = 1;
-
-    if (!val++)
-        return 1;
-
-    while (val > maxval) {
-        topbit <<= 1;
-        maxval <<= 1;
-        maxval |=  1;
-    }
-
-    return ff_log2(topbit)*2 + 1;
+    return 2 * av_log2(val + 1) + 1;
 }
 
 /* VC-2 10.4 - parse_info() */
@@ -232,7 +243,7 @@ static void encode_parse_info(VC2EncContext *s, enum DiracParseCodes pcode)
 
     align_put_bits(&s->pb);
 
-    cur_pos = put_bits_count(&s->pb) >> 3;
+    cur_pos = put_bytes_count(&s->pb, 0);
 
     /* Magic string */
     ff_put_string(&s->pb, "BBCD", 0);
@@ -525,8 +536,8 @@ static void encode_picture_start(VC2EncContext *s)
 #define QUANT(c, mul, add, shift) (((mul) * (c) + (add)) >> (shift))
 
 /* VC-2 13.5.5.2 - slice_band() */
-static void encode_subband(VC2EncContext *s, PutBitContext *pb, int sx, int sy,
-                           SubBand *b, int quant)
+static void encode_subband(const VC2EncContext *s, PutBitContext *pb,
+                           int sx, int sy, const SubBand *b, int quant)
 {
     int x, y;
 
@@ -538,12 +549,12 @@ static void encode_subband(VC2EncContext *s, PutBitContext *pb, int sx, int sy,
     dwtcoef *coeff = b->buf + top * b->stride;
     const uint64_t q_m = ((uint64_t)(s->qmagic_lut[quant][0])) << 2;
     const uint64_t q_a = s->qmagic_lut[quant][1];
-    const int q_s = av_log2(ff_dirac_qscale_tab[quant]) + 32;
+    const int q_s = qscale_len_tab[quant];
 
     for (y = top; y < bottom; y++) {
         for (x = left; x < right; x++) {
             uint32_t c_abs = QUANT(FFABS(coeff[x]), q_m, q_a, q_s);
-            put_vc2_ue_uint(pb, c_abs);
+            put_vc2_ue_uint_inline(pb, c_abs);
             if (c_abs)
                 put_bits(pb, 1, coeff[x] < 0);
         }
@@ -556,7 +567,7 @@ static int count_hq_slice(SliceArgs *slice, int quant_idx)
     int x, y;
     uint8_t quants[MAX_DWT_LEVELS][4];
     int bits = 0, p, level, orientation;
-    VC2EncContext *s = slice->ctx;
+    const VC2EncContext *s = slice->ctx;
 
     if (slice->cache[quant_idx])
         return slice->cache[quant_idx];
@@ -574,12 +585,12 @@ static int count_hq_slice(SliceArgs *slice, int quant_idx)
         bits += 8;
         for (level = 0; level < s->wavelet_depth; level++) {
             for (orientation = !!level; orientation < 4; orientation++) {
-                SubBand *b = &s->plane[p].band[level][orientation];
+                const SubBand *b = &s->plane[p].band[level][orientation];
 
                 const int q_idx = quants[level][orientation];
                 const uint64_t q_m = ((uint64_t)s->qmagic_lut[q_idx][0]) << 2;
                 const uint64_t q_a = s->qmagic_lut[q_idx][1];
-                const int q_s = av_log2(ff_dirac_qscale_tab[q_idx]) + 32;
+                const int q_s = qscale_len_tab[q_idx];
 
                 const int left   = b->width  * slice->x    / s->num_x;
                 const int right  = b->width  *(slice->x+1) / s->num_x;
@@ -610,13 +621,13 @@ static int count_hq_slice(SliceArgs *slice, int quant_idx)
     return bits;
 }
 
-/* Approaches the best possible quantizer asymptotically, its kinda exaustive
+/* Approaches the best possible quantizer asymptotically, its kinda exhaustive
  * but we have a LUT to get the coefficient size in bits. Guaranteed to never
  * overshoot, which is apparently very important when streaming */
 static int rate_control(AVCodecContext *avctx, void *arg)
 {
     SliceArgs *slice_dat = arg;
-    VC2EncContext *s = slice_dat->ctx;
+    const VC2EncContext *s = slice_dat->ctx;
     const int top = slice_dat->bits_ceil;
     const int bottom = slice_dat->bits_floor;
     int quant_buf[2] = {-1, -1};
@@ -721,9 +732,9 @@ static int calc_slice_sizes(VC2EncContext *s)
 /* VC-2 13.5.3 - hq_slice */
 static int encode_hq_slice(AVCodecContext *avctx, void *arg)
 {
-    SliceArgs *slice_dat = arg;
-    VC2EncContext *s = slice_dat->ctx;
-    PutBitContext *pb = &slice_dat->pb;
+    const SliceArgs *slice_dat = arg;
+    const VC2EncContext *s = slice_dat->ctx;
+    PutBitContext pb0, *const pb = &pb0;
     const int slice_x = slice_dat->x;
     const int slice_y = slice_dat->y;
     const int quant_idx = slice_dat->quant_idx;
@@ -732,8 +743,9 @@ static int encode_hq_slice(AVCodecContext *avctx, void *arg)
     int p, level, orientation;
 
     /* The reference decoder ignores it, and its typical length is 0 */
-    memset(put_bits_ptr(pb), 0, s->prefix_bytes);
-    skip_put_bytes(pb, s->prefix_bytes);
+    memset(slice_dat->buf, 0, s->prefix_bytes);
+
+    init_put_bits(pb, slice_dat->buf + s->prefix_bytes, slice_dat->bytes - s->prefix_bytes);
 
     put_bits(pb, 8, quant_idx);
 
@@ -745,7 +757,7 @@ static int encode_hq_slice(AVCodecContext *avctx, void *arg)
     /* Luma + 2 Chroma planes */
     for (p = 0; p < 3; p++) {
         int bytes_start, bytes_len, pad_s, pad_c;
-        bytes_start = put_bits_count(pb) >> 3;
+        bytes_start = put_bytes_count(pb, 0);
         put_bits(pb, 8, 0);
         for (level = 0; level < s->wavelet_depth; level++) {
             for (orientation = !!level; orientation < 4; orientation++) {
@@ -754,10 +766,10 @@ static int encode_hq_slice(AVCodecContext *avctx, void *arg)
                                quants[level][orientation]);
             }
         }
-        align_put_bits(pb);
-        bytes_len = (put_bits_count(pb) >> 3) - bytes_start - 1;
+        flush_put_bits(pb);
+        bytes_len = put_bytes_output(pb) - bytes_start - 1;
         if (p == 2) {
-            int len_diff = slice_bytes_max - (put_bits_count(pb) >> 3);
+            int len_diff = slice_bytes_max - put_bytes_output(pb);
             pad_s = FFALIGN((bytes_len + len_diff), s->size_scaler)/s->size_scaler;
             pad_c = (pad_s*s->size_scaler) - bytes_len;
         } else {
@@ -765,7 +777,6 @@ static int encode_hq_slice(AVCodecContext *avctx, void *arg)
             pad_c = (pad_s*s->size_scaler) - bytes_len;
         }
         pb->buf[bytes_start] = pad_s;
-        flush_put_bits(pb);
         /* vc2-reference uses that padding that decodes to '0' coeffs */
         memset(put_bits_ptr(pb), 0xFF, pad_c);
         skip_put_bytes(pb, pad_c);
@@ -787,7 +798,7 @@ static int encode_slices(VC2EncContext *s)
     for (slice_y = 0; slice_y < s->num_y; slice_y++) {
         for (slice_x = 0; slice_x < s->num_x; slice_x++) {
             SliceArgs *args = &enc_args[s->num_x*slice_y + slice_x];
-            init_put_bits(&args->pb, buf + skip, args->bytes+s->prefix_bytes);
+            args->buf = buf + skip;
             skip += args->bytes;
         }
     }
@@ -838,7 +849,7 @@ static int encode_slices(VC2EncContext *s)
 static int dwt_plane(AVCodecContext *avctx, void *arg)
 {
     TransformArgs *transform_dat = arg;
-    VC2EncContext *s = transform_dat->ctx;
+    const VC2EncContext *s = transform_dat->ctx;
     const void *frame_data = transform_dat->idata;
     const ptrdiff_t linesize = transform_dat->istride;
     const int field = transform_dat->field;
@@ -917,10 +928,8 @@ static int encode_frame(VC2EncContext *s, AVPacket *avpkt, const AVFrame *frame,
     if (field < 2) {
         ret = ff_get_encode_buffer(s->avctx, avpkt,
                                    max_frame_bytes << s->interlaced, 0);
-        if (ret) {
-            av_log(s->avctx, AV_LOG_ERROR, "Error getting output packet.\n");
+        if (ret < 0)
             return ret;
-        }
         init_put_bits(&s->pb, avpkt->data, avpkt->size);
     }
 
@@ -982,7 +991,7 @@ static av_cold int vc2_encode_frame(AVCodecContext *avctx, AVPacket *avpkt,
     }
 
     s->slice_min_bytes = s->slice_max_bytes - s->slice_max_bytes*(s->tolerance/100.0f);
-    if (s->slice_min_bytes < 0)
+    if (s->slice_min_bytes < 0 || s->slice_max_bytes > INT_MAX >> 3)
         return AVERROR(EINVAL);
 
     ret = encode_frame(s, avpkt, frame, aux_data, header_size, s->interlaced);
@@ -1021,11 +1030,12 @@ static av_cold int vc2_encode_end(AVCodecContext *avctx)
 
 static av_cold int vc2_encode_init(AVCodecContext *avctx)
 {
+    static AVOnce init_static_once = AV_ONCE_INIT;
     Plane *p;
     SubBand *b;
-    int i, level, o, shift, ret;
-    const AVPixFmtDescriptor *fmt = av_pix_fmt_desc_get(avctx->pix_fmt);
-    const int depth = fmt->comp[0].depth;
+    int i, level, o, shift;
+    const AVPixFmtDescriptor *pixdesc;
+    int depth;
     VC2EncContext *s = avctx->priv_data;
 
     s->picture_number = 0;
@@ -1074,13 +1084,13 @@ static av_cold int vc2_encode_init(AVCodecContext *avctx)
     if ((s->slice_width  & (s->slice_width  - 1)) ||
         (s->slice_height & (s->slice_height - 1))) {
         av_log(avctx, AV_LOG_ERROR, "Slice size is not a power of two!\n");
-        return AVERROR_UNKNOWN;
+        return AVERROR(EINVAL);
     }
 
     if ((s->slice_width > avctx->width) ||
         (s->slice_height > avctx->height)) {
         av_log(avctx, AV_LOG_ERROR, "Slice size is bigger than the image!\n");
-        return AVERROR_UNKNOWN;
+        return AVERROR(EINVAL);
     }
 
     if (s->base_vf <= 0) {
@@ -1090,19 +1100,20 @@ static av_cold int vc2_encode_init(AVCodecContext *avctx)
         } else {
             av_log(avctx, AV_LOG_WARNING, "Given format does not strictly comply with "
                    "the specifications, decrease strictness to use it.\n");
-            return AVERROR_UNKNOWN;
+            return AVERROR(EINVAL);
         }
     } else {
         av_log(avctx, AV_LOG_INFO, "Selected base video format = %i (%s)\n",
                s->base_vf, base_video_fmts[s->base_vf].name);
     }
 
+    pixdesc = av_pix_fmt_desc_get(avctx->pix_fmt);
     /* Chroma subsampling */
-    ret = av_pix_fmt_get_chroma_sub_sample(avctx->pix_fmt, &s->chroma_x_shift, &s->chroma_y_shift);
-    if (ret)
-        return ret;
+    s->chroma_x_shift = pixdesc->log2_chroma_w;
+    s->chroma_y_shift = pixdesc->log2_chroma_h;
 
     /* Bit depth and color range index */
+    depth = pixdesc->comp[0].depth;
     if (depth == 8 && avctx->color_range == AVCOL_RANGE_JPEG) {
         s->bpp = 1;
         s->bpp_idx = 1;
@@ -1135,7 +1146,7 @@ static av_cold int vc2_encode_init(AVCodecContext *avctx)
         p->coef_stride = FFALIGN(p->dwt_width, 32);
         p->coef_buf = av_mallocz(p->coef_stride*p->dwt_height*sizeof(dwtcoef));
         if (!p->coef_buf)
-            goto alloc_fail;
+            return AVERROR(ENOMEM);
         for (level = s->wavelet_depth-1; level >= 0; level--) {
             w = w >> 1;
             h = h >> 1;
@@ -1154,7 +1165,7 @@ static av_cold int vc2_encode_init(AVCodecContext *avctx)
                                       s->plane[i].coef_stride,
                                       s->plane[i].dwt_height,
                                       s->slice_width, s->slice_height))
-            goto alloc_fail;
+            return AVERROR(ENOMEM);
     }
 
     /* Slices */
@@ -1163,7 +1174,7 @@ static av_cold int vc2_encode_init(AVCodecContext *avctx)
 
     s->slice_args = av_calloc(s->num_x*s->num_y, sizeof(SliceArgs));
     if (!s->slice_args)
-        goto alloc_fail;
+        return AVERROR(ENOMEM);
 
     for (i = 0; i < 116; i++) {
         const uint64_t qf = ff_dirac_qscale_tab[i];
@@ -1182,29 +1193,26 @@ static av_cold int vc2_encode_init(AVCodecContext *avctx)
         }
     }
 
-    return 0;
+    ff_thread_once(&init_static_once, vc2_init_static_data);
 
-alloc_fail:
-    vc2_encode_end(avctx);
-    av_log(avctx, AV_LOG_ERROR, "Unable to allocate memory!\n");
-    return AVERROR(ENOMEM);
+    return 0;
 }
 
 #define VC2ENC_FLAGS (AV_OPT_FLAG_ENCODING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
 static const AVOption vc2enc_options[] = {
-    {"tolerance",     "Max undershoot in percent", offsetof(VC2EncContext, tolerance), AV_OPT_TYPE_DOUBLE, {.dbl = 5.0f}, 0.0f, 45.0f, VC2ENC_FLAGS, "tolerance"},
-    {"slice_width",   "Slice width",  offsetof(VC2EncContext, slice_width), AV_OPT_TYPE_INT, {.i64 = 32}, 32, 1024, VC2ENC_FLAGS, "slice_width"},
-    {"slice_height",  "Slice height", offsetof(VC2EncContext, slice_height), AV_OPT_TYPE_INT, {.i64 = 16}, 8, 1024, VC2ENC_FLAGS, "slice_height"},
-    {"wavelet_depth", "Transform depth", offsetof(VC2EncContext, wavelet_depth), AV_OPT_TYPE_INT, {.i64 = 4}, 1, 5, VC2ENC_FLAGS, "wavelet_depth"},
-    {"wavelet_type",  "Transform type",  offsetof(VC2EncContext, wavelet_idx), AV_OPT_TYPE_INT, {.i64 = VC2_TRANSFORM_9_7}, 0, VC2_TRANSFORMS_NB, VC2ENC_FLAGS, "wavelet_idx"},
-        {"9_7",          "Deslauriers-Dubuc (9,7)", 0, AV_OPT_TYPE_CONST, {.i64 = VC2_TRANSFORM_9_7},    INT_MIN, INT_MAX, VC2ENC_FLAGS, "wavelet_idx"},
-        {"5_3",          "LeGall (5,3)",            0, AV_OPT_TYPE_CONST, {.i64 = VC2_TRANSFORM_5_3},    INT_MIN, INT_MAX, VC2ENC_FLAGS, "wavelet_idx"},
-        {"haar",         "Haar (with shift)",       0, AV_OPT_TYPE_CONST, {.i64 = VC2_TRANSFORM_HAAR_S}, INT_MIN, INT_MAX, VC2ENC_FLAGS, "wavelet_idx"},
-        {"haar_noshift", "Haar (without shift)",    0, AV_OPT_TYPE_CONST, {.i64 = VC2_TRANSFORM_HAAR},   INT_MIN, INT_MAX, VC2ENC_FLAGS, "wavelet_idx"},
-    {"qm", "Custom quantization matrix", offsetof(VC2EncContext, quant_matrix), AV_OPT_TYPE_INT, {.i64 = VC2_QM_DEF}, 0, VC2_QM_NB, VC2ENC_FLAGS, "quant_matrix"},
-        {"default",   "Default from the specifications", 0, AV_OPT_TYPE_CONST, {.i64 = VC2_QM_DEF}, INT_MIN, INT_MAX, VC2ENC_FLAGS, "quant_matrix"},
-        {"color",     "Prevents low bitrate discoloration", 0, AV_OPT_TYPE_CONST, {.i64 = VC2_QM_COL}, INT_MIN, INT_MAX, VC2ENC_FLAGS, "quant_matrix"},
-        {"flat",      "Optimize for PSNR", 0, AV_OPT_TYPE_CONST, {.i64 = VC2_QM_FLAT}, INT_MIN, INT_MAX, VC2ENC_FLAGS, "quant_matrix"},
+    {"tolerance",     "Max undershoot in percent", offsetof(VC2EncContext, tolerance), AV_OPT_TYPE_DOUBLE, {.dbl = 5.0f}, 0.0f, 45.0f, VC2ENC_FLAGS, .unit = "tolerance"},
+    {"slice_width",   "Slice width",  offsetof(VC2EncContext, slice_width), AV_OPT_TYPE_INT, {.i64 = 32}, 32, 1024, VC2ENC_FLAGS, .unit = "slice_width"},
+    {"slice_height",  "Slice height", offsetof(VC2EncContext, slice_height), AV_OPT_TYPE_INT, {.i64 = 16}, 8, 1024, VC2ENC_FLAGS, .unit = "slice_height"},
+    {"wavelet_depth", "Transform depth", offsetof(VC2EncContext, wavelet_depth), AV_OPT_TYPE_INT, {.i64 = 4}, 1, 5, VC2ENC_FLAGS, .unit = "wavelet_depth"},
+    {"wavelet_type",  "Transform type",  offsetof(VC2EncContext, wavelet_idx), AV_OPT_TYPE_INT, {.i64 = VC2_TRANSFORM_9_7}, 0, VC2_TRANSFORMS_NB, VC2ENC_FLAGS, .unit = "wavelet_idx"},
+        {"9_7",          "Deslauriers-Dubuc (9,7)", 0, AV_OPT_TYPE_CONST, {.i64 = VC2_TRANSFORM_9_7},    INT_MIN, INT_MAX, VC2ENC_FLAGS, .unit = "wavelet_idx"},
+        {"5_3",          "LeGall (5,3)",            0, AV_OPT_TYPE_CONST, {.i64 = VC2_TRANSFORM_5_3},    INT_MIN, INT_MAX, VC2ENC_FLAGS, .unit = "wavelet_idx"},
+        {"haar",         "Haar (with shift)",       0, AV_OPT_TYPE_CONST, {.i64 = VC2_TRANSFORM_HAAR_S}, INT_MIN, INT_MAX, VC2ENC_FLAGS, .unit = "wavelet_idx"},
+        {"haar_noshift", "Haar (without shift)",    0, AV_OPT_TYPE_CONST, {.i64 = VC2_TRANSFORM_HAAR},   INT_MIN, INT_MAX, VC2ENC_FLAGS, .unit = "wavelet_idx"},
+    {"qm", "Custom quantization matrix", offsetof(VC2EncContext, quant_matrix), AV_OPT_TYPE_INT, {.i64 = VC2_QM_DEF}, 0, VC2_QM_NB, VC2ENC_FLAGS, .unit = "quant_matrix"},
+        {"default",   "Default from the specifications", 0, AV_OPT_TYPE_CONST, {.i64 = VC2_QM_DEF}, INT_MIN, INT_MAX, VC2ENC_FLAGS, .unit = "quant_matrix"},
+        {"color",     "Prevents low bitrate discoloration", 0, AV_OPT_TYPE_CONST, {.i64 = VC2_QM_COL}, INT_MIN, INT_MAX, VC2ENC_FLAGS, .unit = "quant_matrix"},
+        {"flat",      "Optimize for PSNR", 0, AV_OPT_TYPE_CONST, {.i64 = VC2_QM_FLAT}, INT_MIN, INT_MAX, VC2ENC_FLAGS, .unit = "quant_matrix"},
     {NULL}
 };
 
@@ -1216,7 +1224,7 @@ static const AVClass vc2enc_class = {
     .version = LIBAVUTIL_VERSION_INT
 };
 
-static const AVCodecDefault vc2enc_defaults[] = {
+static const FFCodecDefault vc2enc_defaults[] = {
     { "b",              "600000000"   },
     { NULL },
 };
@@ -1228,18 +1236,20 @@ static const enum AVPixelFormat allowed_pix_fmts[] = {
     AV_PIX_FMT_NONE
 };
 
-const AVCodec ff_vc2_encoder = {
-    .name           = "vc2",
-    .long_name      = NULL_IF_CONFIG_SMALL("SMPTE VC-2"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_DIRAC,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SLICE_THREADS,
+const FFCodec ff_vc2_encoder = {
+    .p.name         = "vc2",
+    CODEC_LONG_NAME("SMPTE VC-2"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_DIRAC,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SLICE_THREADS |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
     .priv_data_size = sizeof(VC2EncContext),
     .init           = vc2_encode_init,
     .close          = vc2_encode_end,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
-    .encode2        = vc2_encode_frame,
-    .priv_class     = &vc2enc_class,
+    FF_CODEC_ENCODE_CB(vc2_encode_frame),
+    .p.priv_class   = &vc2enc_class,
     .defaults       = vc2enc_defaults,
-    .pix_fmts       = allowed_pix_fmts
+    CODEC_PIXFMTS_ARRAY(allowed_pix_fmts),
+    .color_ranges   = AVCOL_RANGE_MPEG | AVCOL_RANGE_JPEG,
 };

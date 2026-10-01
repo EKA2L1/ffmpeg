@@ -23,6 +23,7 @@
 #include "libavutil/intreadwrite.h"
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "avio_internal.h"
 
@@ -80,8 +81,7 @@ static int create_audio_stream(AVFormatContext *s, SIFFContext *c)
         return AVERROR(ENOMEM);
     ast->codecpar->codec_type            = AVMEDIA_TYPE_AUDIO;
     ast->codecpar->codec_id              = AV_CODEC_ID_PCM_U8;
-    ast->codecpar->channels              = 1;
-    ast->codecpar->channel_layout        = AV_CH_LAYOUT_MONO;
+    ast->codecpar->ch_layout             = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     ast->codecpar->bits_per_coded_sample = 8;
     ast->codecpar->sample_rate           = c->rate;
     avpriv_set_pts_info(ast, 16, 1, c->rate);
@@ -199,7 +199,10 @@ static int siff_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (c->cur_frame >= c->frames)
             return AVERROR_EOF;
         if (c->curstrm == -1) {
-            c->pktsize = avio_rl32(s->pb) - 4;
+            unsigned pktsize = avio_rl32(s->pb);
+            if (pktsize < 4)
+                return AVERROR_INVALIDDATA;
+            c->pktsize = pktsize - 4;
             c->flags   = avio_rl16(s->pb);
             if (c->flags & VB_HAS_AUDIO && !c->has_audio)
                 return AVERROR_INVALIDDATA;
@@ -229,7 +232,7 @@ static int siff_read_packet(AVFormatContext *s, AVPacket *pkt)
         } else {
             int pktsize = av_get_packet(s->pb, pkt, c->sndsize - 4);
             if (pktsize < 0)
-                return AVERROR(EIO);
+                return AVERROR_INVALIDDATA;
             pkt->stream_index = 1;
             pkt->duration     = pktsize;
             c->curstrm        = 0;
@@ -243,18 +246,18 @@ static int siff_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (!pktsize)
             return AVERROR_EOF;
         if (pktsize <= 0)
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         pkt->duration = pktsize;
     }
     return pkt->size;
 }
 
-const AVInputFormat ff_siff_demuxer = {
-    .name           = "siff",
-    .long_name      = NULL_IF_CONFIG_SMALL("Beam Software SIFF"),
+const FFInputFormat ff_siff_demuxer = {
+    .p.name         = "siff",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Beam Software SIFF"),
+    .p.extensions   = "vb,son",
     .priv_data_size = sizeof(SIFFContext),
     .read_probe     = siff_probe,
     .read_header    = siff_read_header,
     .read_packet    = siff_read_packet,
-    .extensions     = "vb,son",
 };

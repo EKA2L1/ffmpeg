@@ -19,11 +19,11 @@
  */
 
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 typedef struct TMidEqualizerContext {
@@ -178,6 +178,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         } else {
             s->l_frames++;
         }
+        if (!s->frames[idx])
+            return AVERROR_EOF;
         in = av_frame_clone(s->frames[idx]);
         if (!in)
             return AVERROR(ENOMEM);
@@ -420,14 +422,14 @@ static const AVFilterPad tmidequalizer_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_tmidequalizer = {
-    .name          = "tmidequalizer",
-    .description   = NULL_IF_CONFIG_SMALL("Apply Temporal Midway Equalization."),
+const FFFilter ff_vf_tmidequalizer = {
+    .p.name        = "tmidequalizer",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply Temporal Midway Equalization."),
+    .p.priv_class  = &tmidequalizer_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .priv_size     = sizeof(TMidEqualizerContext),
     .uninit        = uninit,
     FILTER_INPUTS(tmidequalizer_inputs),
     FILTER_OUTPUTS(tmidequalizer_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .priv_class    = &tmidequalizer_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
 };

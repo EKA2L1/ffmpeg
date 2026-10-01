@@ -25,6 +25,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 
 static int usage(const char *argv0, int ret)
 {
@@ -118,20 +119,18 @@ static int handle_file(struct Tracks *tracks, const char *file)
 {
     AVFormatContext *ctx = NULL;
     int err = 0, i, orig_tracks = tracks->nb_tracks;
-    char errbuf[50], *ptr;
+    char *ptr;
     struct Track *track;
 
     err = avformat_open_input(&ctx, file, NULL, NULL);
     if (err < 0) {
-        av_strerror(err, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Unable to open %s: %s\n", file, errbuf);
+        fprintf(stderr, "Unable to open %s: %s\n", file, av_err2str(err));
         return 1;
     }
 
     err = avformat_find_stream_info(ctx, NULL);
     if (err < 0) {
-        av_strerror(err, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Unable to identify %s: %s\n", file, errbuf);
+        fprintf(stderr, "Unable to identify %s: %s\n", file, av_err2str(err));
         goto fail;
     }
 
@@ -191,7 +190,7 @@ static int handle_file(struct Tracks *tracks, const char *file)
                                                 track->timescale, AV_ROUND_UP));
 
         if (track->is_audio) {
-            track->channels    = st->codecpar->channels;
+            track->channels    = st->codecpar->ch_layout.nb_channels;
             track->sample_rate = st->codecpar->sample_rate;
         }
         if (track->is_video) {

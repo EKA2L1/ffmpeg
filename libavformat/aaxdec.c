@@ -20,8 +20,10 @@
  */
 
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct AAXColumn {
@@ -249,8 +251,14 @@ static int aax_read_header(AVFormatContext *s)
 
                 start = avio_rb32(pb);
                 size  = avio_rb32(pb);
+                if (!size)
+                    return AVERROR_INVALIDDATA;
                 a->segments[r].start = start + a->data_offset;
                 a->segments[r].end   = a->segments[r].start + size;
+                if (r &&
+                    a->segments[r].start < a->segments[r-1].end &&
+                    a->segments[r].end   > a->segments[r-1].start)
+                    return AVERROR_INVALIDDATA;
             } else
                 return AVERROR_INVALIDDATA;
         }
@@ -279,9 +287,9 @@ static int aax_read_header(AVFormatContext *s)
         ret = ff_get_extradata(s, par, pb, extradata_size);
         if (ret < 0)
             return ret;
-        par->channels    = AV_RB8 (par->extradata + 7);
+        par->ch_layout.nb_channels = AV_RB8 (par->extradata + 7);
         par->sample_rate = AV_RB32(par->extradata + 8);
-        if (!par->channels || !par->sample_rate)
+        if (!par->ch_layout.nb_channels || !par->sample_rate)
             return AVERROR_INVALIDDATA;
 
         avpriv_set_pts_info(st, 64, 32, par->sample_rate);
@@ -299,7 +307,7 @@ static int aax_read_packet(AVFormatContext *s, AVPacket *pkt)
     AAXContext *a = s->priv_data;
     AVCodecParameters *par = s->streams[0]->codecpar;
     AVIOContext *pb = s->pb;
-    const int size = 18 * par->channels;
+    const int size = 18 * par->ch_layout.nb_channels;
     int ret, extradata_size = 0;
     uint8_t *extradata = NULL;
     int skip = 0;
@@ -337,9 +345,10 @@ static int aax_read_packet(AVFormatContext *s, AVPacket *pkt)
             extradata = av_malloc(extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
             if (!extradata)
                 return AVERROR(ENOMEM);
-            if (avio_read(pb, extradata, extradata_size) != extradata_size) {
+            ret = ffio_read_size(pb, extradata, extradata_size);
+            if (ret < 0) {
                 av_free(extradata);
-                return AVERROR(EIO);
+                return ret;
             }
             memset(extradata + extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         }
@@ -348,7 +357,7 @@ static int aax_read_packet(AVFormatContext *s, AVPacket *pkt)
     ret = av_get_packet(pb, pkt, size);
     if (ret != size) {
         av_free(extradata);
-        return ret < 0 ? ret : AVERROR(EIO);
+        return ret < 0 ? ret : AVERROR_INVALIDDATA;
     }
     pkt->duration = 1;
     pkt->stream_index = 0;
@@ -376,15 +385,15 @@ static int aax_read_close(AVFormatContext *s)
     return 0;
 }
 
-const AVInputFormat ff_aax_demuxer = {
-    .name           = "aax",
-    .long_name      = NULL_IF_CONFIG_SMALL("CRI AAX"),
+const FFInputFormat ff_aax_demuxer = {
+    .p.name         = "aax",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("CRI AAX"),
+    .p.extensions   = "aax",
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .priv_data_size = sizeof(AAXContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = aax_probe,
     .read_header    = aax_read_header,
     .read_packet    = aax_read_packet,
     .read_close     = aax_read_close,
-    .extensions     = "aax",
-    .flags          = AVFMT_GENERIC_INDEX,
 };

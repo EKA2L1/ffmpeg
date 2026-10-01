@@ -19,9 +19,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "mpeg.h"
 
@@ -72,6 +76,9 @@ static int mpegps_probe(const AVProbeData *p)
             int pes  = endpes <= i && check_pes(p->buf + i, p->buf + p->buf_size);
             int pack = check_pack_header(p->buf + i);
 
+            if (len > INT_MAX - i)
+                break;
+
             if (code == SYSTEM_HEADER_START_CODE)
                 sys++;
             else if (code == PACK_START_CODE && pack)
@@ -106,7 +113,7 @@ static int mpegps_probe(const AVProbeData *p)
                           : AVPROBE_SCORE_EXTENSION / 2; // 1 more than .mpg
     if ((!!vid ^ !!audio) && (audio > 4 || vid > 1) && !sys &&
         !pspack && p->buf_size > 2048 && vid + audio > invalid) /* PES stream */
-        return (audio > 12 || vid > 6 + 2 * invalid) ? AVPROBE_SCORE_EXTENSION + 2
+        return (audio > 12 || vid > 6 + 2 * invalid) ? AVPROBE_SCORE_EXTENSION + 1
                                                      : AVPROBE_SCORE_EXTENSION / 2;
 
     // 02-Penguin.flac has sys:0 priv1:0 pspack:0 vid:0 audio:1
@@ -543,8 +550,14 @@ redo:
     } else if (es_type == STREAM_TYPE_VIDEO_HEVC) {
         codec_id = AV_CODEC_ID_HEVC;
         type     = AVMEDIA_TYPE_VIDEO;
+    } else if (es_type == STREAM_TYPE_VIDEO_VVC) {
+        codec_id = AV_CODEC_ID_VVC;
+        type     = AVMEDIA_TYPE_VIDEO;
     } else if (es_type == STREAM_TYPE_AUDIO_AC3) {
         codec_id = AV_CODEC_ID_AC3;
+        type     = AVMEDIA_TYPE_AUDIO;
+    } else if (es_type == 0x90) {
+        codec_id = AV_CODEC_ID_PCM_ALAW;
         type     = AVMEDIA_TYPE_AUDIO;
     } else if (m->imkh_cctv && es_type == 0x91) {
         codec_id = AV_CODEC_ID_PCM_MULAW;
@@ -553,7 +566,9 @@ redo:
         static const unsigned char avs_seqh[4] = { 0, 0, 1, 0xb0 };
         unsigned char buf[8];
 
-        avio_read(s->pb, buf, 8);
+        ret = ffio_read_size(s->pb, buf, 8);
+        if (ret < 0)
+            return ret;
         avio_seek(s->pb, -8, SEEK_CUR);
         if (!memcmp(buf, avs_seqh, 4) && (buf[6] != 0 || buf[7] != 1))
             codec_id = AV_CODEC_ID_CAVS;
@@ -605,6 +620,9 @@ redo:
     } else if (startcode >= 0xfd55 && startcode <= 0xfd5f) {
         type     = AVMEDIA_TYPE_VIDEO;
         codec_id = AV_CODEC_ID_VC1;
+    } else if (startcode == 0x69 || startcode == 0x49) {
+        type     = AVMEDIA_TYPE_SUBTITLE;
+        codec_id = AV_CODEC_ID_IVTV_VBI;
     } else {
 skip:
         /* skip packet */
@@ -621,8 +639,7 @@ skip:
     st->codecpar->codec_id   = codec_id;
     if (   st->codecpar->codec_id == AV_CODEC_ID_PCM_MULAW
         || st->codecpar->codec_id == AV_CODEC_ID_PCM_ALAW) {
-        st->codecpar->channels = 1;
-        st->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+        st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
         st->codecpar->sample_rate = 8000;
     }
     sti->request_probe = request_probe;
@@ -646,7 +663,7 @@ found:
     pkt->pos          = dummy_pos;
     pkt->stream_index = st->index;
 
-    if (s->debug & FF_FDEBUG_TS)
+    if (s->debug & AV_FDEBUG_TS)
         av_log(s, AV_LOG_DEBUG, "%d: pts=%0.3f dts=%0.3f size=%d\n",
             pkt->stream_index, pkt->pts / 90000.0, pkt->dts / 90000.0,
             pkt->size);
@@ -667,7 +684,7 @@ static int64_t mpegps_read_dts(AVFormatContext *s, int stream_index,
     for (;;) {
         len = mpegps_read_pes_header(s, &pos, &startcode, &pts, &dts);
         if (len < 0) {
-            if (s->debug & FF_FDEBUG_TS)
+            if (s->debug & AV_FDEBUG_TS)
                 av_log(s, AV_LOG_DEBUG, "none (ret=%d)\n", len);
             return AV_NOPTS_VALUE;
         }
@@ -677,22 +694,22 @@ static int64_t mpegps_read_dts(AVFormatContext *s, int stream_index,
         }
         avio_skip(s->pb, len);
     }
-    if (s->debug & FF_FDEBUG_TS)
+    if (s->debug & AV_FDEBUG_TS)
         av_log(s, AV_LOG_DEBUG, "pos=0x%"PRIx64" dts=0x%"PRIx64" %0.3f\n",
             pos, dts, dts / 90000.0);
     *ppos = pos;
     return dts;
 }
 
-const AVInputFormat ff_mpegps_demuxer = {
-    .name           = "mpeg",
-    .long_name      = NULL_IF_CONFIG_SMALL("MPEG-PS (MPEG-2 Program Stream)"),
+const FFInputFormat ff_mpegps_demuxer = {
+    .p.name         = "mpeg",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("MPEG-PS (MPEG-2 Program Stream)"),
+    .p.flags        = AVFMT_SHOW_IDS | AVFMT_TS_DISCONT,
     .priv_data_size = sizeof(MpegDemuxContext),
     .read_probe     = mpegps_probe,
     .read_header    = mpegps_read_header,
     .read_packet    = mpegps_read_packet,
     .read_timestamp = mpegps_read_dts,
-    .flags          = AVFMT_SHOW_IDS | AVFMT_TS_DISCONT,
 };
 
 #if CONFIG_VOBSUB_DEMUXER
@@ -824,6 +841,20 @@ static int vobsub_read_header(AVFormatContext *s)
             }
 
             if (!st || st->id != stream_id) {
+                st = NULL;
+                for (i = 0; i < s->nb_streams; i++) {
+                    if (s->streams[i]->id == stream_id) {
+                        st = s->streams[i];
+                        break;
+                    }
+                }
+            }
+            if (!st) {
+                if (s->nb_streams >= FF_ARRAY_ELEMS(vobsub->q)) {
+                    av_log(s, AV_LOG_ERROR, "Maximum number of subtitle streams reached\n");
+                    ret = AVERROR_INVALIDDATA;
+                    goto end;
+                }
                 st = avformat_new_stream(s, NULL);
                 if (!st) {
                     ret = AVERROR(ENOMEM);
@@ -848,14 +879,14 @@ static int vobsub_read_header(AVFormatContext *s)
             timestamp = (hh*3600LL + mm*60LL + ss) * 1000LL + ms + delay;
             timestamp = av_rescale_q(timestamp, av_make_q(1, 1000), st->time_base);
 
-            sub = ff_subtitles_queue_insert(&vobsub->q[s->nb_streams - 1], "", 0, 0);
+            sub = ff_subtitles_queue_insert(&vobsub->q[st->index], "", 0, 0);
             if (!sub) {
                 ret = AVERROR(ENOMEM);
                 goto end;
             }
             sub->pos = pos;
             sub->pts = timestamp;
-            sub->stream_index = s->nb_streams - 1;
+            sub->stream_index = st->index;
 
         } else if (!strncmp(line, "alt:", 4)) {
             const char *p = line + 4;
@@ -1040,18 +1071,18 @@ static const AVClass vobsub_demuxer_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVInputFormat ff_vobsub_demuxer = {
-    .name           = "vobsub",
-    .long_name      = NULL_IF_CONFIG_SMALL("VobSub subtitle format"),
+const FFInputFormat ff_vobsub_demuxer = {
+    .p.name         = "vobsub",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("VobSub subtitle format"),
+    .p.flags        = AVFMT_SHOW_IDS,
+    .p.extensions   = "idx",
+    .p.priv_class   = &vobsub_demuxer_class,
     .priv_data_size = sizeof(VobSubDemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = vobsub_probe,
     .read_header    = vobsub_read_header,
     .read_packet    = vobsub_read_packet,
     .read_seek2     = vobsub_read_seek,
     .read_close     = vobsub_read_close,
-    .flags          = AVFMT_SHOW_IDS,
-    .extensions     = "idx",
-    .priv_class     = &vobsub_demuxer_class,
 };
 #endif

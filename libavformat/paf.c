@@ -20,8 +20,10 @@
  */
 
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "libavcodec/paf.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define MAGIC "Packed Animation File V1.0\n(c) 1992-96 Amazing Studio\x0a\x1a"
@@ -127,8 +129,7 @@ static int read_header(AVFormatContext *s)
     ast->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
     ast->codecpar->codec_tag      = 0;
     ast->codecpar->codec_id       = AV_CODEC_ID_PAF_AUDIO;
-    ast->codecpar->channels       = 2;
-    ast->codecpar->channel_layout = AV_CH_LAYOUT_STEREO;
+    ast->codecpar->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
     ast->codecpar->sample_rate    = 22050;
     avpriv_set_pts_info(ast, 64, 1, 22050);
 
@@ -266,11 +267,11 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     return pkt->size;
 }
 
-const AVInputFormat ff_paf_demuxer = {
-    .name           = "paf",
-    .long_name      = NULL_IF_CONFIG_SMALL("Amazing Studio Packed Animation File"),
+const FFInputFormat ff_paf_demuxer = {
+    .p.name         = "paf",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Amazing Studio Packed Animation File"),
     .priv_data_size = sizeof(PAFDemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = read_probe,
     .read_header    = read_header,
     .read_packet    = read_packet,

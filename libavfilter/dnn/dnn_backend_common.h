@@ -25,12 +25,20 @@
 #define AVFILTER_DNN_DNN_BACKEND_COMMON_H
 
 #include "queue.h"
+#include "safe_queue.h"
 #include "../dnn_interface.h"
 #include "libavutil/thread.h"
 
-#define DNN_BACKEND_COMMON_OPTIONS \
-    { "nireq",           "number of request",             OFFSET(options.nireq),           AV_OPT_TYPE_INT,    { .i64 = 0 },     0, INT_MAX, FLAGS }, \
-    { "async",           "use DNN async inference",       OFFSET(options.async),           AV_OPT_TYPE_BOOL,   { .i64 = 1 },     0,       1, FLAGS },
+#define DNN_DEFINE_CLASS_EXT(name, desc, options) \
+    {                                           \
+        .class_name = desc,                     \
+        .item_name  = av_default_item_name,     \
+        .option     = options,                  \
+        .version    = LIBAVUTIL_VERSION_INT,    \
+        .category   = AV_CLASS_CATEGORY_FILTER, \
+    }
+#define DNN_DEFINE_CLASS(fname) \
+    DNN_DEFINE_CLASS_EXT(fname, #fname, fname##_options)
 
 // one task for one function call from dnn interface
 typedef struct TaskItem {
@@ -60,7 +68,7 @@ typedef struct DNNAsyncExecModule {
      * Synchronous inference function for the backend
      * with corresponding request item as the argument.
      */
-    DNNReturnType (*start_inference)(void *request);
+    int (*start_inference)(void *request);
 
     /**
      * Completion Callback for the backend.
@@ -92,20 +100,28 @@ int ff_check_exec_params(void *ctx, DNNBackendType backend, DNNFunctionType func
  * @param async flag for async execution. Must be 0 or 1
  * @param do_ioproc flag for IO processing. Must be 0 or 1
  *
- * @retval DNN_SUCCESS if successful
- * @retval DNN_ERROR if flags are invalid or any parameter is NULL
+ * @returns 0 if successful or error code otherwise.
  */
-DNNReturnType ff_dnn_fill_task(TaskItem *task, DNNExecBaseParams *exec_params, void *backend_model, int async, int do_ioproc);
+int ff_dnn_fill_task(TaskItem *task, DNNExecBaseParams *exec_params, void *backend_model, int async, int do_ioproc);
 
 /**
  * Join the Async Execution thread and set module pointers to NULL.
  *
  * @param async_module pointer to DNNAsyncExecModule module
  *
- * @retval DNN_SUCCESS if successful
- * @retval DNN_ERROR if async_module is NULL
+ * @returns 0 if successful or error code otherwise.
  */
-DNNReturnType ff_dnn_async_module_cleanup(DNNAsyncExecModule *async_module);
+int ff_dnn_async_module_cleanup(DNNAsyncExecModule *async_module);
+
+/**
+ * Wait for all inference requests to complete before teardown.
+ * This blocks the calling thread until all request items have been
+ * returned to the request_queue by the async inference threads.
+ *
+ * @param request_queue pointer to the SafeQueue holding request items
+ * @param nireq total number of allocated request items
+ */
+void ff_dnn_wait_requests(SafeQueue *request_queue, int nireq);
 
 /**
  * Start asynchronous inference routine for the TensorFlow
@@ -119,10 +135,9 @@ DNNReturnType ff_dnn_async_module_cleanup(DNNAsyncExecModule *async_module);
  * @param ctx pointer to the backend context
  * @param async_module pointer to DNNAsyncExecModule module
  *
- * @retval DNN_SUCCESS on the start of async inference.
- * @retval DNN_ERROR in case async inference cannot be started
+ * @returns 0 on the start of async inference or error code otherwise.
  */
-DNNReturnType ff_dnn_start_inference_async(void *ctx, DNNAsyncExecModule *async_module);
+int ff_dnn_start_inference_async(void *ctx, DNNAsyncExecModule *async_module);
 
 /**
  * Extract input and output frame from the Task Queue after
@@ -149,9 +164,8 @@ DNNAsyncStatusType ff_dnn_get_result_common(Queue *task_queue, AVFrame **in, AVF
  * @param input_width width of input frame
  * @param ctx pointer to the backend context
  *
- * @retval DNN_SUCCESS if successful
- * @retval DNN_ERROR if allocation fails
+ * @returns 0 if successful or error code otherwise.
  */
-DNNReturnType ff_dnn_fill_gettingoutput_task(TaskItem *task, DNNExecBaseParams *exec_params, void *backend_model, int input_height, int input_width, void *ctx);
+int ff_dnn_fill_gettingoutput_task(TaskItem *task, DNNExecBaseParams *exec_params, void *backend_model, int input_height, int input_width, void *ctx);
 
 #endif

@@ -18,13 +18,13 @@
 ;* Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 ;******************************************************************************
 
-%include "x86util.asm"
+%include "libavutil/x86/x86util.asm"
 
 SECTION .text
 
 ;-----------------------------------------------------------------------------
-; void avpriv_emms_asm(void)
+; void ff_emms_asm(void)
 ;-----------------------------------------------------------------------------
-cvisible emms_asm, 0, 0
+cglobal emms_asm, 0, 0
     emms
     RET

@@ -23,6 +23,7 @@
 
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/tree.h"
 #include "libavutil/dict.h"
 #include "libavutil/avassert.h"
@@ -30,10 +31,32 @@
 #include "libavutil/opt.h"
 #include "libavcodec/bytestream.h"
 #include "libavcodec/mpegaudiodata.h"
+#include "mux.h"
 #include "nut.h"
 #include "internal.h"
 #include "avio_internal.h"
 #include "riff.h"
+#include "version.h"
+
+/**
+ * Chooses a timebase for muxing the specified stream.
+ *
+ * The chosen timebase allows sample accurate timestamps based
+ * on the framerate or sample rate for audio streams. It also is
+ * at least as precise as 1/min_precision would be.
+ */
+static AVRational choose_timebase(AVFormatContext *s, AVStream *st, int min_precision)
+{
+    AVRational q = st->time_base;
+
+    for (int j = 2; j < 14; j += 1 + (j > 2))
+        while (q.den / q.num < min_precision && q.num % j == 0)
+            q.num /= j;
+    while (q.den / q.num < min_precision && q.den < (1<<24))
+        q.den <<= 1;
+
+    return q;
+}
 
 static int find_expected_header(AVCodecParameters *p, int size, int key_frame,
                                 uint8_t out[64])
@@ -461,7 +484,7 @@ static int write_streamheader(AVFormatContext *avctx, AVIOContext *bc,
     case AVMEDIA_TYPE_AUDIO:
         put_v(bc, par->sample_rate);
         put_v(bc, 1);
-        put_v(bc, par->channels);
+        put_v(bc, par->ch_layout.nb_channels);
         break;
     case AVMEDIA_TYPE_VIDEO:
         put_v(bc, par->width);
@@ -494,7 +517,7 @@ static int add_info(AVIOContext *bc, const char *type, const char *value)
 static int write_globalinfo(NUTContext *nut, AVIOContext *bc)
 {
     AVFormatContext *s   = nut->avf;
-    AVDictionaryEntry *t = NULL;
+    const AVDictionaryEntry *t = NULL;
     AVIOContext *dyn_bc;
     uint8_t *dyn_buf = NULL;
     int count        = 0, dyn_size;
@@ -503,7 +526,7 @@ static int write_globalinfo(NUTContext *nut, AVIOContext *bc)
         return ret;
 
     ff_standardize_creation_time(s);
-    while ((t = av_dict_get(s->metadata, "", t, AV_DICT_IGNORE_SUFFIX)))
+    while ((t = av_dict_iterate(s->metadata, t)))
         count += add_info(dyn_bc, t->key, t->value);
 
     put_v(bc, 0); //stream_if_plus1
@@ -522,7 +545,7 @@ static int write_globalinfo(NUTContext *nut, AVIOContext *bc)
 static int write_streaminfo(NUTContext *nut, AVIOContext *bc, int stream_id) {
     AVFormatContext *s= nut->avf;
     AVStream* st = s->streams[stream_id];
-    AVDictionaryEntry *t = NULL;
+    const AVDictionaryEntry *t = NULL;
     AVIOContext *dyn_bc;
     uint8_t *dyn_buf=NULL;
     int count=0, dyn_size, i;
@@ -530,7 +553,7 @@ static int write_streaminfo(NUTContext *nut, AVIOContext *bc, int stream_id) {
     if (ret < 0)
         return ret;
 
-    while ((t = av_dict_get(st->metadata, "", t, AV_DICT_IGNORE_SUFFIX)))
+    while ((t = av_dict_iterate(st->metadata, t)))
         count += add_info(dyn_bc, t->key, t->value);
     for (i=0; ff_nut_dispositions[i].flag; ++i) {
         if (st->disposition & ff_nut_dispositions[i].flag)
@@ -565,7 +588,7 @@ static int write_chapter(NUTContext *nut, AVIOContext *bc, int id)
 {
     AVIOContext *dyn_bc;
     uint8_t *dyn_buf     = NULL;
-    AVDictionaryEntry *t = NULL;
+    const AVDictionaryEntry *t = NULL;
     AVChapter *ch        = nut->avf->chapters[id];
     int ret, dyn_size, count = 0;
 
@@ -578,7 +601,7 @@ static int write_chapter(NUTContext *nut, AVIOContext *bc, int id)
     put_tt(nut, nut->chapter[id].time_base, bc, ch->start); // chapter_start
     put_v(bc, ch->end - ch->start);                         // chapter_len
 
-    while ((t = av_dict_get(ch->metadata, "", t, AV_DICT_IGNORE_SUFFIX)))
+    while ((t = av_dict_iterate(ch->metadata, t)))
         count += add_info(dyn_bc, t->key, t->value);
 
     put_v(bc, count);
@@ -727,7 +750,7 @@ static int nut_write_header(AVFormatContext *s)
         if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO && st->codecpar->sample_rate) {
             time_base = (AVRational) {1, st->codecpar->sample_rate};
         } else {
-            time_base = ff_choose_timebase(s, st, 48000);
+            time_base = choose_timebase(s, st, 48000);
         }
 
         avpriv_set_pts_info(st, 64, time_base.num, time_base.den);
@@ -894,19 +917,6 @@ static int write_sm_data(AVFormatContext *s, AVIOContext *bc, AVPacket *pkt, int
                 break;
             case AV_PKT_DATA_PARAM_CHANGE:
                 flags = bytestream_get_le32(&data);
-                if (flags & AV_SIDE_DATA_PARAM_CHANGE_CHANNEL_COUNT) {
-                    put_str(dyn_bc, "Channels");
-                    put_s(dyn_bc, bytestream_get_le32(&data));
-                    sm_data_count++;
-                }
-                if (flags & AV_SIDE_DATA_PARAM_CHANGE_CHANNEL_LAYOUT) {
-                    put_str(dyn_bc, "ChannelLayout");
-                    put_s(dyn_bc, -2);
-                    put_str(dyn_bc, "u64");
-                    put_v(dyn_bc, 8);
-                    avio_write(dyn_bc, data, 8); data+=8;
-                    sm_data_count++;
-                }
                 if (flags & AV_SIDE_DATA_PARAM_CHANGE_SAMPLE_RATE) {
                     put_str(dyn_bc, "SampleRate");
                     put_s(dyn_bc, bytestream_get_le32(&data));
@@ -1039,21 +1049,21 @@ static int nut_write_packet(AVFormatContext *s, AVPacket *pkt)
         ffio_free_dyn_buf(&dyn_bc);
 
         if (nut->write_index) {
-        if ((ret = ff_nut_add_sp(nut, nut->last_syncpoint_pos, 0 /*unused*/, pkt->dts)) < 0)
-            goto fail;
+            if ((ret = ff_nut_add_sp(nut, nut->last_syncpoint_pos, 0 /*unused*/, pkt->dts)) < 0)
+                goto fail;
 
-        if ((1ll<<60) % nut->sp_count == 0)
-            for (i=0; i<s->nb_streams; i++) {
-                int j;
-                StreamContext *nus = &nut->stream[i];
-                av_reallocp_array(&nus->keyframe_pts, 2*nut->sp_count, sizeof(*nus->keyframe_pts));
-                if (!nus->keyframe_pts) {
-                    ret = AVERROR(ENOMEM);
-                    goto fail;
-                }
-                for (j=nut->sp_count == 1 ? 0 : nut->sp_count; j<2*nut->sp_count; j++)
-                    nus->keyframe_pts[j] = AV_NOPTS_VALUE;
-        }
+            if ((1ll<<60) % nut->sp_count == 0)
+                for (unsigned i = 0; i < s->nb_streams; i++) {
+                    StreamContext *nus = &nut->stream[i];
+                    av_reallocp_array(&nus->keyframe_pts, 2*nut->sp_count, sizeof(*nus->keyframe_pts));
+                    if (!nus->keyframe_pts) {
+                        ret = AVERROR(ENOMEM);
+                        goto fail;
+                    }
+                    for (int j = nut->sp_count == 1 ? 0 : nut->sp_count;
+                         j < 2 * nut->sp_count; j++)
+                        nus->keyframe_pts[j] = AV_NOPTS_VALUE;
+            }
         }
     }
     av_assert0(nus->last_pts != AV_NOPTS_VALUE);
@@ -1214,10 +1224,10 @@ static void nut_write_deinit(AVFormatContext *s)
 #define OFFSET(x) offsetof(NUTContext, x)
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-    { "syncpoints",  "NUT syncpoint behaviour",                         OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64 = 0},             INT_MIN, INT_MAX, E, "syncpoints" },
-    { "default",     "",                                                0,             AV_OPT_TYPE_CONST, {.i64 = 0},             INT_MIN, INT_MAX, E, "syncpoints" },
-    { "none",        "Disable syncpoints, low overhead and unseekable", 0,             AV_OPT_TYPE_CONST, {.i64 = NUT_PIPE},      INT_MIN, INT_MAX, E, "syncpoints" },
-    { "timestamped", "Extend syncpoints with a wallclock timestamp",    0,             AV_OPT_TYPE_CONST, {.i64 = NUT_BROADCAST}, INT_MIN, INT_MAX, E, "syncpoints" },
+    { "syncpoints",  "NUT syncpoint behaviour",                         OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64 = 0},             INT_MIN, INT_MAX, E, .unit = "syncpoints" },
+    { "default",     "",                                                0,             AV_OPT_TYPE_CONST, {.i64 = 0},             INT_MIN, INT_MAX, E, .unit = "syncpoints" },
+    { "none",        "Disable syncpoints, low overhead and unseekable", 0,             AV_OPT_TYPE_CONST, {.i64 = NUT_PIPE},      INT_MIN, INT_MAX, E, .unit = "syncpoints" },
+    { "timestamped", "Extend syncpoints with a wallclock timestamp",    0,             AV_OPT_TYPE_CONST, {.i64 = NUT_BROADCAST}, INT_MIN, INT_MAX, E, .unit = "syncpoints" },
     { "write_index", "Write index",                               OFFSET(write_index), AV_OPT_TYPE_BOOL,  {.i64 = 1},                   0,       1, E, },
     { NULL },
 };
@@ -1229,20 +1239,20 @@ static const AVClass class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVOutputFormat ff_nut_muxer = {
-    .name           = "nut",
-    .long_name      = NULL_IF_CONFIG_SMALL("NUT"),
-    .mime_type      = "video/x-nut",
-    .extensions     = "nut",
+const FFOutputFormat ff_nut_muxer = {
+    .p.name         = "nut",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("NUT"),
+    .p.mime_type    = "video/x-nut",
+    .p.extensions   = "nut",
     .priv_data_size = sizeof(NUTContext),
-    .audio_codec    = CONFIG_LIBVORBIS ? AV_CODEC_ID_VORBIS :
+    .p.audio_codec  = CONFIG_LIBVORBIS ? AV_CODEC_ID_VORBIS :
                       CONFIG_LIBMP3LAME ? AV_CODEC_ID_MP3 : AV_CODEC_ID_MP2,
-    .video_codec    = AV_CODEC_ID_MPEG4,
+    .p.video_codec  = AV_CODEC_ID_MPEG4,
     .write_header   = nut_write_header,
     .write_packet   = nut_write_packet,
     .write_trailer  = nut_write_trailer,
     .deinit         = nut_write_deinit,
-    .flags          = AVFMT_GLOBALHEADER | AVFMT_VARIABLE_FPS,
-    .codec_tag      = ff_nut_codec_tags,
-    .priv_class     = &class,
+    .p.flags        = AVFMT_GLOBALHEADER | AVFMT_VARIABLE_FPS,
+    .p.codec_tag    = ff_nut_codec_tags,
+    .p.priv_class   = &class,
 };

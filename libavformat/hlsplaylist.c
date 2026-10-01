@@ -22,6 +22,7 @@
 
 #include "config.h"
 #include <stdint.h>
+#include <time.h>
 
 #include "libavutil/time_internal.h"
 
@@ -38,7 +39,7 @@ void ff_hls_write_playlist_version(AVIOContext *out, int version)
 
 void ff_hls_write_audio_rendition(AVIOContext *out, const char *agroup,
                                   const char *filename, const char *language,
-                                  int name_id, int is_default)
+                                  int name_id, int is_default, int nb_channels)
 {
     if (!out || !agroup || !filename)
         return;
@@ -48,18 +49,26 @@ void ff_hls_write_audio_rendition(AVIOContext *out, const char *agroup,
     if (language) {
         avio_printf(out, "LANGUAGE=\"%s\",", language);
     }
+    if (nb_channels) {
+        avio_printf(out, "CHANNELS=\"%d\",", nb_channels);
+    }
     avio_printf(out, "URI=\"%s\"\n", filename);
 }
 
 void ff_hls_write_subtitle_rendition(AVIOContext *out, const char *sgroup,
                                      const char *filename, const char *language,
-                                     int name_id, int is_default)
+                                     const char *sname, int name_id, int is_default)
 {
     if (!out || !filename)
         return;
 
     avio_printf(out, "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"%s\"", sgroup);
-    avio_printf(out, ",NAME=\"subtitle_%d\",DEFAULT=%s,", name_id, is_default ? "YES" : "NO");
+    if (sname) {
+        avio_printf(out, ",NAME=\"%s\",", sname);
+    } else {
+        avio_printf(out, ",NAME=\"subtitle_%d\",", name_id);
+    }
+    avio_printf(out, "DEFAULT=%s,", is_default ? "YES" : "NO");
     if (language) {
         avio_printf(out, "LANGUAGE=\"%s\",", language);
     }
@@ -67,6 +76,7 @@ void ff_hls_write_subtitle_rendition(AVIOContext *out, const char *sgroup,
 }
 
 void ff_hls_write_stream_info(AVStream *st, AVIOContext *out, int bandwidth,
+                              int avg_bandwidth,
                               const char *filename, const char *agroup,
                               const char *codecs, const char *ccgroup,
                               const char *sgroup)
@@ -81,6 +91,8 @@ void ff_hls_write_stream_info(AVStream *st, AVIOContext *out, int bandwidth,
     }
 
     avio_printf(out, "#EXT-X-STREAM-INF:BANDWIDTH=%d", bandwidth);
+    if (avg_bandwidth)
+        avio_printf(out, ",AVERAGE-BANDWIDTH=%d", avg_bandwidth);
     if (st && st->codecpar->width > 0 && st->codecpar->height > 0)
         avio_printf(out, ",RESOLUTION=%dx%d", st->codecpar->width,
                 st->codecpar->height);
@@ -135,7 +147,6 @@ int ff_hls_write_file_entry(AVIOContext *out, int insert_discont,
                             int64_t pos /* Used only if HLS_SINGLE_FILE flag is set */,
                             const char *baseurl /* Ignored if NULL */,
                             const char *filename, double *prog_date_time,
-                            int64_t video_keyframe_size, int64_t video_keyframe_pos,
                             int iframe_mode)
 {
     if (!out || !filename)
@@ -149,8 +160,7 @@ int ff_hls_write_file_entry(AVIOContext *out, int insert_discont,
     else
         avio_printf(out, "#EXTINF:%f,\n", duration);
     if (byterange_mode)
-        avio_printf(out, "#EXT-X-BYTERANGE:%"PRId64"@%"PRId64"\n", iframe_mode ? video_keyframe_size : size,
-                    iframe_mode ? video_keyframe_pos : pos);
+        avio_printf(out, "#EXT-X-BYTERANGE:%"PRId64"@%"PRId64"\n", size, pos);
 
     if (prog_date_time) {
         time_t tt, wrongsecs;
@@ -192,4 +202,3 @@ void ff_hls_write_end_list(AVIOContext *out)
         return;
     avio_printf(out, "#EXT-X-ENDLIST\n");
 }
-

@@ -20,10 +20,16 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <time.h>
+
+#include "config_components.h"
+
 #include "libavutil/intreadwrite.h"
 #include "libavutil/avstring.h"
+#include "libavutil/bprint.h"
 #include "libavutil/dict.h"
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/time_internal.h"
@@ -31,13 +37,13 @@
 #include "avio_internal.h"
 #include "internal.h"
 #include "img2.h"
+#include "mux.h"
 
 typedef struct VideoMuxData {
     const AVClass *class;  /**< Class for private options. */
+    int start_img_number;
     int img_number;
     int split_planes;       /**< use independent file for each Y, U, V plane */
-    char tmp[4][1024];
-    char target[4][1024];
     int update;
     int use_strftime;
     int frame_pts;
@@ -56,6 +62,8 @@ static int write_header(AVFormatContext *s)
         img->muxer = "gif";
     } else if (st->codecpar->codec_id == AV_CODEC_ID_FITS) {
         img->muxer = "fits";
+    } else if (st->codecpar->codec_id == AV_CODEC_ID_AV1) {
+        img->muxer = "avif";
     } else if (st->codecpar->codec_id == AV_CODEC_ID_RAWVIDEO) {
         const char *str = strrchr(s->url, '.');
         img->split_planes =     str
@@ -65,6 +73,7 @@ static int write_header(AVFormatContext *s)
                              &&(desc->flags & AV_PIX_FMT_FLAG_PLANAR)
                              && desc->nb_components >= 3;
     }
+    img->img_number = img->start_img_number;
 
     return 0;
 }
@@ -132,46 +141,61 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
 {
     VideoMuxData *img = s->priv_data;
     AVIOContext *pb[4] = {0};
-    char filename[1024];
+    char* target[4]    = {0};
+    char* tmp[4]       = {0};
     AVCodecParameters *par = s->streams[pkt->stream_index]->codecpar;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(par->format);
     int ret, i;
-    int nb_renames = 0;
     AVDictionary *options = NULL;
+    AVBPrint filename;
+    av_bprint_init(&filename, 0, AV_BPRINT_SIZE_UNLIMITED);
 
     if (img->update) {
-        av_strlcpy(filename, s->url, sizeof(filename));
+        av_bprintf(&filename, "%s", s->url);
     } else if (img->use_strftime) {
         time_t now0;
         struct tm *tm, tmpbuf;
         time(&now0);
         tm = localtime_r(&now0, &tmpbuf);
-        if (!strftime(filename, sizeof(filename), s->url, tm)) {
-            av_log(s, AV_LOG_ERROR, "Could not get frame filename with strftime\n");
-            return AVERROR(EINVAL);
-        }
+        av_bprint_strftime(&filename, s->url, tm);
     } else if (img->frame_pts) {
-        if (av_get_frame_filename2(filename, sizeof(filename), s->url, pkt->pts, AV_FRAME_FILENAME_FLAGS_MULTIPLE) < 0) {
+        if (ff_bprint_get_frame_filename(&filename, s->url, pkt->pts, AV_FRAME_FILENAME_FLAGS_MULTIPLE) < 0) {
             av_log(s, AV_LOG_ERROR, "Cannot write filename by pts of the frames.");
-            return AVERROR(EINVAL);
+            ret = AVERROR(EINVAL);
+            goto fail;
         }
-    } else if (av_get_frame_filename2(filename, sizeof(filename), s->url,
-                                      img->img_number,
-                                      AV_FRAME_FILENAME_FLAGS_MULTIPLE) < 0 &&
-               img->img_number > 1) {
-        av_log(s, AV_LOG_ERROR,
-               "Could not get frame filename number %d from pattern '%s'. "
-               "Use '-frames:v 1' for a single image, or '-update' option, or use a pattern such as %%03d within the filename.\n",
-               img->img_number, s->url);
-        return AVERROR(EINVAL);
+    } else if (ff_bprint_get_frame_filename(&filename, s->url,
+                                     img->img_number,
+                                     AV_FRAME_FILENAME_FLAGS_MULTIPLE) < 0) {
+        if (img->img_number == img->start_img_number) {
+            av_log(s, AV_LOG_WARNING, "The specified filename '%s' does not contain an image sequence pattern or a pattern is invalid.\n", s->url);
+            av_log(s, AV_LOG_WARNING,
+                   "Use a pattern such as %%03d for an image sequence or "
+                   "use the -update option (with -frames:v 1 if needed) to write a single image.\n");
+            av_bprint_clear(&filename);
+            av_bprintf(&filename, "%s", s->url);
+        } else {
+            av_log(s, AV_LOG_ERROR, "Cannot write more than one file with the same name. Are you missing the -update option or a sequence pattern?\n");
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+    }
+    if (!av_bprint_is_complete(&filename)) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
     }
     for (i = 0; i < 4; i++) {
         av_dict_copy(&options, img->protocol_opts, 0);
-        snprintf(img->tmp[i], sizeof(img->tmp[i]), "%s.tmp", filename);
-        av_strlcpy(img->target[i], filename, sizeof(img->target[i]));
-        if (s->io_open(s, &pb[i], img->use_rename ? img->tmp[i] : filename, AVIO_FLAG_WRITE, &options) < 0) {
-            av_log(s, AV_LOG_ERROR, "Could not open file : %s\n", img->use_rename ? img->tmp[i] : filename);
-            ret = AVERROR(EIO);
+        if (img->use_rename) {
+            tmp[i] = av_asprintf("%s.tmp", filename.str);
+            target[i] = av_strdup(filename.str);
+            if (!tmp[i] || !target[i]) {
+                ret = AVERROR(ENOMEM);
+                goto fail;
+            }
+        }
+        if ((ret = s->io_open(s, &pb[i], tmp[i] ? tmp[i] : filename.str, AVIO_FLAG_WRITE, &options)) < 0) {
+            av_log(s, AV_LOG_ERROR, "Could not open file : %s\n", tmp[i] ? tmp[i] : filename.str);
             goto fail;
         }
         if (options) {
@@ -182,10 +206,9 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
 
         if (!img->split_planes || i+1 >= desc->nb_components)
             break;
-        filename[strlen(filename) - 1] = "UVAx"[i];
+        filename.str[filename.len - 1] = "UVAx"[i];
     }
-    if (img->use_rename)
-        nb_renames = i + 1;
+    av_bprint_finalize(&filename, NULL);
 
     if (img->split_planes) {
         int ysize = par->width * par->height;
@@ -194,6 +217,11 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
             ysize *= 2;
             usize *= 2;
         }
+        if (ysize + 2*usize + (desc->nb_components > 3) * ysize > pkt->size) {
+            ret = AVERROR(EINVAL);
+            goto fail;
+        }
+
         if ((ret = write_and_close(s, &pb[0], pkt->data                , ysize)) < 0 ||
             (ret = write_and_close(s, &pb[1], pkt->data + ysize        , usize)) < 0 ||
             (ret = write_and_close(s, &pb[2], pkt->data + ysize + usize, usize)) < 0)
@@ -210,20 +238,26 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
     if (ret < 0)
         goto fail;
 
-    for (i = 0; i < nb_renames; i++) {
-        int ret = ff_rename(img->tmp[i], img->target[i], s);
+    for (i = 0; i < 4 && tmp[i]; i++) {
+        int ret = ff_rename(tmp[i], target[i], s);
         if (ret < 0)
-            return ret;
+            goto fail;
+        av_freep(&tmp[i]);
+        av_freep(&target[i]);
     }
 
     img->img_number++;
     return 0;
 
 fail:
+    av_bprint_finalize(&filename, NULL);
     av_dict_free(&options);
-    for (i = 0; i < FF_ARRAY_ELEMS(pb); i++)
+    for (i = 0; i < FF_ARRAY_ELEMS(pb); i++) {
+        av_freep(&tmp[i]);
+        av_freep(&target[i]);
         if (pb[i])
             ff_format_io_close(s, &pb[i]);
+    }
     return ret;
 }
 
@@ -242,7 +276,7 @@ static int query_codec(enum AVCodecID id, int std_compliance)
 #define ENC AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption muxoptions[] = {
     { "update",       "continuously overwrite one file", OFFSET(update),  AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0,       1, ENC },
-    { "start_number", "set first number in the sequence", OFFSET(img_number), AV_OPT_TYPE_INT,  { .i64 = 1 }, 0, INT_MAX, ENC },
+    { "start_number", "set first number in the sequence", OFFSET(start_img_number), AV_OPT_TYPE_INT,  { .i64 = 1 }, 0, INT_MAX, ENC },
     { "strftime",     "use strftime for filename", OFFSET(use_strftime),  AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "frame_pts",    "use current frame pts for filename", OFFSET(frame_pts),  AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { "atomic_writing", "write files atomically (using temporary files and renames)", OFFSET(use_rename), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
@@ -258,30 +292,30 @@ static const AVClass img2mux_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVOutputFormat ff_image2_muxer = {
-    .name           = "image2",
-    .long_name      = NULL_IF_CONFIG_SMALL("image2 sequence"),
-    .extensions     = "bmp,dpx,exr,jls,jpeg,jpg,ljpg,pam,pbm,pcx,pfm,pgm,pgmyuv,png,"
-                      "ppm,sgi,tga,tif,tiff,jp2,j2c,j2k,xwd,sun,ras,rs,im1,im8,im24,"
-                      "sunras,xbm,xface,pix,y",
+const FFOutputFormat ff_image2_muxer = {
+    .p.name         = "image2",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("image2 sequence"),
+    .p.extensions   = "bmp,dpx,exr,jls,jpeg,jpg,jxs,jxl,ljpg,pam,pbm,pcx,pfm,pgm,pgmyuv,phm,"
+                      "png,ppm,sgi,tga,tif,tiff,jp2,j2c,j2k,xwd,sun,ras,rs,im1,im8,"
+                      "im24,sunras,vbn,xbm,xface,pix,y,avif,qoi,hdr,wbmp",
     .priv_data_size = sizeof(VideoMuxData),
-    .video_codec    = AV_CODEC_ID_MJPEG,
+    .p.video_codec  = AV_CODEC_ID_MJPEG,
     .write_header   = write_header,
     .write_packet   = write_packet,
     .query_codec    = query_codec,
-    .flags          = AVFMT_NOTIMESTAMPS | AVFMT_NODIMENSIONS | AVFMT_NOFILE,
-    .priv_class     = &img2mux_class,
+    .p.flags        = AVFMT_NOTIMESTAMPS | AVFMT_NODIMENSIONS | AVFMT_NOFILE,
+    .p.priv_class   = &img2mux_class,
 };
 #endif
 #if CONFIG_IMAGE2PIPE_MUXER
-const AVOutputFormat ff_image2pipe_muxer = {
-    .name           = "image2pipe",
-    .long_name      = NULL_IF_CONFIG_SMALL("piped image2 sequence"),
+const FFOutputFormat ff_image2pipe_muxer = {
+    .p.name         = "image2pipe",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("piped image2 sequence"),
     .priv_data_size = sizeof(VideoMuxData),
-    .video_codec    = AV_CODEC_ID_MJPEG,
+    .p.video_codec  = AV_CODEC_ID_MJPEG,
     .write_header   = write_header,
     .write_packet   = write_packet_pipe,
     .query_codec    = query_codec,
-    .flags          = AVFMT_NOTIMESTAMPS | AVFMT_NODIMENSIONS
+    .p.flags        = AVFMT_NOTIMESTAMPS | AVFMT_NODIMENSIONS
 };
 #endif

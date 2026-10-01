@@ -19,32 +19,77 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <stdlib.h>
+
+#include "config.h"
 #include "libavutil/attributes.h"
-#include "libavutil/common.h"
-#include "png.h"
+#include "libavutil/intreadwrite.h"
+#include "libavutil/macros.h"
 #include "pngdsp.h"
 
-// 0x7f7f7f7f or 0x7f7f7f7f7f7f7f7f or whatever, depending on the cpu's native arithmetic size
-#define pb_7f (~0UL / 255 * 0x7f)
-#define pb_80 (~0UL / 255 * 0x80)
+#if HAVE_FAST_64BIT
+#define BITS 64
+typedef uint64_t uint_native;
+#else
+#define BITS 32
+typedef uint32_t uint_native;
+#endif
+#define RN  AV_JOIN(AV_RN, BITS)
+#define RNA AV_JOIN(AV_JOIN(AV_RN, BITS),  A)
+#define WN  AV_JOIN(AV_WN, BITS)
 
-static void add_bytes_l2_c(uint8_t *dst, uint8_t *src1, uint8_t *src2, int w)
+// 0x7f7f7f7f or 0x7f7f7f7f7f7f7f7f or whatever, depending on the cpu's native arithmetic size
+#define pb_7f (~(uint_native)0 / 255 * 0x7f)
+#define pb_80 (~(uint_native)0 / 255 * 0x80)
+
+static void add_bytes_l2_c(uint8_t *dst, const uint8_t *src1,
+                           const uint8_t *src2, int w)
 {
     long i;
-    for (i = 0; i <= w - (int) sizeof(long); i += sizeof(long)) {
-        long a = *(long *)(src1 + i);
-        long b = *(long *)(src2 + i);
-        *(long *)(dst + i) = ((a & pb_7f) + (b & pb_7f)) ^ ((a ^ b) & pb_80);
+    for (i = 0; i <= w - (int) sizeof(uint_native); i += sizeof(uint_native)) {
+        uint_native a = RNA(src1 + i);
+        uint_native b = RN (src2 + i);
+        WN(dst + i, ((a & pb_7f) + (b & pb_7f)) ^ ((a ^ b) & pb_80));
     }
     for (; i < w; i++)
         dst[i] = src1[i] + src2[i];
 }
 
+void ff_png_add_paeth_prediction(uint8_t *dst, const uint8_t *src,
+                                 const uint8_t *top, int w, int bpp)
+{
+    for (int i = 0; i < w; ++i) {
+        int a, b, c, p, pa, pb, pc;
+
+        a = dst[i - bpp];
+        b = top[i];
+        c = top[i - bpp];
+
+        p  = b - c;
+        pc = a - c;
+
+        pa = abs(p);
+        pb = abs(pc);
+        pc = abs(p + pc);
+
+        if (pa <= pb && pa <= pc)
+            p = a;
+        else if (pb <= pc)
+            p = b;
+        else
+            p = c;
+        dst[i] = p + src[i];
+    }
+}
+
 av_cold void ff_pngdsp_init(PNGDSPContext *dsp)
 {
     dsp->add_bytes_l2         = add_bytes_l2_c;
-    dsp->add_paeth_prediction = ff_add_png_paeth_prediction;
+    dsp->add_paeth_prediction = ff_png_add_paeth_prediction;
 
-    if (ARCH_X86)
-        ff_pngdsp_init_x86(dsp);
+#if ARCH_AARCH64
+    ff_pngdsp_init_aarch64(dsp);
+#elif ARCH_X86 && HAVE_X86ASM
+    ff_pngdsp_init_x86(dsp);
+#endif
 }

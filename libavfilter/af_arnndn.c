@@ -31,11 +31,10 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <float.h>
-
 #include "libavutil/avassert.h"
-#include "libavutil/avstring.h"
+#include "libavutil/file_open.h"
 #include "libavutil/float_dsp.h"
+#include "libavutil/mem.h"
 #include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/tx.h"
@@ -328,7 +327,9 @@ static int rnnoise_model_from_file(FILE *f, RNNModel **rnn)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     static const enum AVSampleFormat sample_fmts[] = {
         AV_SAMPLE_FMT_FLTP,
@@ -336,15 +337,11 @@ static int query_formats(AVFilterContext *ctx)
     };
     int ret, sample_rates[] = { 48000, -1 };
 
-    ret = ff_set_common_formats_from_list(ctx, sample_fmts);
+    ret = ff_set_sample_formats_from_list2(ctx, cfg_in, cfg_out, sample_fmts);
     if (ret < 0)
         return ret;
 
-    ret = ff_set_common_all_channel_counts(ctx);
-    if (ret < 0)
-        return ret;
-
-    return ff_set_common_samplerates_from_list(ctx, sample_rates);
+    return ff_set_common_samplerates_from_list2(ctx, cfg_in, cfg_out, sample_rates);
 }
 
 static int config_input(AVFilterLink *inlink)
@@ -353,7 +350,7 @@ static int config_input(AVFilterLink *inlink)
     AudioRNNContext *s = ctx->priv;
     int ret = 0;
 
-    s->channels = inlink->channels;
+    s->channels = inlink->ch_layout.nb_channels;
 
     if (!s->st)
         s->st = av_calloc(s->channels, sizeof(DenoiseState));
@@ -364,9 +361,9 @@ static int config_input(AVFilterLink *inlink)
         DenoiseState *st = &s->st[i];
 
         st->rnn[0].model = s->model[0];
-        st->rnn[0].vad_gru_state = av_calloc(sizeof(float), FFALIGN(s->model[0]->vad_gru_size, 16));
-        st->rnn[0].noise_gru_state = av_calloc(sizeof(float), FFALIGN(s->model[0]->noise_gru_size, 16));
-        st->rnn[0].denoise_gru_state = av_calloc(sizeof(float), FFALIGN(s->model[0]->denoise_gru_size, 16));
+        st->rnn[0].vad_gru_state = av_calloc(FFALIGN(s->model[0]->vad_gru_size, 16), sizeof(float));
+        st->rnn[0].noise_gru_state = av_calloc(FFALIGN(s->model[0]->noise_gru_size, 16), sizeof(float));
+        st->rnn[0].denoise_gru_state = av_calloc(FFALIGN(s->model[0]->denoise_gru_size, 16), sizeof(float));
         if (!st->rnn[0].vad_gru_state ||
             !st->rnn[0].noise_gru_state ||
             !st->rnn[0].denoise_gru_state)
@@ -375,14 +372,15 @@ static int config_input(AVFilterLink *inlink)
 
     for (int i = 0; i < s->channels; i++) {
         DenoiseState *st = &s->st[i];
+        float scale = 1.f;
 
         if (!st->tx)
-            ret = av_tx_init(&st->tx, &st->tx_fn, AV_TX_FLOAT_FFT, 0, WINDOW_SIZE, NULL, 0);
+            ret = av_tx_init(&st->tx, &st->tx_fn, AV_TX_FLOAT_FFT, 0, WINDOW_SIZE, &scale, 0);
         if (ret < 0)
             return ret;
 
         if (!st->txi)
-            ret = av_tx_init(&st->txi, &st->txi_fn, AV_TX_FLOAT_FFT, 1, WINDOW_SIZE, NULL, 0);
+            ret = av_tx_init(&st->txi, &st->txi_fn, AV_TX_FLOAT_FFT, 1, WINDOW_SIZE, &scale, 0);
         if (ret < 0)
             return ret;
     }
@@ -418,7 +416,7 @@ static void forward_transform(DenoiseState *st, AVComplexFloat *out, const float
         x[i].im = 0;
     }
 
-    st->tx_fn(st->tx, y, x, sizeof(float));
+    st->tx_fn(st->tx, y, x, sizeof(AVComplexFloat));
 
     RNN_COPY(out, y, FREQ_SIZE);
 }
@@ -435,7 +433,7 @@ static void inverse_transform(DenoiseState *st, float *out, const AVComplexFloat
         x[i].im = -x[WINDOW_SIZE - i].im;
     }
 
-    st->txi_fn(st->txi, y, x, sizeof(float));
+    st->txi_fn(st->txi, y, x, sizeof(AVComplexFloat));
 
     for (int i = 0; i < WINDOW_SIZE; i++)
         out[i] = y[i].re / WINDOW_SIZE;
@@ -1025,7 +1023,7 @@ static int compute_frame_features(AudioRNNContext *s, DenoiseState *st, AVComple
     float E = 0;
     float *ceps_0, *ceps_1, *ceps_2;
     float spec_variability = 0;
-    LOCAL_ALIGNED_32(float, Ly, [NB_BANDS]);
+    LOCAL_ALIGNED_32(float, Ly, [FFALIGN(NB_BANDS, 4)]);
     LOCAL_ALIGNED_32(float, p, [WINDOW_SIZE]);
     float pitch_buf[PITCH_BUF_SIZE>>1];
     int pitch_index;
@@ -1059,6 +1057,7 @@ static int compute_frame_features(AudioRNNContext *s, DenoiseState *st, AVComple
     for (int i = 0; i < NB_BANDS; i++)
         Exp[i] = Exp[i] / sqrtf(.001f+Ex[i]*Ep[i]);
 
+    memset(Exp + NB_BANDS, 0, (FFALIGN(NB_BANDS, 4) - NB_BANDS) * sizeof(*Exp));
     dct(s, tmp, Exp);
 
     for (int i = 0; i < NB_DELTA_CEPS; i++)
@@ -1084,6 +1083,7 @@ static int compute_frame_features(AudioRNNContext *s, DenoiseState *st, AVComple
         return 1;
     }
 
+    memset(Ly + NB_BANDS, 0, (FFALIGN(NB_BANDS, 4) - NB_BANDS) * sizeof(*Ly));
     dct(s, features, Ly);
     features[0] -= 12;
     features[1] -= 4;
@@ -1366,7 +1366,7 @@ static float rnnoise_channel(AudioRNNContext *s, DenoiseState *st, float *out, c
     AVComplexFloat P[WINDOW_SIZE];
     float x[FRAME_SIZE];
     float Ex[NB_BANDS], Ep[NB_BANDS];
-    LOCAL_ALIGNED_32(float, Exp, [NB_BANDS]);
+    LOCAL_ALIGNED_32(float, Exp, [FFALIGN(NB_BANDS, 4)]);
     float features[NB_FEATURES];
     float g[NB_BANDS];
     float gf[FREQ_SIZE];
@@ -1413,8 +1413,8 @@ static int rnnoise_channels(AVFilterContext *ctx, void *arg, int jobnr, int nb_j
     ThreadData *td = arg;
     AVFrame *in = td->in;
     AVFrame *out = td->out;
-    const int start = (out->channels * jobnr) / nb_jobs;
-    const int end = (out->channels * (jobnr+1)) / nb_jobs;
+    const int start = ff_slice_pos(out->ch_layout.nb_channels, jobnr, nb_jobs);
+    const int end = ff_slice_pos(out->ch_layout.nb_channels, jobnr + 1, nb_jobs);
 
     for (int ch = start; ch < end; ch++) {
         rnnoise_channel(s, &s->st[ch],
@@ -1438,11 +1438,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         av_frame_free(&in);
         return AVERROR(ENOMEM);
     }
-    out->pts = in->pts;
+    av_frame_copy_props(out, in);
 
     td.in = in; td.out = out;
     ff_filter_execute(ctx, rnnoise_channels, &td, NULL,
-                      FFMIN(outlink->channels, ff_filter_get_nb_threads(ctx)));
+                      FFMIN(outlink->ch_layout.nb_channels, ff_filter_get_nb_threads(ctx)));
 
     av_frame_free(&in);
     return ff_filter_frame(outlink, out);
@@ -1478,7 +1478,7 @@ static int open_model(AVFilterContext *ctx, RNNModel **model)
 
     if (!s->model_name)
         return AVERROR(EINVAL);
-    f = av_fopen_utf8(s->model_name, "r");
+    f = avpriv_fopen_utf8(s->model_name, "r");
     if (!f) {
         av_log(ctx, AV_LOG_ERROR, "Failed to open model file: %s\n", s->model_name);
         return AVERROR(EINVAL);
@@ -1586,13 +1586,6 @@ static const AVFilterPad inputs[] = {
     },
 };
 
-static const AVFilterPad outputs[] = {
-    {
-        .name          = "default",
-        .type          = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
 #define OFFSET(x) offsetof(AudioRNNContext, x)
 #define AF AV_OPT_FLAG_AUDIO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
@@ -1605,18 +1598,18 @@ static const AVOption arnndn_options[] = {
 
 AVFILTER_DEFINE_CLASS(arnndn);
 
-const AVFilter ff_af_arnndn = {
-    .name          = "arnndn",
-    .description   = NULL_IF_CONFIG_SMALL("Reduce noise from speech using Recurrent Neural Networks."),
+const FFFilter ff_af_arnndn = {
+    .p.name        = "arnndn",
+    .p.description = NULL_IF_CONFIG_SMALL("Reduce noise from speech using Recurrent Neural Networks."),
+    .p.priv_class  = &arnndn_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(AudioRNNContext),
-    .priv_class    = &arnndn_class,
     .activate      = activate,
     .init          = init,
     .uninit        = uninit,
     FILTER_INPUTS(inputs),
-    FILTER_OUTPUTS(outputs),
-    FILTER_QUERY_FUNC(query_formats),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
-                     AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
     .process_command = process_command,
 };

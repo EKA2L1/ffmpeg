@@ -19,16 +19,16 @@
  */
 
 #include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
 #include "drawutils.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 #define R 0
 #define G 1
 #define B 2
+#define A 3
 
 typedef struct VibranceContext {
     const AVClass *class;
@@ -51,10 +51,16 @@ static inline float lerpf(float v0, float v1, float f)
     return v0 + (v1 - v0) * f;
 }
 
+typedef struct ThreadData {
+    AVFrame *out, *in;
+} ThreadData;
+
 static int vibrance_slice8(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
 {
     VibranceContext *s = avctx->priv;
-    AVFrame *frame = arg;
+    ThreadData *td = arg;
+    AVFrame *frame = td->out;
+    AVFrame *in = td->in;
     const int width = frame->width;
     const int height = frame->height;
     const float scale = 1.f / 255.f;
@@ -69,20 +75,30 @@ static int vibrance_slice8(AVFilterContext *avctx, void *arg, int jobnr, int nb_
     const float sgintensity = alternate * FFSIGN(gintensity);
     const float sbintensity = alternate * FFSIGN(bintensity);
     const float srintensity = alternate * FFSIGN(rintensity);
-    const int slice_start = (height * jobnr) / nb_jobs;
-    const int slice_end = (height * (jobnr + 1)) / nb_jobs;
-    const int glinesize = frame->linesize[0];
-    const int blinesize = frame->linesize[1];
-    const int rlinesize = frame->linesize[2];
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);
+    const ptrdiff_t glinesize = frame->linesize[0];
+    const ptrdiff_t blinesize = frame->linesize[1];
+    const ptrdiff_t rlinesize = frame->linesize[2];
+    const ptrdiff_t alinesize = frame->linesize[3];
+    const ptrdiff_t gslinesize = in->linesize[0];
+    const ptrdiff_t bslinesize = in->linesize[1];
+    const ptrdiff_t rslinesize = in->linesize[2];
+    const ptrdiff_t aslinesize = in->linesize[3];
+    const uint8_t *gsrc = in->data[0] + slice_start * glinesize;
+    const uint8_t *bsrc = in->data[1] + slice_start * blinesize;
+    const uint8_t *rsrc = in->data[2] + slice_start * rlinesize;
     uint8_t *gptr = frame->data[0] + slice_start * glinesize;
     uint8_t *bptr = frame->data[1] + slice_start * blinesize;
     uint8_t *rptr = frame->data[2] + slice_start * rlinesize;
+    const uint8_t *asrc = in->data[3];
+    uint8_t *aptr = frame->data[3];
 
     for (int y = slice_start; y < slice_end; y++) {
         for (int x = 0; x < width; x++) {
-            float g = gptr[x] * scale;
-            float b = bptr[x] * scale;
-            float r = rptr[x] * scale;
+            float g = gsrc[x] * scale;
+            float b = bsrc[x] * scale;
+            float r = rsrc[x] * scale;
             float max_color = FFMAX3(r, g, b);
             float min_color = FFMIN3(r, g, b);
             float color_saturation = max_color - min_color;
@@ -100,6 +116,12 @@ static int vibrance_slice8(AVFilterContext *avctx, void *arg, int jobnr, int nb_
             rptr[x] = av_clip_uint8(r * 255.f);
         }
 
+        if (aptr && alinesize && frame != in)
+            memcpy(aptr + alinesize * y, asrc + aslinesize * y, width);
+
+        gsrc += gslinesize;
+        bsrc += bslinesize;
+        rsrc += rslinesize;
         gptr += glinesize;
         bptr += blinesize;
         rptr += rlinesize;
@@ -111,7 +133,9 @@ static int vibrance_slice8(AVFilterContext *avctx, void *arg, int jobnr, int nb_
 static int vibrance_slice16(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
 {
     VibranceContext *s = avctx->priv;
-    AVFrame *frame = arg;
+    ThreadData *td = arg;
+    AVFrame *frame = td->out;
+    AVFrame *in = td->in;
     const int depth = s->depth;
     const float max = (1 << depth) - 1;
     const float scale = 1.f / max;
@@ -128,20 +152,30 @@ static int vibrance_slice16(AVFilterContext *avctx, void *arg, int jobnr, int nb
     const float sgintensity = alternate * FFSIGN(gintensity);
     const float sbintensity = alternate * FFSIGN(bintensity);
     const float srintensity = alternate * FFSIGN(rintensity);
-    const int slice_start = (height * jobnr) / nb_jobs;
-    const int slice_end = (height * (jobnr + 1)) / nb_jobs;
-    const int glinesize = frame->linesize[0] / 2;
-    const int blinesize = frame->linesize[1] / 2;
-    const int rlinesize = frame->linesize[2] / 2;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);
+    const ptrdiff_t gslinesize = in->linesize[0] / 2;
+    const ptrdiff_t bslinesize = in->linesize[1] / 2;
+    const ptrdiff_t rslinesize = in->linesize[2] / 2;
+    const ptrdiff_t aslinesize = in->linesize[3] / 2;
+    const ptrdiff_t glinesize = frame->linesize[0] / 2;
+    const ptrdiff_t blinesize = frame->linesize[1] / 2;
+    const ptrdiff_t rlinesize = frame->linesize[2] / 2;
+    const ptrdiff_t alinesize = frame->linesize[3] / 2;
+    const uint16_t *gsrc = (const uint16_t *)in->data[0] + slice_start * gslinesize;
+    const uint16_t *bsrc = (const uint16_t *)in->data[1] + slice_start * bslinesize;
+    const uint16_t *rsrc = (const uint16_t *)in->data[2] + slice_start * rslinesize;
     uint16_t *gptr = (uint16_t *)frame->data[0] + slice_start * glinesize;
     uint16_t *bptr = (uint16_t *)frame->data[1] + slice_start * blinesize;
     uint16_t *rptr = (uint16_t *)frame->data[2] + slice_start * rlinesize;
+    const uint16_t *asrc = (const uint16_t *)in->data[3];
+    uint16_t *aptr = (uint16_t *)frame->data[3];
 
     for (int y = slice_start; y < slice_end; y++) {
         for (int x = 0; x < width; x++) {
-            float g = gptr[x] * scale;
-            float b = bptr[x] * scale;
-            float r = rptr[x] * scale;
+            float g = gsrc[x] * scale;
+            float b = bsrc[x] * scale;
+            float r = rsrc[x] * scale;
             float max_color = FFMAX3(r, g, b);
             float min_color = FFMIN3(r, g, b);
             float color_saturation = max_color - min_color;
@@ -159,6 +193,12 @@ static int vibrance_slice16(AVFilterContext *avctx, void *arg, int jobnr, int nb
             rptr[x] = av_clip_uintp2_c(r * max, depth);
         }
 
+        if (aptr && alinesize && frame != in)
+            memcpy(aptr + alinesize * y, asrc + aslinesize * y, width * 2);
+
+        gsrc += gslinesize;
+        bsrc += bslinesize;
+        rsrc += rslinesize;
         gptr += glinesize;
         bptr += blinesize;
         rptr += rlinesize;
@@ -170,7 +210,9 @@ static int vibrance_slice16(AVFilterContext *avctx, void *arg, int jobnr, int nb
 static int vibrance_slice8p(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
 {
     VibranceContext *s = avctx->priv;
-    AVFrame *frame = arg;
+    ThreadData *td = arg;
+    AVFrame *frame = td->out;
+    AVFrame *in = td->in;
     const int step = s->step;
     const int width = frame->width;
     const int height = frame->height;
@@ -181,6 +223,7 @@ static int vibrance_slice8p(AVFilterContext *avctx, void *arg, int jobnr, int nb
     const uint8_t roffset = s->rgba_map[R];
     const uint8_t goffset = s->rgba_map[G];
     const uint8_t boffset = s->rgba_map[B];
+    const uint8_t aoffset = s->rgba_map[A];
     const float intensity = s->intensity;
     const float alternate = s->alternate ? 1.f : -1.f;
     const float gintensity = intensity * s->balance[0];
@@ -189,16 +232,18 @@ static int vibrance_slice8p(AVFilterContext *avctx, void *arg, int jobnr, int nb
     const float sgintensity = alternate * FFSIGN(gintensity);
     const float sbintensity = alternate * FFSIGN(bintensity);
     const float srintensity = alternate * FFSIGN(rintensity);
-    const int slice_start = (height * jobnr) / nb_jobs;
-    const int slice_end = (height * (jobnr + 1)) / nb_jobs;
-    const int linesize = frame->linesize[0];
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);
+    const ptrdiff_t linesize = frame->linesize[0];
+    const ptrdiff_t slinesize = in->linesize[0];
+    const uint8_t *src = in->data[0] + slice_start * slinesize;
     uint8_t *ptr = frame->data[0] + slice_start * linesize;
 
     for (int y = slice_start; y < slice_end; y++) {
         for (int x = 0; x < width; x++) {
-            float g = ptr[x * step + goffset] * scale;
-            float b = ptr[x * step + boffset] * scale;
-            float r = ptr[x * step + roffset] * scale;
+            float g = src[x * step + goffset] * scale;
+            float b = src[x * step + boffset] * scale;
+            float r = src[x * step + roffset] * scale;
             float max_color = FFMAX3(r, g, b);
             float min_color = FFMIN3(r, g, b);
             float color_saturation = max_color - min_color;
@@ -214,9 +259,13 @@ static int vibrance_slice8p(AVFilterContext *avctx, void *arg, int jobnr, int nb
             ptr[x * step + goffset] = av_clip_uint8(g * 255.f);
             ptr[x * step + boffset] = av_clip_uint8(b * 255.f);
             ptr[x * step + roffset] = av_clip_uint8(r * 255.f);
+
+            if (frame != in)
+                ptr[x * step + aoffset] = src[x * step + aoffset];
         }
 
         ptr += linesize;
+        src += slinesize;
     }
 
     return 0;
@@ -225,7 +274,9 @@ static int vibrance_slice8p(AVFilterContext *avctx, void *arg, int jobnr, int nb
 static int vibrance_slice16p(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
 {
     VibranceContext *s = avctx->priv;
-    AVFrame *frame = arg;
+    ThreadData *td = arg;
+    AVFrame *frame = td->out;
+    AVFrame *in = td->in;
     const int step = s->step;
     const int depth = s->depth;
     const float max = (1 << depth) - 1;
@@ -236,6 +287,7 @@ static int vibrance_slice16p(AVFilterContext *avctx, void *arg, int jobnr, int n
     const uint8_t roffset = s->rgba_map[R];
     const uint8_t goffset = s->rgba_map[G];
     const uint8_t boffset = s->rgba_map[B];
+    const uint8_t aoffset = s->rgba_map[A];
     const int width = frame->width;
     const int height = frame->height;
     const float intensity = s->intensity;
@@ -246,16 +298,18 @@ static int vibrance_slice16p(AVFilterContext *avctx, void *arg, int jobnr, int n
     const float sgintensity = alternate * FFSIGN(gintensity);
     const float sbintensity = alternate * FFSIGN(bintensity);
     const float srintensity = alternate * FFSIGN(rintensity);
-    const int slice_start = (height * jobnr) / nb_jobs;
-    const int slice_end = (height * (jobnr + 1)) / nb_jobs;
-    const int linesize = frame->linesize[0] / 2;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);
+    const ptrdiff_t linesize = frame->linesize[0] / 2;
+    const ptrdiff_t slinesize = in->linesize[0] / 2;
+    const uint16_t *src = (const uint16_t *)in->data[0] + slice_start * slinesize;
     uint16_t *ptr = (uint16_t *)frame->data[0] + slice_start * linesize;
 
     for (int y = slice_start; y < slice_end; y++) {
         for (int x = 0; x < width; x++) {
-            float g = ptr[x * step + goffset] * scale;
-            float b = ptr[x * step + boffset] * scale;
-            float r = ptr[x * step + roffset] * scale;
+            float g = src[x * step + goffset] * scale;
+            float b = src[x * step + boffset] * scale;
+            float r = src[x * step + roffset] * scale;
             float max_color = FFMAX3(r, g, b);
             float min_color = FFMIN3(r, g, b);
             float color_saturation = max_color - min_color;
@@ -271,25 +325,46 @@ static int vibrance_slice16p(AVFilterContext *avctx, void *arg, int jobnr, int n
             ptr[x * step + goffset] = av_clip_uintp2_c(g * max, depth);
             ptr[x * step + boffset] = av_clip_uintp2_c(b * max, depth);
             ptr[x * step + roffset] = av_clip_uintp2_c(r * max, depth);
+            if (frame != in)
+                ptr[x * step + aoffset] = src[x * step + aoffset];
         }
 
         ptr += linesize;
+        src += slinesize;
     }
 
     return 0;
 }
 
-static int filter_frame(AVFilterLink *link, AVFrame *frame)
+static int filter_frame(AVFilterLink *link, AVFrame *in)
 {
     AVFilterContext *avctx = link->dst;
+    AVFilterLink *outlink = avctx->outputs[0];
     VibranceContext *s = avctx->priv;
+    ThreadData td;
+    AVFrame *out;
     int res;
 
-    if (res = ff_filter_execute(avctx, s->do_slice, frame, NULL,
-                                FFMIN(frame->height, ff_filter_get_nb_threads(avctx))))
+    if (av_frame_is_writable(in)) {
+        out = in;
+    } else {
+        out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+        if (!out) {
+            av_frame_free(&in);
+            return AVERROR(ENOMEM);
+        }
+        av_frame_copy_props(out, in);
+    }
+
+    td.out = out;
+    td.in = in;
+    if (res = ff_filter_execute(avctx, s->do_slice, &td, NULL,
+                                FFMIN(out->height, ff_filter_get_nb_threads(avctx))))
         return res;
 
-    return ff_filter_frame(avctx->outputs[0], frame);
+    if (out != in)
+        av_frame_free(&in);
+    return ff_filter_frame(outlink, out);
 }
 
 static const enum AVPixelFormat pixel_fmts[] = {
@@ -335,16 +410,8 @@ static const AVFilterPad vibrance_inputs[] = {
     {
         .name           = "default",
         .type           = AVMEDIA_TYPE_VIDEO,
-        .flags          = AVFILTERPAD_FLAG_NEEDS_WRITABLE,
         .filter_frame   = filter_frame,
         .config_props   = config_input,
-    },
-};
-
-static const AVFilterPad vibrance_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
     },
 };
 
@@ -356,23 +423,23 @@ static const AVOption vibrance_options[] = {
     { "rbal", "set the red balance value",      OFFSET(balance[2]), AV_OPT_TYPE_FLOAT, {.dbl=1},      -10, 10, VF },
     { "gbal", "set the green balance value",    OFFSET(balance[0]), AV_OPT_TYPE_FLOAT, {.dbl=1},      -10, 10, VF },
     { "bbal", "set the blue balance value",     OFFSET(balance[1]), AV_OPT_TYPE_FLOAT, {.dbl=1},      -10, 10, VF },
-    { "rlum", "set the red luma coefficient",   OFFSET(lcoeffs[2]), AV_OPT_TYPE_FLOAT, {.dbl=0.072186}, 0,  1, VF },
+    { "rlum", "set the red luma coefficient",   OFFSET(lcoeffs[2]), AV_OPT_TYPE_FLOAT, {.dbl=0.212656}, 0,  1, VF },
     { "glum", "set the green luma coefficient", OFFSET(lcoeffs[0]), AV_OPT_TYPE_FLOAT, {.dbl=0.715158}, 0,  1, VF },
-    { "blum", "set the blue luma coefficient",  OFFSET(lcoeffs[1]), AV_OPT_TYPE_FLOAT, {.dbl=0.212656}, 0,  1, VF },
+    { "blum", "set the blue luma coefficient",  OFFSET(lcoeffs[1]), AV_OPT_TYPE_FLOAT, {.dbl=0.072186}, 0,  1, VF },
     { "alternate", "use alternate colors",      OFFSET(alternate),  AV_OPT_TYPE_BOOL,  {.i64=0},        0,  1, VF },
     { NULL }
 };
 
 AVFILTER_DEFINE_CLASS(vibrance);
 
-const AVFilter ff_vf_vibrance = {
-    .name          = "vibrance",
-    .description   = NULL_IF_CONFIG_SMALL("Boost or alter saturation."),
+const FFFilter ff_vf_vibrance = {
+    .p.name        = "vibrance",
+    .p.description = NULL_IF_CONFIG_SMALL("Boost or alter saturation."),
+    .p.priv_class  = &vibrance_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(VibranceContext),
-    .priv_class    = &vibrance_class,
     FILTER_INPUTS(vibrance_inputs),
-    FILTER_OUTPUTS(vibrance_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pixel_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = ff_filter_process_command,
 };

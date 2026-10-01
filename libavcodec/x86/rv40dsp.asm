@@ -1,5 +1,5 @@
 ;******************************************************************************
-;* MMX/SSE2-optimized functions for the RV40 decoder
+;* ASM-optimized functions for the RV40 decoder
 ;* Copyright (c) 2010 Ronald S. Bultje <rsbultje@gmail.com>
 ;* Copyright (c) 2010 Fiona Glaser <fiona@x264.com>
 ;* Copyright (C) 2012 Christophe Gisquet <christophe.gisquet@gmail.com>
@@ -51,7 +51,7 @@ sixtap_filter_v_m:   times 8 dw   1
                      times 8 dw  20
                      times 8 dw  52
 
-%ifdef PIC
+%if PIC
 %define sixtap_filter_hw   picregq
 %define sixtap_filter_hb   picregq
 %define sixtap_filter_v    picregq
@@ -84,7 +84,7 @@ SECTION .text
 %if WIN64
    movsxd   %1q, %1d
 %endif
-%ifdef PIC
+%if PIC
    add      %1q, picregq
 %else
    add      %1q, %2
@@ -104,7 +104,7 @@ SECTION .text
 
 %macro FILTER_V 1
 cglobal %1_rv40_qpel_v, 6,6+npicregs,12, dst, dststride, src, srcstride, height, my, picreg
-%ifdef PIC
+%if PIC
     lea  picregq, [sixtap_filter_v_m]
 %endif
     pxor      m7, m7
@@ -170,12 +170,12 @@ cglobal %1_rv40_qpel_v, 6,6+npicregs,12, dst, dststride, src, srcstride, height,
     add     srcq, srcstrideq
     dec  heightd                           ; next row
     jg .nextrow
-    REP_RET
+    RET
 %endmacro
 
 %macro FILTER_H  1
 cglobal %1_rv40_qpel_h, 6, 6+npicregs, 12, dst, dststride, src, srcstride, height, mx, picreg
-%ifdef PIC
+%if PIC
     lea  picregq, [sixtap_filter_v_m]
 %endif
     pxor      m7, m7
@@ -227,22 +227,8 @@ cglobal %1_rv40_qpel_h, 6, 6+npicregs, 12, dst, dststride, src, srcstride, heigh
     add     srcq, srcstrideq
     dec  heightd            ; next row
     jg .nextrow
-    REP_RET
+    RET
 %endmacro
-
-%if ARCH_X86_32
-INIT_MMX  mmx
-FILTER_V  put
-FILTER_H  put
-
-INIT_MMX  mmxext
-FILTER_V  avg
-FILTER_H  avg
-
-INIT_MMX  3dnow
-FILTER_V  avg
-FILTER_H  avg
-%endif
 
 INIT_XMM  sse2
 FILTER_H  put
@@ -252,7 +238,7 @@ FILTER_V  avg
 
 %macro FILTER_SSSE3 1
 cglobal %1_rv40_qpel_v, 6,6+npicregs,8, dst, dststride, src, srcstride, height, my, picreg
-%ifdef PIC
+%if PIC
     lea  picregq, [sixtap_filter_hb_m]
 %endif
 
@@ -294,10 +280,10 @@ cglobal %1_rv40_qpel_v, 6,6+npicregs,8, dst, dststride, src, srcstride, height, 
     add     srcq, srcstrideq
     dec       heightd                          ; next row
     jg       .nextrow
-    REP_RET
+    RET
 
 cglobal %1_rv40_qpel_h, 6,6+npicregs,8, dst, dststride, src, srcstride, height, mx, picreg
-%ifdef PIC
+%if PIC
     lea  picregq, [sixtap_filter_hb_m]
 %endif
     mova      m3, [filter_h6_shuf2]
@@ -327,7 +313,7 @@ cglobal %1_rv40_qpel_h, 6,6+npicregs,8, dst, dststride, src, srcstride, height, 
     add     srcq, srcstrideq
     dec  heightd            ; next row
     jg .nextrow
-    REP_RET
+    RET
 %endmacro
 
 INIT_XMM ssse3
@@ -415,15 +401,6 @@ FILTER_SSSE3  avg
 
 
 %macro MAIN_LOOP   2
-%if mmsize == 8
-    RV40_WCORE %2, r0, r1, r2
-%if %1 == 16
-    RV40_WCORE %2, r0 + 8, r1 + 8, r2 + 8
-%endif
-
-    ; Prepare for next loop
-    add        r6, r5
-%else
 %ifidn %1, 8
     RV40_WCORE %2, r0, r1, r2, r5
     ; Prepare 2 next lines
@@ -432,7 +409,6 @@ FILTER_SSSE3  avg
     RV40_WCORE %2, r0, r1, r2
     ; Prepare single next line
     add        r6, r5
-%endif
 %endif
 
 %endmacro
@@ -478,14 +454,8 @@ cglobal rv40_weight_func_%1_%2, 6, 7, 8
 .loop:
     MAIN_LOOP  %2, RND
     jnz        .loop
-    REP_RET
+    RET
 %endmacro
-
-INIT_MMX mmxext
-RV40_WEIGHT   rnd,    8, 3
-RV40_WEIGHT   rnd,   16, 4
-RV40_WEIGHT   nornd,  8, 3
-RV40_WEIGHT   nornd, 16, 4
 
 INIT_XMM sse2
 RV40_WEIGHT   rnd,    8, 3

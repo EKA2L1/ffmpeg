@@ -25,7 +25,12 @@ extern "C" {
 #include "libavformat/internal.h"
 }
 
+#include <DeckLinkAPIVersion.h>
 #include <DeckLinkAPI.h>
+#if BLACKMAGIC_DECKLINK_API_VERSION >= 0x0e030000
+#include <DeckLinkAPI_v14_2_1.h>
+#endif
+
 #ifdef _WIN32
 #include <DeckLinkAPI_i.c>
 #else
@@ -390,6 +395,116 @@ int ff_decklink_set_format(AVFormatContext *avctx, decklink_direction_t directio
     return ff_decklink_set_format(avctx, 0, 0, 0, 0, AV_FIELD_UNKNOWN, direction);
 }
 
+void ff_decklink_packet_queue_init(AVFormatContext *avctx, DecklinkPacketQueue *q, int64_t queue_size)
+{
+    memset(q, 0, sizeof(DecklinkPacketQueue));
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->cond, NULL);
+    q->avctx = avctx;
+    q->max_q_size = queue_size;
+}
+
+void ff_decklink_packet_queue_flush(DecklinkPacketQueue *q)
+{
+    AVPacket pkt;
+
+    pthread_mutex_lock(&q->mutex);
+    while (ff_packet_list_get(&q->pkt_list, &pkt) == 0) {
+        av_packet_unref(&pkt);
+    }
+    q->nb_packets = 0;
+    q->size       = 0;
+    pthread_mutex_unlock(&q->mutex);
+}
+
+void ff_decklink_packet_queue_end(DecklinkPacketQueue *q)
+{
+    ff_decklink_packet_queue_flush(q);
+    pthread_mutex_destroy(&q->mutex);
+    pthread_cond_destroy(&q->cond);
+}
+
+unsigned long long ff_decklink_packet_queue_size(DecklinkPacketQueue *q)
+{
+    unsigned long long size;
+    pthread_mutex_lock(&q->mutex);
+    size = q->size;
+    pthread_mutex_unlock(&q->mutex);
+    return size;
+}
+
+int ff_decklink_packet_queue_put(DecklinkPacketQueue *q, AVPacket *pkt)
+{
+    int pkt_size = pkt->size;
+    int ret;
+
+    // Drop Packet if queue size is > maximum queue size
+    if (ff_decklink_packet_queue_size(q) > (uint64_t)q->max_q_size) {
+        av_packet_unref(pkt);
+        av_log(q->avctx, AV_LOG_WARNING,  "Decklink input buffer overrun!\n");
+        return -1;
+    }
+    /* ensure the packet is reference counted */
+    if (av_packet_make_refcounted(pkt) < 0) {
+        av_packet_unref(pkt);
+        return -1;
+    }
+
+    pthread_mutex_lock(&q->mutex);
+
+    ret = ff_packet_list_put(&q->pkt_list, pkt, NULL, 0);
+    if (ret == 0) {
+        q->nb_packets++;
+        q->size += pkt_size + sizeof(AVPacket);
+        pthread_cond_signal(&q->cond);
+    } else {
+        av_packet_unref(pkt);
+    }
+
+    pthread_mutex_unlock(&q->mutex);
+    return ret;
+}
+
+int ff_decklink_packet_queue_get(DecklinkPacketQueue *q, AVPacket *pkt, int block)
+{
+    int ret;
+
+    pthread_mutex_lock(&q->mutex);
+
+    for (;; ) {
+        ret = ff_packet_list_get(&q->pkt_list, pkt);
+        if (ret == 0) {
+            q->nb_packets--;
+            q->size -= pkt->size + sizeof(AVPacket);
+            ret = 1;
+            break;
+        } else if (!block) {
+            ret = 0;
+            break;
+        } else {
+            pthread_cond_wait(&q->cond, &q->mutex);
+        }
+    }
+    pthread_mutex_unlock(&q->mutex);
+    return ret;
+}
+
+int64_t ff_decklink_packet_queue_peekpts(DecklinkPacketQueue *q)
+{
+    PacketListEntry *pkt1;
+    int64_t pts = -1;
+
+    pthread_mutex_lock(&q->mutex);
+    pkt1 = q->pkt_list.head;
+    if (pkt1) {
+        pts = pkt1->pkt.pts;
+    }
+    pthread_mutex_unlock(&q->mutex);
+
+    return pts;
+}
+
+
 int ff_decklink_list_devices(AVFormatContext *avctx,
                              struct AVDeviceInfoList *device_list,
                              int show_inputs, int show_outputs)
@@ -402,8 +517,8 @@ int ff_decklink_list_devices(AVFormatContext *avctx,
         return AVERROR(EIO);
 
     while (ret == 0 && iter->Next(&dl) == S_OK) {
-        IDeckLinkOutput *output_config;
-        IDeckLinkInput *input_config;
+        IDeckLinkOutput_v14_2_1 *output_config;
+        IDeckLinkInput_v14_2_1 *input_config;
         const char *display_name = NULL;
         const char *unique_name = NULL;
         AVDeviceInfo *new_device = NULL;
@@ -417,14 +532,14 @@ int ff_decklink_list_devices(AVFormatContext *avctx,
             goto next;
 
         if (show_outputs) {
-            if (dl->QueryInterface(IID_IDeckLinkOutput, (void **)&output_config) == S_OK) {
+            if (dl->QueryInterface(IID_IDeckLinkOutput_v14_2_1, (void **)&output_config) == S_OK) {
                 output_config->Release();
                 add = 1;
             }
         }
 
         if (show_inputs) {
-            if (dl->QueryInterface(IID_IDeckLinkInput, (void **)&input_config) == S_OK) {
+            if (dl->QueryInterface(IID_IDeckLinkInput_v14_2_1, (void **)&input_config) == S_OK) {
                 input_config->Release();
                 add = 1;
             }

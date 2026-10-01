@@ -22,8 +22,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 #include "framesync.h"
 
@@ -82,42 +81,30 @@ static const enum AVPixelFormat pix_fmts[] = {
     AV_PIX_FMT_GBRP12, AV_PIX_FMT_GBRP14, AV_PIX_FMT_GBRP16,
     AV_PIX_FMT_GBRAP, AV_PIX_FMT_GBRAP10, AV_PIX_FMT_GBRAP12, AV_PIX_FMT_GBRAP16,
     AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY9, AV_PIX_FMT_GRAY10, AV_PIX_FMT_GRAY12, AV_PIX_FMT_GRAY14, AV_PIX_FMT_GRAY16,
+    AV_PIX_FMT_GRAYF32, AV_PIX_FMT_GBRPF32, AV_PIX_FMT_GBRAPF32,
     AV_PIX_FMT_NONE
 };
 
-static void maskedmin8(const uint8_t *src, uint8_t *dst, const uint8_t *f1, const uint8_t *f2, int w)
-{
-    for (int x = 0; x < w; x++)
-        dst[x] = FFABS(src[x] - f2[x]) < FFABS(src[x] - f1[x]) ? f2[x] : f1[x];
+#define MASKED(n, type, op)                                \
+static void masked##n(const uint8_t *ssrc, uint8_t *ddst,  \
+                      const uint8_t *ff1,                  \
+                      const uint8_t *ff2, int w)           \
+{                                                          \
+    const type *src = (const type *)ssrc;                  \
+    const type *f1 = (const type *)ff1;                    \
+    const type *f2 = (const type *)ff2;                    \
+    type *dst = (type *)ddst;                              \
+                                                           \
+    for (int x = 0; x < w; x++)                            \
+        dst[x] = FFABS(src[x] - f2[x]) op FFABS(src[x] - f1[x]) ? f2[x] : f1[x]; \
 }
 
-static void maskedmax8(const uint8_t *src, uint8_t *dst, const uint8_t *f1, const uint8_t *f2, int w)
-{
-    for (int x = 0; x < w; x++)
-        dst[x] = FFABS(src[x] - f2[x]) > FFABS(src[x] - f1[x]) ? f2[x] : f1[x];
-}
-
-static void maskedmin16(const uint8_t *ssrc, uint8_t *ddst, const uint8_t *ff1, const uint8_t *ff2, int w)
-{
-    const uint16_t *src = (const uint16_t *)ssrc;
-    const uint16_t *f1 = (const uint16_t *)ff1;
-    const uint16_t *f2 = (const uint16_t *)ff2;
-    uint16_t *dst = (uint16_t *)ddst;
-
-    for (int x = 0; x < w; x++)
-        dst[x] = FFABS(src[x] - f2[x]) < FFABS(src[x] - f1[x]) ? f2[x] : f1[x];
-}
-
-static void maskedmax16(const uint8_t *ssrc, uint8_t *ddst, const uint8_t *ff1, const uint8_t *ff2, int w)
-{
-    const uint16_t *src = (const uint16_t *)ssrc;
-    const uint16_t *f1 = (const uint16_t *)ff1;
-    const uint16_t *f2 = (const uint16_t *)ff2;
-    uint16_t *dst = (uint16_t *)ddst;
-
-    for (int x = 0; x < w; x++)
-        dst[x] = FFABS(src[x] - f2[x]) > FFABS(src[x] - f1[x]) ? f2[x] : f1[x];
-}
+MASKED(min8,  uint8_t,  <)
+MASKED(max8,  uint8_t,  >)
+MASKED(min16, uint16_t, <)
+MASKED(max16, uint16_t, >)
+MASKED(min32, float,    <)
+MASKED(max32, float,    >)
 
 static int config_input(AVFilterLink *inlink)
 {
@@ -142,8 +129,10 @@ static int config_input(AVFilterLink *inlink)
 
     if (desc->comp[0].depth == 8)
         s->maskedminmax = s->maskedmin ? maskedmin8  : maskedmax8;
-    else
+    else if (desc->comp[0].depth <= 16)
         s->maskedminmax = s->maskedmin ? maskedmin16 : maskedmax16;
+    else
+        s->maskedminmax = s->maskedmin ? maskedmin32 : maskedmax32;
 
     return 0;
 }
@@ -160,8 +149,8 @@ static int maskedminmax_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb
         const ptrdiff_t dst_linesize = td->dst->linesize[p];
         const int w = s->planewidth[p];
         const int h = s->planeheight[p];
-        const int slice_start = (h * jobnr) / nb_jobs;
-        const int slice_end = (h * (jobnr+1)) / nb_jobs;
+        const int slice_start = ff_slice_pos(h, jobnr, nb_jobs);
+        const int slice_end = ff_slice_pos(h, jobnr + 1, nb_jobs);
         const uint8_t *src = td->src->data[p] + slice_start * src_linesize;
         const uint8_t *f1 = td->f1->data[p] + slice_start * f1_linesize;
         const uint8_t *f2 = td->f2->data[p] + slice_start * f2_linesize;
@@ -231,6 +220,8 @@ static int config_output(AVFilterLink *outlink)
     AVFilterLink *source = ctx->inputs[0];
     AVFilterLink *f1 = ctx->inputs[1];
     AVFilterLink *f2 = ctx->inputs[2];
+    FilterLink *il = ff_filter_link(source);
+    FilterLink *ol = ff_filter_link(outlink);
     FFFrameSyncIn *in;
     int ret;
 
@@ -249,7 +240,7 @@ static int config_output(AVFilterLink *outlink)
     outlink->w = source->w;
     outlink->h = source->h;
     outlink->sample_aspect_ratio = source->sample_aspect_ratio;
-    outlink->frame_rate = source->frame_rate;
+    ol->frame_rate = il->frame_rate;
 
     if ((ret = ff_framesync_init(&s->fs, ctx, 3)) < 0)
         return ret;
@@ -315,10 +306,12 @@ static const AVFilterPad maskedminmax_outputs[] = {
 
 AVFILTER_DEFINE_CLASS_EXT(maskedminmax, "masked(min|max)", maskedminmax_options);
 
-const AVFilter ff_vf_maskedmin = {
-    .name          = "maskedmin",
-    .description   = NULL_IF_CONFIG_SMALL("Apply filtering with minimum difference of two streams."),
-    .priv_class    = &maskedminmax_class,
+const FFFilter ff_vf_maskedmin = {
+    .p.name        = "maskedmin",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply filtering with minimum difference of two streams."),
+    .p.priv_class  = &maskedminmax_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(MaskedMinMaxContext),
     .init          = maskedmin_init,
     .uninit        = uninit,
@@ -326,20 +319,20 @@ const AVFilter ff_vf_maskedmin = {
     FILTER_INPUTS(maskedminmax_inputs),
     FILTER_OUTPUTS(maskedminmax_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = ff_filter_process_command,
 };
 
-const AVFilter ff_vf_maskedmax = {
-    .name          = "maskedmax",
-    .description   = NULL_IF_CONFIG_SMALL("Apply filtering with maximum difference of two streams."),
-    .priv_class    = &maskedminmax_class,
+const FFFilter ff_vf_maskedmax = {
+    .p.name        = "maskedmax",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply filtering with maximum difference of two streams."),
+    .p.priv_class  = &maskedminmax_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(MaskedMinMaxContext),
     .uninit        = uninit,
     .activate      = activate,
     FILTER_INPUTS(maskedminmax_inputs),
     FILTER_OUTPUTS(maskedminmax_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = ff_filter_process_command,
 };

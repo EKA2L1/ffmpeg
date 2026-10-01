@@ -34,14 +34,14 @@
 
 #include "libavutil/frame.h"
 #include "libavutil/imgutils.h"
-#include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
 #include "encode.h"
 #include "hap.h"
-#include "internal.h"
 #include "texturedsp.h"
 
 #define HAP_MAX_CHUNKS 64
@@ -56,18 +56,16 @@ enum HapHeaderLength {
 static int compress_texture(AVCodecContext *avctx, uint8_t *out, int out_length, const AVFrame *f)
 {
     HapContext *ctx = avctx->priv_data;
-    int i, j;
 
     if (ctx->tex_size > out_length)
         return AVERROR_BUFFER_TOO_SMALL;
 
-    for (j = 0; j < avctx->height; j += 4) {
-        for (i = 0; i < avctx->width; i += 4) {
-            uint8_t *p = f->data[0] + i * 4 + j * f->linesize[0];
-            const int step = ctx->tex_fun(out, f->linesize[0], p);
-            out += step;
-        }
-    }
+    ctx->enc.tex_data.out = out;
+    ctx->enc.frame_data.in = f->data[0];
+    ctx->enc.stride = f->linesize[0];
+    ctx->enc.width  = avctx->width;
+    ctx->enc.height = avctx->height;
+    ff_texturedsp_exec_compress_threads(avctx, &ctx->enc);
 
     return 0;
 }
@@ -123,7 +121,7 @@ static int hap_compress_frame(AVCodecContext *avctx, uint8_t *dst)
         /* If there is no gain from snappy, just use the raw texture. */
         if (chunk->compressed_size >= chunk->uncompressed_size) {
             av_log(avctx, AV_LOG_VERBOSE,
-                   "Snappy buffer bigger than uncompressed (%"SIZE_SPECIFIER" >= %"SIZE_SPECIFIER" bytes).\n",
+                   "Snappy buffer bigger than uncompressed (%zu >= %zu bytes).\n",
                    chunk->compressed_size, chunk->uncompressed_size);
             memcpy(chunk_dst, chunk_src, chunk->uncompressed_size);
             chunk->compressor = HAP_COMP_NONE;
@@ -236,7 +234,7 @@ static int hap_encode(AVCodecContext *avctx, AVPacket *pkt,
 static av_cold int hap_init(AVCodecContext *avctx)
 {
     HapContext *ctx = avctx->priv_data;
-    int ratio;
+    TextureDSPEncContext dxtc;
     int corrected_chunk_count;
     int ret = av_image_check_size(avctx->width, avctx->height, 0, avctx);
 
@@ -252,36 +250,38 @@ static av_cold int hap_init(AVCodecContext *avctx)
         return AVERROR_INVALIDDATA;
     }
 
-    ff_texturedspenc_init(&ctx->dxtc);
+    ff_texturedspenc_init(&dxtc);
 
     switch (ctx->opt_tex_fmt) {
     case HAP_FMT_RGBDXT1:
-        ratio = 8;
+        ctx->enc.tex_ratio = 8;
         avctx->codec_tag = MKTAG('H', 'a', 'p', '1');
         avctx->bits_per_coded_sample = 24;
-        ctx->tex_fun = ctx->dxtc.dxt1_block;
+        ctx->enc.tex_funct = dxtc.dxt1_block;
         break;
     case HAP_FMT_RGBADXT5:
-        ratio = 4;
+        ctx->enc.tex_ratio = 16;
         avctx->codec_tag = MKTAG('H', 'a', 'p', '5');
         avctx->bits_per_coded_sample = 32;
-        ctx->tex_fun = ctx->dxtc.dxt5_block;
+        ctx->enc.tex_funct = dxtc.dxt5_block;
         break;
     case HAP_FMT_YCOCGDXT5:
-        ratio = 4;
+        ctx->enc.tex_ratio = 16;
         avctx->codec_tag = MKTAG('H', 'a', 'p', 'Y');
         avctx->bits_per_coded_sample = 24;
-        ctx->tex_fun = ctx->dxtc.dxt5ys_block;
+        ctx->enc.tex_funct = dxtc.dxt5ys_block;
         break;
     default:
         av_log(avctx, AV_LOG_ERROR, "Invalid format %02X\n", ctx->opt_tex_fmt);
         return AVERROR_INVALIDDATA;
     }
+    ctx->enc.raw_ratio = 16;
+    ctx->enc.slice_count = av_clip(avctx->thread_count, 1, avctx->height / TEXTURE_BLOCK_H);
 
     /* Texture compression ratio is constant, so can we computer
      * beforehand the final size of the uncompressed buffer. */
-    ctx->tex_size   = FFALIGN(avctx->width,  TEXTURE_BLOCK_W) *
-                      FFALIGN(avctx->height, TEXTURE_BLOCK_H) * 4 / ratio;
+    ctx->tex_size   = avctx->width  / TEXTURE_BLOCK_W *
+                      avctx->height / TEXTURE_BLOCK_H * ctx->enc.tex_ratio;
 
     switch (ctx->opt_compressor) {
     case HAP_COMP_NONE:
@@ -294,7 +294,7 @@ static av_cold int hap_init(AVCodecContext *avctx)
     case HAP_COMP_SNAPPY:
         /* Round the chunk count to divide evenly on DXT block edges */
         corrected_chunk_count = av_clip(ctx->opt_chunk_count, 1, HAP_MAX_CHUNKS);
-        while ((ctx->tex_size / (64 / ratio)) % corrected_chunk_count != 0) {
+        while ((ctx->tex_size / ctx->enc.tex_ratio) % corrected_chunk_count != 0) {
             corrected_chunk_count--;
         }
 
@@ -305,7 +305,7 @@ static av_cold int hap_init(AVCodecContext *avctx)
         }
         break;
     default:
-        av_log(avctx, AV_LOG_ERROR, "Invalid compresor %02X\n", ctx->opt_compressor);
+        av_log(avctx, AV_LOG_ERROR, "Invalid compressor %02X\n", ctx->opt_compressor);
         return AVERROR_INVALIDDATA;
     }
     if (corrected_chunk_count != ctx->opt_chunk_count) {
@@ -331,14 +331,14 @@ static av_cold int hap_close(AVCodecContext *avctx)
 #define OFFSET(x) offsetof(HapContext, x)
 #define FLAGS     AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-    { "format", NULL, OFFSET(opt_tex_fmt), AV_OPT_TYPE_INT, { .i64 = HAP_FMT_RGBDXT1 }, HAP_FMT_RGBDXT1, HAP_FMT_YCOCGDXT5, FLAGS, "format" },
-        { "hap",       "Hap 1 (DXT1 textures)", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_FMT_RGBDXT1   }, 0, 0, FLAGS, "format" },
-        { "hap_alpha", "Hap Alpha (DXT5 textures)", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_FMT_RGBADXT5  }, 0, 0, FLAGS, "format" },
-        { "hap_q",     "Hap Q (DXT5-YCoCg textures)", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_FMT_YCOCGDXT5 }, 0, 0, FLAGS, "format" },
+    { "format", NULL, OFFSET(opt_tex_fmt), AV_OPT_TYPE_INT, { .i64 = HAP_FMT_RGBDXT1 }, HAP_FMT_RGBDXT1, HAP_FMT_YCOCGDXT5, FLAGS, .unit = "format" },
+        { "hap",       "Hap 1 (DXT1 textures)", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_FMT_RGBDXT1   }, 0, 0, FLAGS, .unit = "format" },
+        { "hap_alpha", "Hap Alpha (DXT5 textures)", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_FMT_RGBADXT5  }, 0, 0, FLAGS, .unit = "format" },
+        { "hap_q",     "Hap Q (DXT5-YCoCg textures)", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_FMT_YCOCGDXT5 }, 0, 0, FLAGS, .unit = "format" },
     { "chunks", "chunk count", OFFSET(opt_chunk_count), AV_OPT_TYPE_INT, {.i64 = 1 }, 1, HAP_MAX_CHUNKS, FLAGS, },
-    { "compressor", "second-stage compressor", OFFSET(opt_compressor), AV_OPT_TYPE_INT, { .i64 = HAP_COMP_SNAPPY }, HAP_COMP_NONE, HAP_COMP_SNAPPY, FLAGS, "compressor" },
-        { "none",       "None", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_COMP_NONE }, 0, 0, FLAGS, "compressor" },
-        { "snappy",     "Snappy", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_COMP_SNAPPY }, 0, 0, FLAGS, "compressor" },
+    { "compressor", "second-stage compressor", OFFSET(opt_compressor), AV_OPT_TYPE_INT, { .i64 = HAP_COMP_SNAPPY }, HAP_COMP_NONE, HAP_COMP_SNAPPY, FLAGS, .unit = "compressor" },
+        { "none",       "None", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_COMP_NONE }, 0, 0, FLAGS, .unit = "compressor" },
+        { "snappy",     "Snappy", 0, AV_OPT_TYPE_CONST, { .i64 = HAP_COMP_SNAPPY }, 0, 0, FLAGS, .unit = "compressor" },
     { NULL },
 };
 
@@ -349,19 +349,18 @@ static const AVClass hapenc_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_hap_encoder = {
-    .name           = "hap",
-    .long_name      = NULL_IF_CONFIG_SMALL("Vidvox Hap"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_HAP,
+const FFCodec ff_hap_encoder = {
+    .p.name         = "hap",
+    CODEC_LONG_NAME("Vidvox Hap"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_HAP,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SLICE_THREADS |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(HapContext),
-    .priv_class     = &hapenc_class,
+    .p.priv_class   = &hapenc_class,
     .init           = hap_init,
-    .encode2        = hap_encode,
+    FF_CODEC_ENCODE_CB(hap_encode),
     .close          = hap_close,
-    .pix_fmts       = (const enum AVPixelFormat[]) {
-        AV_PIX_FMT_RGBA, AV_PIX_FMT_NONE,
-    },
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |
-                      FF_CODEC_CAP_INIT_CLEANUP,
+    CODEC_PIXFMTS(AV_PIX_FMT_RGBA),
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

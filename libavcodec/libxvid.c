@@ -30,7 +30,7 @@
 #include <xvid.h>
 
 #include "libavutil/avassert.h"
-#include "libavutil/file.h"
+#include "libavutil/file_open.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
@@ -38,10 +38,9 @@
 #include "libavutil/opt.h"
 
 #include "avcodec.h"
+#include "codec_internal.h"
 #include "encode.h"
-#include "internal.h"
 #include "mpegutils.h"
-#include "packet_internal.h"
 
 #if HAVE_UNISTD_H
 #include <unistd.h>
@@ -408,12 +407,14 @@ static av_cold int xvid_encode_init(AVCodecContext *avctx)
     case 5:
         x->me_flags |= XVID_ME_EXTSEARCH16 |
                        XVID_ME_EXTSEARCH8;
+        av_fallthrough;
     case 4:
     case 3:
         x->me_flags |= XVID_ME_ADVANCEDDIAMOND8 |
                        XVID_ME_HALFPELREFINE8   |
                        XVID_ME_CHROMA_PVOP      |
                        XVID_ME_CHROMA_BVOP;
+        av_fallthrough;
     case 2:
     case 1:
         x->me_flags |= XVID_ME_ADVANCEDDIAMOND16 |
@@ -422,17 +423,19 @@ static av_cold int xvid_encode_init(AVCodecContext *avctx)
 
     /* Decide how we should decide blocks */
     switch (avctx->mb_decision) {
-    case 2:
+    case FF_MB_DECISION_RD:
         x->vop_flags |=  XVID_VOP_MODEDECISION_RD;
         x->me_flags  |=  XVID_ME_HALFPELREFINE8_RD    |
                          XVID_ME_QUARTERPELREFINE8_RD |
                          XVID_ME_EXTSEARCH_RD         |
                          XVID_ME_CHECKPREDICTION_RD;
-    case 1:
+        av_fallthrough;
+    case FF_MB_DECISION_BITS:
         if (!(x->vop_flags & XVID_VOP_MODEDECISION_RD))
             x->vop_flags |= XVID_VOP_FAST_MODEDECISION_RD;
         x->me_flags |= XVID_ME_HALFPELREFINE16_RD |
                        XVID_ME_QUARTERPELREFINE16_RD;
+        av_fallthrough;
     default:
         break;
     }
@@ -617,6 +620,10 @@ static av_cold int xvid_encode_init(AVCodecContext *avctx)
     x->intra_matrix =
     x->inter_matrix = NULL;
 
+    ret = ff_check_codec_matrices(avctx, FF_MATRIX_TYPE_INTRA | FF_MATRIX_TYPE_INTER, 1, 255);
+    if (ret < 0)
+        return ret;
+
     if (x->mpeg_quant)
         x->vol_flags |= XVID_VOL_MPEGQUANT;
     if ((avctx->intra_matrix || avctx->inter_matrix)) {
@@ -657,7 +664,6 @@ static av_cold int xvid_encode_init(AVCodecContext *avctx)
     if (xvid_flags & AV_CODEC_FLAG_GLOBAL_HEADER) {
         /* In this case, we are claiming to be MPEG-4 */
         x->quicktime_format = 1;
-        avctx->codec_id     = AV_CODEC_ID_MPEG4;
     } else {
         /* We are claiming to be Xvid */
         x->quicktime_format = 0;
@@ -740,7 +746,7 @@ static int xvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     xvid_enc_frame_t xvid_enc_frame = { 0 };
     xvid_enc_stats_t xvid_enc_stats = { 0 };
 
-    if ((ret = ff_alloc_packet(avctx, pkt, mb_width*(int64_t)mb_height*MAX_MB_BYTES + AV_INPUT_BUFFER_MIN_SIZE)) < 0)
+    if ((ret = ff_alloc_packet(avctx, pkt, mb_width*(int64_t)mb_height*MAX_MB_BYTES + FF_INPUT_BUFFER_MIN_SIZE)) < 0)
         return ret;
 
     /* Start setting up the frame */
@@ -815,7 +821,7 @@ static int xvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     }
 
     if (xerr > 0) {
-        int pict_type;
+        enum AVPictureType pict_type;
 
         *got_packet = 1;
 
@@ -828,7 +834,7 @@ static int xvid_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         else
             pict_type = AV_PICTURE_TYPE_I;
 
-        ff_side_data_set_encoder_stats(pkt, xvid_enc_stats.quant * FF_QP2LAMBDA, NULL, 0, pict_type);
+        ff_encode_add_stats_side_data(pkt, xvid_enc_stats.quant * FF_QP2LAMBDA, NULL, 0, pict_type);
 
         if (xvid_enc_frame.out_flags & XVID_KEYFRAME) {
             pkt->flags  |= AV_PKT_FLAG_KEY;
@@ -880,10 +886,10 @@ static av_cold int xvid_encode_close(AVCodecContext *avctx)
 static const AVOption options[] = {
     { "lumi_aq",     "Luminance masking AQ",            OFFSET(lumi_aq),     AV_OPT_TYPE_INT,   { .i64 = 0 },       0,       1, VE         },
     { "variance_aq", "Variance AQ",                     OFFSET(variance_aq), AV_OPT_TYPE_INT,   { .i64 = 0 },       0,       1, VE         },
-    { "ssim",        "Show SSIM information to stdout", OFFSET(ssim),        AV_OPT_TYPE_INT,   { .i64 = 0 },       0,       2, VE, "ssim" },
-    { "off",         NULL,                                                0, AV_OPT_TYPE_CONST, { .i64 = 0 }, INT_MIN, INT_MAX, VE, "ssim" },
-    { "avg",         NULL,                                                0, AV_OPT_TYPE_CONST, { .i64 = 1 }, INT_MIN, INT_MAX, VE, "ssim" },
-    { "frame",       NULL,                                                0, AV_OPT_TYPE_CONST, { .i64 = 2 }, INT_MIN, INT_MAX, VE, "ssim" },
+    { "ssim",        "Show SSIM information to stdout", OFFSET(ssim),        AV_OPT_TYPE_INT,   { .i64 = 0 },       0,       2, VE, .unit = "ssim" },
+    { "off",         NULL,                                                0, AV_OPT_TYPE_CONST, { .i64 = 0 }, INT_MIN, INT_MAX, VE, .unit = "ssim" },
+    { "avg",         NULL,                                                0, AV_OPT_TYPE_CONST, { .i64 = 1 }, INT_MIN, INT_MAX, VE, .unit = "ssim" },
+    { "frame",       NULL,                                                0, AV_OPT_TYPE_CONST, { .i64 = 2 }, INT_MIN, INT_MAX, VE, .unit = "ssim" },
     { "ssim_acc",    "SSIM accuracy",                   OFFSET(ssim_acc),    AV_OPT_TYPE_INT,   { .i64 = 2 },       0,       4, VE         },
     { "gmc",         "use GMC",                         OFFSET(gmc),         AV_OPT_TYPE_INT,   { .i64 = 0 },       0,       1, VE         },
     { "me_quality",  "Motion estimation quality",       OFFSET(me_quality),  AV_OPT_TYPE_INT,   { .i64 = 4 },       0,       6, VE         },
@@ -898,18 +904,19 @@ static const AVClass xvid_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_libxvid_encoder = {
-    .name           = "libxvid",
-    .long_name      = NULL_IF_CONFIG_SMALL("libxvidcore MPEG-4 part 2"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_MPEG4,
+const FFCodec ff_libxvid_encoder = {
+    .p.name         = "libxvid",
+    CODEC_LONG_NAME("libxvidcore MPEG-4 part 2"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_MPEG4,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(struct xvid_context),
     .init           = xvid_encode_init,
-    .encode2        = xvid_encode_frame,
+    FF_CODEC_ENCODE_CB(xvid_encode_frame),
     .close          = xvid_encode_close,
-    .pix_fmts       = (const enum AVPixelFormat[]) { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE },
-    .priv_class     = &xvid_class,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |
-                      FF_CODEC_CAP_INIT_CLEANUP,
-    .wrapper_name   = "libxvid",
+    CODEC_PIXFMTS(AV_PIX_FMT_YUV420P),
+    .color_ranges   = AVCOL_RANGE_MPEG,
+    .p.priv_class   = &xvid_class,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
+    .p.wrapper_name = "libxvid",
 };

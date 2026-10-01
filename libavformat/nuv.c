@@ -19,12 +19,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/intfloat.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "riff.h"
 
@@ -116,10 +118,11 @@ static int get_codec_data(AVFormatContext *s, AVIOContext *pb, AVStream *vst,
                     return AVERROR_INVALIDDATA;
                 }
                 ast->codecpar->bits_per_coded_sample = avio_rl32(pb);
-                ast->codecpar->channels              = avio_rl32(pb);
-                ast->codecpar->channel_layout        = 0;
-                if (ast->codecpar->channels <= 0) {
-                    av_log(s, AV_LOG_ERROR, "Invalid channels %d\n", ast->codecpar->channels);
+                av_channel_layout_uninit(&ast->codecpar->ch_layout);
+                ast->codecpar->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+                ast->codecpar->ch_layout.nb_channels = avio_rl32(pb);
+                if (ast->codecpar->ch_layout.nb_channels <= 0) {
+                    av_log(s, AV_LOG_ERROR, "Invalid channels %d\n", ast->codecpar->ch_layout.nb_channels);
                     return AVERROR_INVALIDDATA;
                 }
 
@@ -163,7 +166,9 @@ static int nuv_header(AVFormatContext *s)
     int is_mythtv, width, height, v_packs, a_packs, ret;
     AVStream *vst = NULL, *ast = NULL;
 
-    avio_read(pb, id_string, 12);
+    if ((ret = ffio_read_size(pb, id_string, 12)) < 0)
+        return ret;
+
     is_mythtv = !memcmp(id_string, "MythTVVideo", 12);
     avio_skip(pb, 5);       // version string
     avio_skip(pb, 3);       // padding
@@ -227,8 +232,7 @@ static int nuv_header(AVFormatContext *s)
 
         ast->codecpar->codec_type            = AVMEDIA_TYPE_AUDIO;
         ast->codecpar->codec_id              = AV_CODEC_ID_PCM_S16LE;
-        ast->codecpar->channels              = 2;
-        ast->codecpar->channel_layout        = AV_CH_LAYOUT_STEREO;
+        ast->codecpar->ch_layout             = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
         ast->codecpar->sample_rate           = 44100;
         ast->codecpar->bit_rate              = 2 * 2 * 44100 * 8;
         ast->codecpar->block_align           = 2 * 2;
@@ -317,7 +321,7 @@ static int nuv_packet(AVFormatContext *s, AVPacket *pkt)
         }
     }
 
-    return AVERROR(EIO);
+    return AVERROR_INVALIDDATA;
 }
 
 /**
@@ -386,6 +390,7 @@ static int64_t nuv_read_dts(AVFormatContext *s, int stream_index,
                     *ppos = pos;
                     return dts;
                 }
+                av_fallthrough;
             default:
                 avio_skip(pb, size);
                 break;
@@ -395,13 +400,13 @@ static int64_t nuv_read_dts(AVFormatContext *s, int stream_index,
 }
 
 
-const AVInputFormat ff_nuv_demuxer = {
-    .name           = "nuv",
-    .long_name      = NULL_IF_CONFIG_SMALL("NuppelVideo"),
+const FFInputFormat ff_nuv_demuxer = {
+    .p.name         = "nuv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("NuppelVideo"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .priv_data_size = sizeof(NUVContext),
     .read_probe     = nuv_probe,
     .read_header    = nuv_header,
     .read_packet    = nuv_packet,
     .read_timestamp = nuv_read_dts,
-    .flags          = AVFMT_GENERIC_INDEX,
 };

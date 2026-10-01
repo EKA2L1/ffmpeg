@@ -33,8 +33,8 @@
 #include "libavutil/intreadwrite.h"
 #include "libavcodec/bytestream.h"
 #include "avformat.h"
-#include "internal.h"
 #include "avio_internal.h"
+#include "mux.h"
 
 typedef struct FILMOutputContext {
     AVIOContext *header;
@@ -124,10 +124,6 @@ static int film_init(AVFormatContext *format_context)
     for (int i = 0; i < format_context->nb_streams; i++) {
         AVStream *st = format_context->streams[i];
         if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            if (film->audio_index > -1) {
-                av_log(format_context, AV_LOG_ERROR, "Sega FILM allows a maximum of one audio stream.\n");
-                return AVERROR(EINVAL);
-            }
             if (get_audio_codec_id(st->codecpar->codec_id) < 0) {
                 av_log(format_context, AV_LOG_ERROR,
                        "Incompatible audio stream format.\n");
@@ -137,10 +133,6 @@ static int film_init(AVFormatContext *format_context)
         }
 
         if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            if (film->video_index > -1) {
-                av_log(format_context, AV_LOG_ERROR, "Sega FILM allows a maximum of one video stream.\n");
-                return AVERROR(EINVAL);
-            }
             if (st->codecpar->codec_id != AV_CODEC_ID_CINEPAK &&
                 st->codecpar->codec_id != AV_CODEC_ID_RAWVIDEO) {
                 av_log(format_context, AV_LOG_ERROR,
@@ -236,7 +228,7 @@ static int film_write_header(AVFormatContext *format_context)
         AVStream *audio = format_context->streams[film->audio_index];
         int audio_codec = get_audio_codec_id(audio->codecpar->codec_id);
 
-        bytestream_put_byte(&ptr, audio->codecpar->channels); /* Audio channels */
+        bytestream_put_byte(&ptr, audio->codecpar->ch_layout.nb_channels); /* Audio channels */
         bytestream_put_byte(&ptr, audio->codecpar->bits_per_coded_sample); /* Audio bit depth */
         bytestream_put_byte(&ptr, audio_codec); /* Compression - 0 is PCM, 2 is ADX */
         bytestream_put_be16(&ptr, audio->codecpar->sample_rate); /* Audio sampling rate */
@@ -280,13 +272,15 @@ static void film_deinit(AVFormatContext *format_context)
     ffio_free_dyn_buf(&film->header);
 }
 
-const AVOutputFormat ff_segafilm_muxer = {
-    .name           = "film_cpk",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sega FILM / CPK"),
-    .extensions     = "cpk",
+const FFOutputFormat ff_segafilm_muxer = {
+    .p.name         = "film_cpk",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Sega FILM / CPK"),
+    .p.extensions   = "cpk",
     .priv_data_size = sizeof(FILMOutputContext),
-    .audio_codec    = AV_CODEC_ID_PCM_S16BE_PLANAR,
-    .video_codec    = AV_CODEC_ID_CINEPAK,
+    .p.audio_codec  = AV_CODEC_ID_PCM_S16BE_PLANAR,
+    .p.video_codec  = AV_CODEC_ID_CINEPAK,
+    .p.subtitle_codec = AV_CODEC_ID_NONE,
+    .flags_internal   = FF_OFMT_FLAG_MAX_ONE_OF_EACH,
     .init           = film_init,
     .write_trailer  = film_write_header,
     .write_packet   = film_write_packet,

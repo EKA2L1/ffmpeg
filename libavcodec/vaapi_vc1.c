@@ -20,11 +20,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "hwconfig.h"
-#include "internal.h"
+#include "config_components.h"
+
+#include "libavutil/attributes.h"
+#include "libavutil/mem.h"
+#include "hwaccel_internal.h"
+#include "mpegvideodec.h"
 #include "vaapi_decode.h"
 #include "vc1.h"
-#include "vc1data.h"
 
 /** Translate FFmpeg MV modes to VA API */
 static int get_VAMvModeVC1(enum MVModes mv_mode)
@@ -247,15 +250,18 @@ static inline void vc1_pack_bitplanes(uint8_t *bitplane, int n, const uint8_t *f
     bitplane[bitplane_index] = (bitplane[bitplane_index] << 4) | v;
 }
 
-static int vaapi_vc1_start_frame(AVCodecContext *avctx, av_unused const uint8_t *buffer, av_unused uint32_t size)
+static int vaapi_vc1_start_frame(AVCodecContext *avctx,
+                                 av_unused const AVBufferRef *buffer_ref,
+                                 av_unused const uint8_t *buffer,
+                                 av_unused uint32_t size)
 {
     const VC1Context *v = avctx->priv_data;
     const MpegEncContext *s = &v->s;
-    VAAPIDecodePicture *pic = s->current_picture_ptr->hwaccel_picture_private;
+    VAAPIDecodePicture *pic = s->cur_pic.ptr->hwaccel_picture_private;
     VAPictureParameterBufferVC1 pic_param;
     int err;
 
-    pic->output_surface = ff_vaapi_get_surface_id(s->current_picture_ptr->f);
+    pic->output_surface = ff_vaapi_get_surface_id(s->cur_pic.ptr->f);
 
     pic_param = (VAPictureParameterBufferVC1) {
         .forward_reference_picture         = VA_INVALID_ID,
@@ -280,7 +286,7 @@ static int vaapi_vc1_start_frame(AVCodecContext *avctx, av_unused const uint8_t 
             .broken_link                   = v->broken_link,
             .closed_entry                  = v->closed_entry,
             .panscan_flag                  = v->panscanflag,
-            .loopfilter                    = s->loop_filter,
+            .loopfilter                    = v->loop_filter,
         },
         .conditional_overlap_flag          = v->condover,
         .fast_uvmc_flag                    = v->fastuvmc,
@@ -338,7 +344,7 @@ static int vaapi_vc1_start_frame(AVCodecContext *avctx, av_unused const uint8_t 
         .mv_fields.bits = {
             .mv_mode                       = vc1_get_MVMODE(v),
             .mv_mode2                      = vc1_get_MVMODE2(v),
-            .mv_table                      = (v->fcm == PROGRESSIVE ? s->mv_table_index : v->imvtab),
+            .mv_table                      = (v->fcm == PROGRESSIVE ? v->mv_table_index : v->imvtab),
             .two_mv_block_pattern_table    = v->twomvbptab,
             .four_mv_switch                = v->fourmvswitch,
             .four_mv_block_pattern_table   = v->fourmvbptab,
@@ -366,16 +372,18 @@ static int vaapi_vc1_start_frame(AVCodecContext *avctx, av_unused const uint8_t 
             .frame_level_transform_type    = vc1_get_TTFRM(v),
             .transform_ac_codingset_idx1   = v->c_ac_table_index,
             .transform_ac_codingset_idx2   = v->y_ac_table_index,
-            .intra_transform_dc_table      = v->s.dc_table_index,
+            .intra_transform_dc_table      = v->dc_table_index,
         },
     };
 
     switch (s->pict_type) {
     case AV_PICTURE_TYPE_B:
-        pic_param.backward_reference_picture = ff_vaapi_get_surface_id(s->next_picture.f);
-        // fall-through
+        if (s->next_pic.ptr)
+            pic_param.backward_reference_picture = ff_vaapi_get_surface_id(s->next_pic.ptr->f);
+        av_fallthrough;
     case AV_PICTURE_TYPE_P:
-        pic_param.forward_reference_picture = ff_vaapi_get_surface_id(s->last_picture.f);
+        if (s->last_pic.ptr)
+            pic_param.forward_reference_picture = ff_vaapi_get_surface_id(s->last_pic.ptr->f);
         break;
     }
 
@@ -410,7 +418,7 @@ static int vaapi_vc1_start_frame(AVCodecContext *avctx, av_unused const uint8_t 
                 ff_bp[2] = pic_param.bitplane_present.flags.bp_forward_mb ? v->forward_mb_plane : NULL;
                 break;
             }
-            /* fall-through (BI-type) */
+            av_fallthrough; // (BI-type)
         case AV_PICTURE_TYPE_I:
             ff_bp[0] = pic_param.bitplane_present.flags.bp_field_tx   ? v->fieldtx_plane      : NULL;
             ff_bp[1] = pic_param.bitplane_present.flags.bp_ac_pred    ? v->acpred_plane       : NULL;
@@ -448,14 +456,12 @@ static int vaapi_vc1_end_frame(AVCodecContext *avctx)
 {
     VC1Context *v = avctx->priv_data;
     MpegEncContext *s = &v->s;
-    VAAPIDecodePicture *pic = s->current_picture_ptr->hwaccel_picture_private;
+    VAAPIDecodePicture *pic = s->cur_pic.ptr->hwaccel_picture_private;
     int ret;
 
     ret = ff_vaapi_decode_issue(avctx, pic);
     if (ret < 0)
         goto fail;
-
-    ff_mpeg_draw_horiz_band(s, 0, s->avctx->height);
 
 fail:
     return ret;
@@ -465,7 +471,7 @@ static int vaapi_vc1_decode_slice(AVCodecContext *avctx, const uint8_t *buffer, 
 {
     const VC1Context *v = avctx->priv_data;
     const MpegEncContext *s = &v->s;
-    VAAPIDecodePicture *pic = s->current_picture_ptr->hwaccel_picture_private;
+    VAAPIDecodePicture *pic = s->cur_pic.ptr->hwaccel_picture_private;
     VASliceParameterBufferVC1 slice_param;
     int mb_height;
     int err;
@@ -485,12 +491,12 @@ static int vaapi_vc1_decode_slice(AVCodecContext *avctx, const uint8_t *buffer, 
         .slice_data_size         = size,
         .slice_data_offset       = 0,
         .slice_data_flag         = VA_SLICE_DATA_FLAG_ALL,
-        .macroblock_offset       = get_bits_count(&s->gb),
+        .macroblock_offset       = get_bits_count(&v->gb),
         .slice_vertical_position = s->mb_y % mb_height,
     };
 
     err = ff_vaapi_decode_make_slice_buffer(avctx, pic,
-                                            &slice_param, sizeof(slice_param),
+                                            &slice_param, 1, sizeof(slice_param),
                                             buffer, size);
     if (err < 0) {
         ff_vaapi_decode_cancel(avctx, pic);
@@ -501,11 +507,11 @@ static int vaapi_vc1_decode_slice(AVCodecContext *avctx, const uint8_t *buffer, 
 }
 
 #if CONFIG_WMV3_VAAPI_HWACCEL
-const AVHWAccel ff_wmv3_vaapi_hwaccel = {
-    .name                 = "wmv3_vaapi",
-    .type                 = AVMEDIA_TYPE_VIDEO,
-    .id                   = AV_CODEC_ID_WMV3,
-    .pix_fmt              = AV_PIX_FMT_VAAPI,
+const FFHWAccel ff_wmv3_vaapi_hwaccel = {
+    .p.name               = "wmv3_vaapi",
+    .p.type               = AVMEDIA_TYPE_VIDEO,
+    .p.id                 = AV_CODEC_ID_WMV3,
+    .p.pix_fmt            = AV_PIX_FMT_VAAPI,
     .start_frame          = &vaapi_vc1_start_frame,
     .end_frame            = &vaapi_vc1_end_frame,
     .decode_slice         = &vaapi_vc1_decode_slice,
@@ -518,11 +524,11 @@ const AVHWAccel ff_wmv3_vaapi_hwaccel = {
 };
 #endif
 
-const AVHWAccel ff_vc1_vaapi_hwaccel = {
-    .name                 = "vc1_vaapi",
-    .type                 = AVMEDIA_TYPE_VIDEO,
-    .id                   = AV_CODEC_ID_VC1,
-    .pix_fmt              = AV_PIX_FMT_VAAPI,
+const FFHWAccel ff_vc1_vaapi_hwaccel = {
+    .p.name               = "vc1_vaapi",
+    .p.type               = AVMEDIA_TYPE_VIDEO,
+    .p.id                 = AV_CODEC_ID_VC1,
+    .p.pix_fmt            = AV_PIX_FMT_VAAPI,
     .start_frame          = &vaapi_vc1_start_frame,
     .end_frame            = &vaapi_vc1_end_frame,
     .decode_slice         = &vaapi_vc1_decode_slice,

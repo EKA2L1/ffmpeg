@@ -24,7 +24,7 @@
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "opencl.h"
 #include "opencl_source.h"
 #include "video.h"
@@ -57,7 +57,8 @@ typedef struct TonemapOpenCLContext {
     enum AVColorRange range, range_in, range_out;
     enum AVChromaLocation chroma_loc;
 
-    enum TonemapAlgorithm tonemap;
+    /* enum TonemapAlgorithm */
+    int                   tonemap;
     enum AVPixelFormat    format;
     double                peak;
     double                param;
@@ -70,24 +71,14 @@ typedef struct TonemapOpenCLContext {
     cl_mem                util_mem;
 } TonemapOpenCLContext;
 
-static const char *const linearize_funcs[AVCOL_TRC_NB] = {
+static const char *const linearize_funcs[] = {
     [AVCOL_TRC_SMPTE2084] = "eotf_st2084",
     [AVCOL_TRC_ARIB_STD_B67] = "inverse_oetf_hlg",
 };
 
-static const char *const delinearize_funcs[AVCOL_TRC_NB] = {
+static const char *const delinearize_funcs[] = {
     [AVCOL_TRC_BT709]     = "inverse_eotf_bt1886",
     [AVCOL_TRC_BT2020_10] = "inverse_eotf_bt1886",
-};
-
-static const struct PrimaryCoefficients primaries_table[AVCOL_PRI_NB] = {
-    [AVCOL_PRI_BT709]  = { 0.640, 0.330, 0.300, 0.600, 0.150, 0.060 },
-    [AVCOL_PRI_BT2020] = { 0.708, 0.292, 0.170, 0.797, 0.131, 0.046 },
-};
-
-static const struct WhitepointCoefficients whitepoint_table[AVCOL_PRI_NB] = {
-    [AVCOL_PRI_BT709]  = { 0.3127, 0.3290 },
-    [AVCOL_PRI_BT2020] = { 0.3127, 0.3290 },
 };
 
 static const char *const tonemap_func[TONEMAP_MAX] = {
@@ -100,14 +91,22 @@ static const char *const tonemap_func[TONEMAP_MAX] = {
     [TONEMAP_MOBIUS]   = "mobius",
 };
 
-static void get_rgb2rgb_matrix(enum AVColorPrimaries in, enum AVColorPrimaries out,
-                               double rgb2rgb[3][3]) {
+static int get_rgb2rgb_matrix(enum AVColorPrimaries in, enum AVColorPrimaries out,
+                              double rgb2rgb[3][3]) {
     double rgb2xyz[3][3], xyz2rgb[3][3];
 
-    ff_fill_rgb2xyz_table(&primaries_table[out], &whitepoint_table[out], rgb2xyz);
+    const AVColorPrimariesDesc *in_primaries = av_csp_primaries_desc_from_id(in);
+    const AVColorPrimariesDesc *out_primaries = av_csp_primaries_desc_from_id(out);
+
+    if (!in_primaries || !out_primaries)
+        return AVERROR(EINVAL);
+
+    ff_fill_rgb2xyz_table(&out_primaries->prim, &out_primaries->wp, rgb2xyz);
     ff_matrix_invert_3x3(rgb2xyz, xyz2rgb);
-    ff_fill_rgb2xyz_table(&primaries_table[in], &whitepoint_table[in], rgb2xyz);
+    ff_fill_rgb2xyz_table(&in_primaries->prim, &in_primaries->wp, rgb2xyz);
     ff_matrix_mul_3x3(rgb2rgb, rgb2xyz, xyz2rgb);
+
+    return 0;
 }
 
 #define OPENCL_SOURCE_NB 3
@@ -120,7 +119,7 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
     TonemapOpenCLContext *ctx = avctx->priv;
     int rgb2rgb_passthrough = 1;
     double rgb2rgb[3][3], rgb2yuv[3][3], yuv2rgb[3][3];
-    const struct LumaCoefficients *luma_src, *luma_dst;
+    const AVLumaCoefficients *luma_src, *luma_dst;
     cl_int cle;
     int err;
     AVBPrint header;
@@ -160,7 +159,7 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
     av_log(ctx, AV_LOG_DEBUG, "mapping range from %s to %s\n",
            av_color_range_name(ctx->range_in),
            av_color_range_name(ctx->range_out));
-    // checking valid value just because of limited implementaion
+    // checking valid value just because of limited implementation
     // please remove when more functionalities are implemented
     av_assert0(ctx->trc_out == AVCOL_TRC_BT709 ||
                ctx->trc_out == AVCOL_TRC_BT2020_10);
@@ -184,7 +183,8 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
     av_bprintf(&header, "#define DETECTION_FRAMES %d\n", DETECTION_FRAMES);
 
     if (ctx->primaries_out != ctx->primaries_in) {
-        get_rgb2rgb_matrix(ctx->primaries_in, ctx->primaries_out, rgb2rgb);
+        if ((err = get_rgb2rgb_matrix(ctx->primaries_in, ctx->primaries_out, rgb2rgb)) < 0)
+            goto fail;
         rgb2rgb_passthrough = 0;
     }
     if (ctx->range_in == AVCOL_RANGE_JPEG)
@@ -201,7 +201,7 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
         ff_opencl_print_const_matrix_3x3(&header, "rgb2rgb", rgb2rgb);
 
 
-    luma_src = ff_get_luma_coefficients(ctx->colorspace_in);
+    luma_src = av_csp_luma_coeffs_from_avcsp(ctx->colorspace_in);
     if (!luma_src) {
         err = AVERROR(EINVAL);
         av_log(avctx, AV_LOG_ERROR, "unsupported input colorspace %d (%s)\n",
@@ -209,7 +209,7 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
         goto fail;
     }
 
-    luma_dst = ff_get_luma_coefficients(ctx->colorspace_out);
+    luma_dst = av_csp_luma_coeffs_from_avcsp(ctx->colorspace_out);
     if (!luma_dst) {
         err = AVERROR(EINVAL);
         av_log(avctx, AV_LOG_ERROR, "unsupported output colorspace %d (%s)\n",
@@ -225,9 +225,9 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
     ff_opencl_print_const_matrix_3x3(&header, "rgb_matrix", yuv2rgb);
 
     av_bprintf(&header, "constant float3 luma_src = {%.4ff, %.4ff, %.4ff};\n",
-               luma_src->cr, luma_src->cg, luma_src->cb);
+               av_q2d(luma_src->cr), av_q2d(luma_src->cg), av_q2d(luma_src->cb));
     av_bprintf(&header, "constant float3 luma_dst = {%.4ff, %.4ff, %.4ff};\n",
-               luma_dst->cr, luma_dst->cg, luma_dst->cb);
+               av_q2d(luma_dst->cr), av_q2d(luma_dst->cg), av_q2d(luma_dst->cb));
 
     av_bprintf(&header, "#define linearize %s\n", linearize_funcs[ctx->trc_in]);
     av_bprintf(&header, "#define delinearize %s\n",
@@ -241,8 +241,8 @@ static int tonemap_opencl_init(AVFilterContext *avctx)
 
     av_log(avctx, AV_LOG_DEBUG, "Generated OpenCL header:\n%s\n", header.str);
     opencl_sources[0] = header.str;
-    opencl_sources[1] = ff_opencl_source_tonemap;
-    opencl_sources[2] = ff_opencl_source_colorspace_common;
+    opencl_sources[1] = ff_source_tonemap_cl;
+    opencl_sources[2] = ff_source_colorspace_common_cl;
     err = ff_opencl_filter_load_program(avctx, opencl_sources, OPENCL_SOURCE_NB);
 
     av_bprint_finalize(&header, NULL);
@@ -344,8 +344,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
     int err;
     double peak = ctx->peak;
 
-    AVHWFramesContext *input_frames_ctx =
-        (AVHWFramesContext*)input->hw_frames_ctx->data;
+    AVHWFramesContext *input_frames_ctx;
 
     av_log(ctx, AV_LOG_DEBUG, "Filter input: %s, %ux%u (%"PRId64").\n",
            av_get_pix_fmt_name(input->format),
@@ -353,6 +352,7 @@ static int tonemap_opencl_filter_frame(AVFilterLink *inlink, AVFrame *input)
 
     if (!input->hw_frames_ctx)
         return AVERROR(EINVAL);
+    input_frames_ctx = (AVHWFramesContext*)input->hw_frames_ctx->data;
 
     output = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!output) {
@@ -484,33 +484,33 @@ static av_cold void tonemap_opencl_uninit(AVFilterContext *avctx)
 #define OFFSET(x) offsetof(TonemapOpenCLContext, x)
 #define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
 static const AVOption tonemap_opencl_options[] = {
-    { "tonemap",      "tonemap algorithm selection", OFFSET(tonemap), AV_OPT_TYPE_INT, {.i64 = TONEMAP_NONE}, TONEMAP_NONE, TONEMAP_MAX - 1, FLAGS, "tonemap" },
-    {     "none",     0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_NONE},              0, 0, FLAGS, "tonemap" },
-    {     "linear",   0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_LINEAR},            0, 0, FLAGS, "tonemap" },
-    {     "gamma",    0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_GAMMA},             0, 0, FLAGS, "tonemap" },
-    {     "clip",     0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_CLIP},              0, 0, FLAGS, "tonemap" },
-    {     "reinhard", 0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_REINHARD},          0, 0, FLAGS, "tonemap" },
-    {     "hable",    0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_HABLE},             0, 0, FLAGS, "tonemap" },
-    {     "mobius",   0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_MOBIUS},            0, 0, FLAGS, "tonemap" },
-    { "transfer", "set transfer characteristic", OFFSET(trc), AV_OPT_TYPE_INT, {.i64 = AVCOL_TRC_BT709}, -1, INT_MAX, FLAGS, "transfer" },
-    { "t",        "set transfer characteristic", OFFSET(trc), AV_OPT_TYPE_INT, {.i64 = AVCOL_TRC_BT709}, -1, INT_MAX, FLAGS, "transfer" },
-    {     "bt709",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_BT709},         0, 0, FLAGS, "transfer" },
-    {     "bt2020",           0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_BT2020_10},     0, 0, FLAGS, "transfer" },
-    { "matrix", "set colorspace matrix", OFFSET(colorspace), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, "matrix" },
-    { "m",      "set colorspace matrix", OFFSET(colorspace), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, "matrix" },
-    {     "bt709",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_SPC_BT709},         0, 0, FLAGS, "matrix" },
-    {     "bt2020",           0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_SPC_BT2020_NCL},    0, 0, FLAGS, "matrix" },
-    { "primaries", "set color primaries", OFFSET(primaries), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, "primaries" },
-    { "p",         "set color primaries", OFFSET(primaries), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, "primaries" },
-    {     "bt709",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_PRI_BT709},         0, 0, FLAGS, "primaries" },
-    {     "bt2020",           0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_PRI_BT2020},        0, 0, FLAGS, "primaries" },
-    { "range",         "set color range", OFFSET(range), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, "range" },
-    { "r",             "set color range", OFFSET(range), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, "range" },
-    {     "tv",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_MPEG},         0, 0, FLAGS, "range" },
-    {     "pc",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_JPEG},         0, 0, FLAGS, "range" },
-    {     "limited",       0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_MPEG},         0, 0, FLAGS, "range" },
-    {     "full",          0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_JPEG},         0, 0, FLAGS, "range" },
-    { "format",    "output pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, {.i64 = AV_PIX_FMT_NONE}, AV_PIX_FMT_NONE, INT_MAX, FLAGS, "fmt" },
+    { "tonemap",      "tonemap algorithm selection", OFFSET(tonemap), AV_OPT_TYPE_INT, {.i64 = TONEMAP_NONE}, TONEMAP_NONE, TONEMAP_MAX - 1, FLAGS, .unit = "tonemap" },
+    {     "none",     0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_NONE},              0, 0, FLAGS, .unit = "tonemap" },
+    {     "linear",   0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_LINEAR},            0, 0, FLAGS, .unit = "tonemap" },
+    {     "gamma",    0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_GAMMA},             0, 0, FLAGS, .unit = "tonemap" },
+    {     "clip",     0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_CLIP},              0, 0, FLAGS, .unit = "tonemap" },
+    {     "reinhard", 0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_REINHARD},          0, 0, FLAGS, .unit = "tonemap" },
+    {     "hable",    0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_HABLE},             0, 0, FLAGS, .unit = "tonemap" },
+    {     "mobius",   0, 0, AV_OPT_TYPE_CONST, {.i64 = TONEMAP_MOBIUS},            0, 0, FLAGS, .unit = "tonemap" },
+    { "transfer", "set transfer characteristic", OFFSET(trc), AV_OPT_TYPE_INT, {.i64 = AVCOL_TRC_BT709}, -1, INT_MAX, FLAGS, .unit = "transfer" },
+    { "t",        "set transfer characteristic", OFFSET(trc), AV_OPT_TYPE_INT, {.i64 = AVCOL_TRC_BT709}, -1, INT_MAX, FLAGS, .unit = "transfer" },
+    {     "bt709",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_BT709},         0, 0, FLAGS, .unit = "transfer" },
+    {     "bt2020",           0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_TRC_BT2020_10},     0, 0, FLAGS, .unit = "transfer" },
+    { "matrix", "set colorspace matrix", OFFSET(colorspace), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, .unit = "matrix" },
+    { "m",      "set colorspace matrix", OFFSET(colorspace), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, .unit = "matrix" },
+    {     "bt709",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_SPC_BT709},         0, 0, FLAGS, .unit = "matrix" },
+    {     "bt2020",           0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_SPC_BT2020_NCL},    0, 0, FLAGS, .unit = "matrix" },
+    { "primaries", "set color primaries", OFFSET(primaries), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, .unit = "primaries" },
+    { "p",         "set color primaries", OFFSET(primaries), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, .unit = "primaries" },
+    {     "bt709",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_PRI_BT709},         0, 0, FLAGS, .unit = "primaries" },
+    {     "bt2020",           0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_PRI_BT2020},        0, 0, FLAGS, .unit = "primaries" },
+    { "range",         "set color range", OFFSET(range), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, .unit = "range" },
+    { "r",             "set color range", OFFSET(range), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, FLAGS, .unit = "range" },
+    {     "tv",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_MPEG},         0, 0, FLAGS, .unit = "range" },
+    {     "pc",            0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_JPEG},         0, 0, FLAGS, .unit = "range" },
+    {     "limited",       0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_MPEG},         0, 0, FLAGS, .unit = "range" },
+    {     "full",          0,       0,                 AV_OPT_TYPE_CONST, {.i64 = AVCOL_RANGE_JPEG},         0, 0, FLAGS, .unit = "range" },
+    { "format",    "output pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, {.i64 = AV_PIX_FMT_NONE}, AV_PIX_FMT_NONE, INT_MAX, FLAGS, .unit = "fmt" },
     { "peak",      "signal peak override", OFFSET(peak), AV_OPT_TYPE_DOUBLE, {.dbl = 0}, 0, DBL_MAX, FLAGS },
     { "param",     "tonemap parameter",   OFFSET(param), AV_OPT_TYPE_DOUBLE, {.dbl = NAN}, DBL_MIN, DBL_MAX, FLAGS },
     { "desat",     "desaturation parameter",   OFFSET(desat_param), AV_OPT_TYPE_DOUBLE, {.dbl = 0.5}, 0, DBL_MAX, FLAGS },
@@ -537,11 +537,12 @@ static const AVFilterPad tonemap_opencl_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_tonemap_opencl = {
-    .name           = "tonemap_opencl",
-    .description    = NULL_IF_CONFIG_SMALL("Perform HDR to SDR conversion with tonemapping."),
+const FFFilter ff_vf_tonemap_opencl = {
+    .p.name         = "tonemap_opencl",
+    .p.description  = NULL_IF_CONFIG_SMALL("Perform HDR to SDR conversion with tonemapping."),
+    .p.priv_class   = &tonemap_opencl_class,
+    .p.flags        = AVFILTER_FLAG_HWDEVICE,
     .priv_size      = sizeof(TonemapOpenCLContext),
-    .priv_class     = &tonemap_opencl_class,
     .init           = &ff_opencl_filter_init,
     .uninit         = &tonemap_opencl_uninit,
     FILTER_INPUTS(tonemap_opencl_inputs),

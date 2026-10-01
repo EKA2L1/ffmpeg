@@ -22,8 +22,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 #include "framesync.h"
 
@@ -32,6 +31,7 @@ typedef struct MaskedThresholdContext {
 
     int threshold;
     int planes;
+    int mode;
 
     int linesize[4];
     int planewidth[4], planeheight[4];
@@ -43,15 +43,19 @@ typedef struct MaskedThresholdContext {
 } MaskedThresholdContext;
 
 #define OFFSET(x) offsetof(MaskedThresholdContext, x)
-#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
+#define TFLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
+#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
 typedef struct ThreadData {
     AVFrame *src, *ref, *dst;
 } ThreadData;
 
 static const AVOption maskedthreshold_options[] = {
-    { "threshold", "set threshold", OFFSET(threshold), AV_OPT_TYPE_INT, {.i64=1},   0, UINT16_MAX, FLAGS },
-    { "planes",    "set planes",    OFFSET(planes),    AV_OPT_TYPE_INT, {.i64=0xF}, 0, 0xF,        FLAGS },
+    { "threshold", "set threshold", OFFSET(threshold), AV_OPT_TYPE_INT, {.i64=1},   0, UINT16_MAX, TFLAGS },
+    { "planes",    "set planes",    OFFSET(planes),    AV_OPT_TYPE_INT, {.i64=0xF}, 0, 0xF,        TFLAGS },
+    { "mode",      "set mode",      OFFSET(mode),      AV_OPT_TYPE_INT, {.i64=0},   0, 1,          FLAGS, .unit = "mode" },
+    { "abs",       "",              0,                 AV_OPT_TYPE_CONST, {.i64=0}, 0, 0,          FLAGS, .unit = "mode" },
+    { "diff",      "",              0,                 AV_OPT_TYPE_CONST, {.i64=1}, 0, 0,          FLAGS, .unit = "mode" },
     { NULL }
 };
 
@@ -77,13 +81,29 @@ static const enum AVPixelFormat pix_fmts[] = {
     AV_PIX_FMT_NONE
 };
 
-static void threshold8(const uint8_t *src, const uint8_t *ref, uint8_t *dst, int threshold, int w)
+static void threshold8_diff(const uint8_t *src, const uint8_t *ref, uint8_t *dst, int threshold, int w)
+{
+    for (int x = 0; x < w; x++)
+        dst[x] = (ref[x] - src[x] <= threshold) ? FFMAX(ref[x] - threshold, 0): src[x];
+}
+
+static void threshold8_abs(const uint8_t *src, const uint8_t *ref, uint8_t *dst, int threshold, int w)
 {
     for (int x = 0; x < w; x++)
         dst[x] = FFABS(src[x] - ref[x]) <= threshold ? src[x] : ref[x];
 }
 
-static void threshold16(const uint8_t *ssrc, const uint8_t *rref, uint8_t *ddst, int threshold, int w)
+static void threshold16_diff(const uint8_t *ssrc, const uint8_t *rref, uint8_t *ddst, int threshold, int w)
+{
+    const uint16_t *src = (const uint16_t *)ssrc;
+    const uint16_t *ref = (const uint16_t *)rref;
+    uint16_t *dst = (uint16_t *)ddst;
+
+    for (int x = 0; x < w; x++)
+        dst[x] = (ref[x] - src[x] <= threshold) ? FFMAX(ref[x] - threshold, 0): src[x];
+}
+
+static void threshold16_abs(const uint8_t *ssrc, const uint8_t *rref, uint8_t *ddst, int threshold, int w)
 {
     const uint16_t *src = (const uint16_t *)ssrc;
     const uint16_t *ref = (const uint16_t *)rref;
@@ -115,9 +135,9 @@ static int config_input(AVFilterLink *inlink)
     s->depth = desc->comp[0].depth;
 
     if (desc->comp[0].depth == 8)
-        s->maskedthreshold = threshold8;
+        s->maskedthreshold = s->mode ? threshold8_diff : threshold8_abs;
     else
-        s->maskedthreshold = threshold16;
+        s->maskedthreshold = s->mode ? threshold16_diff : threshold16_abs;
 
     return 0;
 }
@@ -134,8 +154,8 @@ static int threshold_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jo
         const ptrdiff_t dst_linesize = td->dst->linesize[p];
         const int w = s->planewidth[p];
         const int h = s->planeheight[p];
-        const int slice_start = (h * jobnr) / nb_jobs;
-        const int slice_end = (h * (jobnr+1)) / nb_jobs;
+        const int slice_start = ff_slice_pos(h, jobnr, nb_jobs);
+        const int slice_end = ff_slice_pos(h, jobnr + 1, nb_jobs);
         const uint8_t *src = td->src->data[p] + slice_start * src_linesize;
         const uint8_t *ref = td->ref->data[p] + slice_start * ref_linesize;
         uint8_t *dst = td->dst->data[p] + slice_start * dst_linesize;
@@ -200,6 +220,8 @@ static int config_output(AVFilterLink *outlink)
     MaskedThresholdContext *s = ctx->priv;
     AVFilterLink *source = ctx->inputs[0];
     AVFilterLink *ref = ctx->inputs[1];
+    FilterLink *il = ff_filter_link(source);
+    FilterLink *ol = ff_filter_link(outlink);
     FFFrameSyncIn *in;
     int ret;
 
@@ -215,7 +237,7 @@ static int config_output(AVFilterLink *outlink)
     outlink->w = source->w;
     outlink->h = source->h;
     outlink->sample_aspect_ratio = source->sample_aspect_ratio;
-    outlink->frame_rate = source->frame_rate;
+    ol->frame_rate = il->frame_rate;
 
     if ((ret = ff_framesync_init(&s->fs, ctx, 2)) < 0)
         return ret;
@@ -273,16 +295,17 @@ static const AVFilterPad maskedthreshold_outputs[] = {
 
 AVFILTER_DEFINE_CLASS(maskedthreshold);
 
-const AVFilter ff_vf_maskedthreshold = {
-    .name          = "maskedthreshold",
-    .description   = NULL_IF_CONFIG_SMALL("Pick pixels comparing absolute difference of two streams with threshold."),
-    .priv_class    = &maskedthreshold_class,
+const FFFilter ff_vf_maskedthreshold = {
+    .p.name        = "maskedthreshold",
+    .p.description = NULL_IF_CONFIG_SMALL("Pick pixels comparing absolute difference of two streams with threshold."),
+    .p.priv_class  = &maskedthreshold_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(MaskedThresholdContext),
     .uninit        = uninit,
     .activate      = activate,
     FILTER_INPUTS(maskedthreshold_inputs),
     FILTER_OUTPUTS(maskedthreshold_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = ff_filter_process_command,
 };

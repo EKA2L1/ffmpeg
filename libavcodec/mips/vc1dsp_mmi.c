@@ -1375,7 +1375,7 @@ void ff_vc1_inv_trans_4x4_mmi(uint8_t *dest, ptrdiff_t linesize, int16_t *block)
 }
 
 /* Apply overlap transform to horizontal edge */
-void ff_vc1_h_overlap_mmi(uint8_t *src, int stride)
+void ff_vc1_h_overlap_mmi(uint8_t *src, ptrdiff_t stride)
 {
     int i;
     int a, b, c, d;
@@ -1398,7 +1398,7 @@ void ff_vc1_h_overlap_mmi(uint8_t *src, int stride)
     }
 }
 
-void ff_vc1_h_s_overlap_mmi(int16_t *left, int16_t *right, int left_stride, int right_stride, int flags)
+void ff_vc1_h_s_overlap_mmi(int16_t *left, int16_t *right, ptrdiff_t left_stride, ptrdiff_t right_stride, int flags)
 {
     int i;
     int a, b, c, d;
@@ -1428,7 +1428,7 @@ void ff_vc1_h_s_overlap_mmi(int16_t *left, int16_t *right, int left_stride, int 
 }
 
 /* Apply overlap transform to vertical edge */
-void ff_vc1_v_overlap_mmi(uint8_t *src, int stride)
+void ff_vc1_v_overlap_mmi(uint8_t *src, ptrdiff_t stride)
 {
     int i;
     int a, b, c, d;
@@ -1485,7 +1485,7 @@ void ff_vc1_v_s_overlap_mmi(int16_t *top, int16_t *bottom)
  * @return whether other 3 pairs should be filtered or not
  * @see 8.6
  */
-static av_always_inline int vc1_filter_line(uint8_t *src, int stride, int pq)
+static av_always_inline int vc1_filter_line(uint8_t *src, ptrdiff_t stride, int pq)
 {
     int a0 = (2 * (src[-2 * stride] - src[1 * stride]) -
               5 * (src[-1 * stride] - src[0 * stride]) + 4) >> 3;
@@ -1534,7 +1534,7 @@ static av_always_inline int vc1_filter_line(uint8_t *src, int stride, int pq)
  * @param pq block quantizer
  * @see 8.6
  */
-static inline void vc1_loop_filter(uint8_t *src, int step, int stride,
+static inline void vc1_loop_filter(uint8_t *src, ptrdiff_t step, ptrdiff_t stride,
                                    int len, int pq)
 {
     int i;
@@ -1551,32 +1551,32 @@ static inline void vc1_loop_filter(uint8_t *src, int step, int stride,
     }
 }
 
-void ff_vc1_v_loop_filter4_mmi(uint8_t *src, int stride, int pq)
+void ff_vc1_v_loop_filter4_mmi(uint8_t *src, ptrdiff_t stride, int pq)
 {
     vc1_loop_filter(src, 1, stride, 4, pq);
 }
 
-void ff_vc1_h_loop_filter4_mmi(uint8_t *src, int stride, int pq)
+void ff_vc1_h_loop_filter4_mmi(uint8_t *src, ptrdiff_t stride, int pq)
 {
     vc1_loop_filter(src, stride, 1, 4, pq);
 }
 
-void ff_vc1_v_loop_filter8_mmi(uint8_t *src, int stride, int pq)
+void ff_vc1_v_loop_filter8_mmi(uint8_t *src, ptrdiff_t stride, int pq)
 {
     vc1_loop_filter(src, 1, stride, 8, pq);
 }
 
-void ff_vc1_h_loop_filter8_mmi(uint8_t *src, int stride, int pq)
+void ff_vc1_h_loop_filter8_mmi(uint8_t *src, ptrdiff_t stride, int pq)
 {
     vc1_loop_filter(src, stride, 1, 8, pq);
 }
 
-void ff_vc1_v_loop_filter16_mmi(uint8_t *src, int stride, int pq)
+void ff_vc1_v_loop_filter16_mmi(uint8_t *src, ptrdiff_t stride, int pq)
 {
     vc1_loop_filter(src, 1, stride, 16, pq);
 }
 
-void ff_vc1_h_loop_filter16_mmi(uint8_t *src, int stride, int pq)
+void ff_vc1_h_loop_filter16_mmi(uint8_t *src, ptrdiff_t stride, int pq)
 {
     vc1_loop_filter(src, stride, 1, 16, pq);
 }
@@ -2079,8 +2079,9 @@ typedef void (*vc1_mspel_mc_filter_8bits)
  * @param  rnd     Rounding bias.
  */
 #define VC1_MSPEL_MC(OP)                                                    \
-static void OP ## vc1_mspel_mc(uint8_t *dst, const uint8_t *src, int stride,\
-                               int hmode, int vmode, int rnd)               \
+static void OP ## vc1_mspel_mc(uint8_t *dst, const uint8_t *src,            \
+                               ptrdiff_t stride, int hmode, int vmode,      \
+                               int rnd)                                     \
 {                                                                           \
     static const vc1_mspel_mc_filter_ver_16bits vc1_put_shift_ver_16bits[] =\
          { NULL, vc1_put_ver_16b_shift1_mmi,                                \
@@ -2118,7 +2119,8 @@ static void OP ## vc1_mspel_mc(uint8_t *dst, const uint8_t *src, int stride,\
     vc1_put_shift_8bits[hmode](dst, src, stride, rnd, 1);                   \
 }                                                                           \
 static void OP ## vc1_mspel_mc_16(uint8_t *dst, const uint8_t *src,         \
-                                  int stride, int hmode, int vmode, int rnd)\
+                                  ptrdiff_t stride, int hmode, int vmode,   \
+                                  int rnd)                                  \
 {                                                                           \
     OP ## vc1_mspel_mc(dst + 0, src + 0, stride, hmode, vmode, rnd);        \
     OP ## vc1_mspel_mc(dst + 8, src + 8, stride, hmode, vmode, rnd);        \
@@ -2235,7 +2237,7 @@ DECLARE_FUNCTION(3, 3)
 
 
 void ff_put_no_rnd_vc1_chroma_mc8_mmi(uint8_t *dst /* align 8 */,
-                                      uint8_t *src /* align 1 */,
+                                      const uint8_t *src /* align 1 */,
                                       ptrdiff_t stride, int h, int x, int y)
 {
     union mmi_intfloat64 A, B, C, D;
@@ -2291,7 +2293,7 @@ void ff_put_no_rnd_vc1_chroma_mc8_mmi(uint8_t *dst /* align 8 */,
 }
 
 void ff_put_no_rnd_vc1_chroma_mc4_mmi(uint8_t *dst /* align 8 */,
-                                      uint8_t *src /* align 1 */,
+                                      const uint8_t *src /* align 1 */,
                                       ptrdiff_t stride, int h, int x, int y)
 {
     union mmi_intfloat64 A, B, C, D;
@@ -2345,7 +2347,7 @@ void ff_put_no_rnd_vc1_chroma_mc4_mmi(uint8_t *dst /* align 8 */,
 }
 
 void ff_avg_no_rnd_vc1_chroma_mc8_mmi(uint8_t *dst /* align 8 */,
-                                      uint8_t *src /* align 1 */,
+                                      const uint8_t *src /* align 1 */,
                                       ptrdiff_t stride, int h, int x, int y)
 {
     union mmi_intfloat64 A, B, C, D;
@@ -2404,7 +2406,7 @@ void ff_avg_no_rnd_vc1_chroma_mc8_mmi(uint8_t *dst /* align 8 */,
 }
 
 void ff_avg_no_rnd_vc1_chroma_mc4_mmi(uint8_t *dst /* align 8 */,
-                                      uint8_t *src /* align 1 */,
+                                      const uint8_t *src /* align 1 */,
                                       ptrdiff_t stride, int h, int x, int y)
 {
     union mmi_intfloat64 A, B, C, D;

@@ -28,9 +28,11 @@
 #include "libavutil/eval.h"
 #include "libavutil/intfloat.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/rational.h"
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct MvContext {
@@ -45,7 +47,7 @@ typedef struct MvContext {
     int aformat;          ///< audio format
 } MvContext;
 
-/* these magic numbers are defined in moviefile.h on Silicon Grahpics IRIX */
+/* these magic numbers are defined in moviefile.h on Silicon Graphics IRIX */
 #define MOVIE_SOUND  1
 #define MOVIE_SILENT 2
 
@@ -111,9 +113,7 @@ static int set_channels(AVFormatContext *avctx, AVStream *st, int channels)
         av_log(avctx, AV_LOG_ERROR, "Channel count %d invalid.\n", channels);
         return AVERROR_INVALIDDATA;
     }
-    st->codecpar->channels       = channels;
-    st->codecpar->channel_layout = (st->codecpar->channels == 1) ? AV_CH_LAYOUT_MONO
-                                                                 : AV_CH_LAYOUT_STEREO;
+    av_channel_layout_default(&st->codecpar->ch_layout, channels);
     return 0;
 }
 
@@ -256,7 +256,8 @@ static int read_table(AVFormatContext *avctx, AVStream *st,
         if (avio_feof(pb))
             return AVERROR_EOF;
 
-        avio_read(pb, name, 16);
+        if (avio_read(pb, name, 16) != 16)
+            return AVERROR_INVALIDDATA;
         name[sizeof(name) - 1] = 0;
         size = avio_rb32(pb);
         if (size < 0) {
@@ -283,7 +284,7 @@ static void read_index(AVIOContext *pb, AVStream *st)
             return ;
         av_add_index_entry(st, pos, timestamp, size, 0, AVINDEX_KEYFRAME);
         if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-            timestamp += size / (st->codecpar->channels * 2LL);
+            timestamp += size / (st->codecpar->ch_layout.nb_channels * 2LL);
         } else {
             timestamp++;
         }
@@ -402,7 +403,7 @@ static int mv_read_header(AVFormatContext *avctx)
             avio_skip(pb, 8);
             if (ast) {
                 av_add_index_entry(ast, pos, timestamp, asize, 0, AVINDEX_KEYFRAME);
-                timestamp += asize / (ast->codecpar->channels * (uint64_t)bytes_per_sample);
+                timestamp += asize / (ast->codecpar->ch_layout.nb_channels * (uint64_t)bytes_per_sample);
             }
             av_add_index_entry(vst, pos + asize, i, vsize, 0, AVINDEX_KEYFRAME);
         }
@@ -439,7 +440,7 @@ static int mv_read_header(AVFormatContext *avctx)
                                       ast->codecpar->bits_per_coded_sample);
                 ast->codecpar->codec_id = AV_CODEC_ID_NONE;
             }
-            if (ast->codecpar->channels <= 0) {
+            if (ast->codecpar->ch_layout.nb_channels <= 0) {
                 av_log(avctx, AV_LOG_ERROR, "No valid channel count found.\n");
                 return AVERROR_INVALIDDATA;
             }
@@ -488,7 +489,7 @@ static int mv_read_packet(AVFormatContext *avctx, AVPacket *pkt)
             avio_skip(pb, index->pos - pos);
         else if (index->pos < pos) {
             if (!(pb->seekable & AVIO_SEEKABLE_NORMAL))
-                return AVERROR(EIO);
+                return AVERROR(ENOSYS);
             ret = avio_seek(pb, index->pos, SEEK_SET);
             if (ret < 0)
                 return ret;
@@ -530,7 +531,7 @@ static int mv_read_seek(AVFormatContext *avctx, int stream_index,
         return AVERROR(ENOSYS);
 
     if (!(avctx->pb->seekable & AVIO_SEEKABLE_NORMAL))
-        return AVERROR(EIO);
+        return AVERROR(ENOSYS);
 
     frame = av_index_search_timestamp(st, timestamp, flags);
     if (frame < 0)
@@ -541,9 +542,9 @@ static int mv_read_seek(AVFormatContext *avctx, int stream_index,
     return 0;
 }
 
-const AVInputFormat ff_mv_demuxer = {
-    .name           = "mv",
-    .long_name      = NULL_IF_CONFIG_SMALL("Silicon Graphics Movie"),
+const FFInputFormat ff_mv_demuxer = {
+    .p.name         = "mv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Silicon Graphics Movie"),
     .priv_data_size = sizeof(MvContext),
     .read_probe     = mv_probe,
     .read_header    = mv_read_header,

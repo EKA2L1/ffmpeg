@@ -22,14 +22,21 @@
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
+#include "libavutil/cpu.h"
+#include "libavutil/eval.h"
 
 #include "audio.h"
 #include "avfilter.h"
+#include "avfilter_internal.h"
+#include "filters.h"
 #include "framepool.h"
-#include "internal.h"
 
-#define BUFFER_ALIGN 0
-
+const AVFilterPad ff_audio_default_filterpad[1] = {
+    {
+        .name = "default",
+        .type = AVMEDIA_TYPE_AUDIO,
+    }
+};
 
 AVFrame *ff_null_get_audio_buffer(AVFilterLink *link, int nb_samples)
 {
@@ -39,45 +46,24 @@ AVFrame *ff_null_get_audio_buffer(AVFilterLink *link, int nb_samples)
 AVFrame *ff_default_get_audio_buffer(AVFilterLink *link, int nb_samples)
 {
     AVFrame *frame = NULL;
-    int channels = link->channels;
-    int channel_layout_nb_channels = av_get_channel_layout_nb_channels(link->channel_layout);
+    FilterLinkInternal *const li = ff_link_internal(link);
+    int channels = link->ch_layout.nb_channels;
+    int align = av_cpu_max_align();
 
-    av_assert0(channels == channel_layout_nb_channels || !channel_layout_nb_channels);
+    if (ff_frame_pool_audio_reinit(&li->frame_pool, channels, nb_samples,
+                                   link->format, align) < 0)
+        return NULL;
 
-    if (!link->frame_pool) {
-        link->frame_pool = ff_frame_pool_audio_init(av_buffer_allocz, channels,
-                                                    nb_samples, link->format, BUFFER_ALIGN);
-        if (!link->frame_pool)
-            return NULL;
-    } else {
-        int pool_channels = 0;
-        int pool_nb_samples = 0;
-        int pool_align = 0;
-        enum AVSampleFormat pool_format = AV_SAMPLE_FMT_NONE;
-
-        if (ff_frame_pool_get_audio_config(link->frame_pool,
-                                           &pool_channels, &pool_nb_samples,
-                                           &pool_format, &pool_align) < 0) {
-            return NULL;
-        }
-
-        if (pool_channels != channels || pool_nb_samples < nb_samples ||
-            pool_format != link->format || pool_align != BUFFER_ALIGN) {
-
-            ff_frame_pool_uninit((FFFramePool **)&link->frame_pool);
-            link->frame_pool = ff_frame_pool_audio_init(av_buffer_allocz, channels,
-                                                        nb_samples, link->format, BUFFER_ALIGN);
-            if (!link->frame_pool)
-                return NULL;
-        }
-    }
-
-    frame = ff_frame_pool_get(link->frame_pool);
+    frame = ff_frame_pool_get(&li->frame_pool);
     if (!frame)
         return NULL;
 
     frame->nb_samples = nb_samples;
-    frame->channel_layout = link->channel_layout;
+    if (link->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC &&
+        av_channel_layout_copy(&frame->ch_layout, &link->ch_layout) < 0) {
+        av_frame_free(&frame);
+        return NULL;
+    }
     frame->sample_rate = link->sample_rate;
 
     av_samples_set_silence(frame->extended_data, 0, nb_samples, channels, link->format);
@@ -96,4 +82,39 @@ AVFrame *ff_get_audio_buffer(AVFilterLink *link, int nb_samples)
         ret = ff_default_get_audio_buffer(link, nb_samples);
 
     return ret;
+}
+
+int ff_parse_sample_rate(int *ret, const char *arg, void *log_ctx)
+{
+    char *tail;
+    double srate = av_strtod(arg, &tail);
+    if (*tail || srate < 1 || (int)srate != srate || srate > INT_MAX) {
+        av_log(log_ctx, AV_LOG_ERROR, "Invalid sample rate '%s'\n", arg);
+        return AVERROR(EINVAL);
+    }
+    *ret = srate;
+    return 0;
+}
+
+int ff_parse_channel_layout(AVChannelLayout *ret, int *nret, const char *arg,
+                            void *log_ctx)
+{
+    AVChannelLayout chlayout = { 0 };
+    int res;
+
+    res = av_channel_layout_from_string(&chlayout, arg);
+    if (res < 0) {
+        av_log(log_ctx, AV_LOG_ERROR, "Invalid channel layout '%s'\n", arg);
+        return AVERROR(EINVAL);
+    }
+
+    if (chlayout.order == AV_CHANNEL_ORDER_UNSPEC && !nret) {
+        av_log(log_ctx, AV_LOG_ERROR, "Unknown channel layout '%s' is not supported.\n", arg);
+        return AVERROR(EINVAL);
+    }
+    *ret = chlayout;
+    if (nret)
+        *nret = chlayout.nb_channels;
+
+    return 0;
 }

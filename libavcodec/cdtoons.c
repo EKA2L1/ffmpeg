@@ -29,9 +29,11 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/internal.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 #define CDTOONS_HEADER_SIZE   44
 #define CDTOONS_MAX_SPRITES 1200
@@ -150,7 +152,7 @@ static int cdtoons_render_sprite(AVCodecContext *avctx, const uint8_t *data,
     return 0;
 }
 
-static int cdtoons_decode_frame(AVCodecContext *avctx, void *data,
+static int cdtoons_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                                 int *got_frame, AVPacket *avpkt)
 {
     CDToonsContext *c = avctx->priv_data;
@@ -383,7 +385,6 @@ static int cdtoons_decode_frame(AVCodecContext *avctx, void *data,
             }
             /* first palette entry indicates transparency */
             c->pal[0]                     = 0;
-            c->frame->palette_has_changed = 1;
         }
     }
 
@@ -397,7 +398,7 @@ done:
 
     memcpy(c->frame->data[1], c->pal, AVPALETTE_SIZE);
 
-    if ((ret = av_frame_ref(data, c->frame)) < 0)
+    if ((ret = av_frame_ref(rframe, c->frame)) < 0)
         return ret;
 
     *got_frame = 1;
@@ -419,7 +420,7 @@ static av_cold int cdtoons_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static void cdtoons_flush(AVCodecContext *avctx)
+static av_cold void cdtoons_flush(AVCodecContext *avctx)
 {
     CDToonsContext *c = avctx->priv_data;
 
@@ -442,16 +443,15 @@ static av_cold int cdtoons_decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-const AVCodec ff_cdtoons_decoder = {
-    .name           = "cdtoons",
-    .long_name      = NULL_IF_CONFIG_SMALL("CDToons video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_CDTOONS,
+const FFCodec ff_cdtoons_decoder = {
+    .p.name         = "cdtoons",
+    CODEC_LONG_NAME("CDToons video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_CDTOONS,
     .priv_data_size = sizeof(CDToonsContext),
     .init           = cdtoons_decode_init,
     .close          = cdtoons_decode_end,
-    .decode         = cdtoons_decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(cdtoons_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
     .flush          = cdtoons_flush,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
 };

@@ -25,12 +25,13 @@
  * @author Zhentan Feng <spyfeng at gmail dot com>
  */
 
-#include "libavutil/intreadwrite.h"
 #include "libavutil/avassert.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
 #include "avio_internal.h"
 #include "internal.h"
 #include "mpegts.h"
+#include "mux.h"
 #include "wtv.h"
 
 #define WTV_BIGSECTOR_SIZE (1 << WTV_BIGSECTOR_BITS)
@@ -449,7 +450,7 @@ static void write_timestamp(AVFormatContext *s, AVPacket *pkt)
     write_pad(pb, 8);
     avio_wl64(pb, pkt->pts == AV_NOPTS_VALUE ? -1 : pkt->pts);
     avio_wl64(pb, pkt->pts == AV_NOPTS_VALUE ? -1 : pkt->pts);
-    avio_wl64(pb, pkt->pts == AV_NOPTS_VALUE ? -1 : pkt->pts);
+    avio_wl64(pb, pkt->pts == AV_NOPTS_VALUE ? 0 : pkt->pts);
     avio_wl64(pb, 0);
     avio_wl64(pb, par->codec_type == AVMEDIA_TYPE_VIDEO && (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 0);
     avio_wl64(pb, 0);
@@ -574,7 +575,7 @@ static int write_root_table(AVFormatContext *s, int64_t sector_pos)
         }
     }
 
-    // caculate root table size
+    // calculate root table size
     size = avio_tell(pb) - sector_pos;
     pad = WTV_SECTOR_SIZE- size;
     write_pad(pb, pad);
@@ -670,12 +671,12 @@ static void write_table_entries_attrib(AVFormatContext *s)
 {
     WtvContext *wctx = s->priv_data;
     AVIOContext *pb = s->pb;
-    AVDictionaryEntry *tag = 0;
+    const AVDictionaryEntry *tag = NULL;
 
     ff_standardize_creation_time(s);
     //FIXME: translate special tags (e.g. WM/Bitrate) to binary representation
     ff_metadata_conv(&s->metadata, ff_asf_metadata_conv, NULL);
-    while ((tag = av_dict_get(s->metadata, "", tag, AV_DICT_IGNORE_SUFFIX)))
+    while ((tag = av_dict_iterate(s->metadata, tag)))
         write_tag(pb, tag->key, tag->value);
 
     if (wctx->thumbnail.size) {
@@ -698,11 +699,11 @@ static void write_table_redirector_legacy_attrib(AVFormatContext *s)
 {
     WtvContext *wctx = s->priv_data;
     AVIOContext *pb = s->pb;
-    AVDictionaryEntry *tag = 0;
+    const AVDictionaryEntry *tag = NULL;
     int64_t pos = 0;
 
     //FIXME: translate special tags to binary representation
-    while ((tag = av_dict_get(s->metadata, "", tag, AV_DICT_IGNORE_SUFFIX))) {
+    while ((tag = av_dict_iterate(s->metadata, tag))) {
         avio_wl64(pb, pos);
         pos += metadata_header_size(tag->key) + strlen(tag->value)*2 + 2;
     }
@@ -829,15 +830,15 @@ static int write_trailer(AVFormatContext *s)
     return 0;
 }
 
-const AVOutputFormat ff_wtv_muxer = {
-    .name           = "wtv",
-    .long_name      = NULL_IF_CONFIG_SMALL("Windows Television (WTV)"),
-    .extensions     = "wtv",
+const FFOutputFormat ff_wtv_muxer = {
+    .p.name         = "wtv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Windows Television (WTV)"),
+    .p.extensions   = "wtv",
     .priv_data_size = sizeof(WtvContext),
-    .audio_codec    = AV_CODEC_ID_AC3,
-    .video_codec    = AV_CODEC_ID_MPEG2VIDEO,
+    .p.audio_codec  = AV_CODEC_ID_AC3,
+    .p.video_codec  = AV_CODEC_ID_MPEG2VIDEO,
     .write_header   = write_header,
     .write_packet   = write_packet,
     .write_trailer  = write_trailer,
-    .codec_tag      = ff_riff_codec_tags_list,
+    .p.codec_tag    = ff_riff_codec_tags_list,
 };

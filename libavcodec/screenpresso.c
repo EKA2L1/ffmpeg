@@ -34,7 +34,6 @@
  */
 
 #include <stdint.h>
-#include <string.h>
 #include <zlib.h>
 
 #include "libavutil/imgutils.h"
@@ -42,7 +41,8 @@
 #include "libavutil/mem.h"
 
 #include "avcodec.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct ScreenpressoContext {
     AVFrame *current;
@@ -101,11 +101,10 @@ static void sum_delta_flipped(uint8_t       *dst, int dst_linesize,
     }
 }
 
-static int screenpresso_decode_frame(AVCodecContext *avctx, void *data,
+static int screenpresso_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                                      int *got_frame, AVPacket *avpkt)
 {
     ScreenpressoContext *ctx = avctx->priv_data;
-    AVFrame *frame = data;
     uLongf length = ctx->inflated_size;
     int keyframe, component_size, src_linesize;
     int ret;
@@ -138,6 +137,9 @@ static int screenpresso_decode_frame(AVCodecContext *avctx, void *data,
         return AVERROR_INVALIDDATA;
     }
 
+    /* Codec has aligned strides */
+    src_linesize = FFALIGN(avctx->width * component_size, 4);
+
     /* Inflate the frame after the 2 byte header */
     ret = uncompress(ctx->inflated_buf, &length,
                      avpkt->data + 2, avpkt->size - 2);
@@ -145,13 +147,15 @@ static int screenpresso_decode_frame(AVCodecContext *avctx, void *data,
         av_log(avctx, AV_LOG_ERROR, "Deflate error %d.\n", ret);
         return AVERROR_UNKNOWN;
     }
+    if (length < src_linesize * avctx->height) {
+        av_log(avctx, AV_LOG_ERROR, "Deflated %lu bytes, but %d are needed\n",
+               length, src_linesize * avctx->height);
+        return AVERROR_INVALIDDATA;
+    }
 
     ret = ff_reget_buffer(avctx, ctx->current, 0);
     if (ret < 0)
         return ret;
-
-    /* Codec has aligned strides */
-    src_linesize = FFALIGN(avctx->width * component_size, 4);
 
     /* When a keyframe is found, copy it (flipped) */
     if (keyframe)
@@ -174,7 +178,7 @@ static int screenpresso_decode_frame(AVCodecContext *avctx, void *data,
     /* Usual properties */
     if (keyframe) {
         frame->pict_type = AV_PICTURE_TYPE_I;
-        frame->key_frame = 1;
+        frame->flags |= AV_FRAME_FLAG_KEY;
     } else {
         frame->pict_type = AV_PICTURE_TYPE_P;
     }
@@ -183,16 +187,15 @@ static int screenpresso_decode_frame(AVCodecContext *avctx, void *data,
     return avpkt->size;
 }
 
-const AVCodec ff_screenpresso_decoder = {
-    .name           = "screenpresso",
-    .long_name      = NULL_IF_CONFIG_SMALL("Screenpresso"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_SCREENPRESSO,
+const FFCodec ff_screenpresso_decoder = {
+    .p.name         = "screenpresso",
+    CODEC_LONG_NAME("Screenpresso"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_SCREENPRESSO,
     .init           = screenpresso_init,
-    .decode         = screenpresso_decode_frame,
+    FF_CODEC_DECODE_CB(screenpresso_decode_frame),
     .close          = screenpresso_close,
     .priv_data_size = sizeof(ScreenpressoContext),
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |
-                      FF_CODEC_CAP_INIT_CLEANUP,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

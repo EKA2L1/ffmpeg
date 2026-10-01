@@ -18,11 +18,12 @@
 
 #include "config.h"
 
+#include <stddef.h>
 #include <stdint.h>
 
-#include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
+#include "libavutil/macros.h"
 #include "libavutil/pixdesc.h"
 
 #include "avcodec.h"
@@ -336,4 +337,3 @@ const AVDVProfile *av_dv_codec_profile2(int width, int height,
 
     return p;
 }
-

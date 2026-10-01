@@ -24,6 +24,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem.h"
 #include "avcodec.h"
+#include "parser_internal.h"
 
 /* parser definition */
 typedef struct DVDSubParseContext {
@@ -43,7 +44,7 @@ static int dvdsub_parse(AVCodecParserContext *s,
     *poutbuf_size = buf_size;
 
     if (pc->packet_index == 0) {
-        if (buf_size < 2 || AV_RB16(buf) && buf_size < 6) {
+        if (buf_size < 2 || (AV_RB16(buf) == 0 && buf_size < 6)) {
             if (buf_size)
                 av_log(avctx, AV_LOG_DEBUG, "Parser input %d too small\n", buf_size);
             return buf_size;
@@ -59,7 +60,7 @@ static int dvdsub_parse(AVCodecParserContext *s,
         pc->packet = av_malloc(pc->packet_len + AV_INPUT_BUFFER_PADDING_SIZE);
     }
     if (pc->packet) {
-        if (pc->packet_index + buf_size <= pc->packet_len) {
+        if (buf_size <= pc->packet_len - pc->packet_index) {
             memcpy(pc->packet + pc->packet_index, buf, buf_size);
             pc->packet_index += buf_size;
             if (pc->packet_index >= pc->packet_len) {
@@ -84,9 +85,9 @@ static av_cold void dvdsub_parse_close(AVCodecParserContext *s)
     av_freep(&pc->packet);
 }
 
-const AVCodecParser ff_dvdsub_parser = {
-    .codec_ids      = { AV_CODEC_ID_DVD_SUBTITLE },
+const FFCodecParser ff_dvdsub_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_DVD_SUBTITLE),
     .priv_data_size = sizeof(DVDSubParseContext),
-    .parser_parse   = dvdsub_parse,
-    .parser_close   = dvdsub_parse_close,
+    .parse          = dvdsub_parse,
+    .close          = dvdsub_parse_close,
 };

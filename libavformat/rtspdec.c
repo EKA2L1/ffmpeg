@@ -19,12 +19,17 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/avstring.h"
+#include "libavutil/avassert.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/random_seed.h"
 #include "libavutil/time.h"
 #include "avformat.h"
+#include "demux.h"
 
 #include "internal.h"
 #include "network.h"
@@ -34,6 +39,7 @@
 #include "rdt.h"
 #include "tls.h"
 #include "url.h"
+#include "version.h"
 
 static const struct RTSPStatusMessage {
     enum RTSPStatusCode code;
@@ -185,7 +191,7 @@ static int rtsp_read_announce(AVFormatContext *s)
         rtsp_send_reply(s, RTSP_STATUS_SERVICE, NULL, request.seq);
         return AVERROR_OPTION_NOT_FOUND;
     }
-    if (request.content_length) {
+    if (request.content_length > 0 && request.content_length <= SDP_MAX_SIZE) {
         sdp = av_malloc(request.content_length + 1);
         if (!sdp)
             return AVERROR(ENOMEM);
@@ -209,10 +215,10 @@ static int rtsp_read_announce(AVFormatContext *s)
         return 0;
     }
     av_log(s, AV_LOG_ERROR,
-           "Content-Length header value exceeds sdp allocated buffer (4KB)\n");
+           "Invalid ANNOUNCE Content-Length %d\n", request.content_length);
     rtsp_send_reply(s, RTSP_STATUS_INTERNAL,
-                    "Content-Length exceeds buffer size", request.seq);
-    return AVERROR(EIO);
+                    "Invalid Content-Length", request.seq);
+    return AVERROR_INVALIDDATA;
 }
 
 static int rtsp_read_options(AVFormatContext *s)
@@ -300,7 +306,7 @@ static int rtsp_read_setup(AVFormatContext *s, char* host, char *controlurl)
         rtsp_st->interleaved_min = request.transports[0].interleaved_min;
         rtsp_st->interleaved_max = request.transports[0].interleaved_max;
         snprintf(responseheaders, sizeof(responseheaders), "Transport: "
-                 "RTP/AVP/TCP;unicast;mode=receive;interleaved=%d-%d"
+                 "RTP/AVP/TCP;unicast;mode=record;interleaved=%d-%d"
                  "\r\n", request.transports[0].interleaved_min,
                  request.transports[0].interleaved_max);
     } else {
@@ -330,7 +336,7 @@ static int rtsp_read_setup(AVFormatContext *s, char* host, char *controlurl)
 
         localport = ff_rtp_get_local_rtp_port(rtsp_st->rtp_handle);
         snprintf(responseheaders, sizeof(responseheaders), "Transport: "
-                 "RTP/AVP/UDP;unicast;mode=receive;source=%s;"
+                 "RTP/AVP/UDP;unicast;mode=record;source=%s;"
                  "client_port=%d-%d;server_port=%d-%d\r\n",
                  host, request.transports[0].client_port_min,
                  request.transports[0].client_port_max, localport,
@@ -548,7 +554,7 @@ static int rtsp_read_play(AVFormatContext *s)
                 if (!rtpctx)
                     continue;
                 ff_rtp_reset_packet_queue(rtpctx);
-                rtpctx->last_rtcp_ntp_time  = AV_NOPTS_VALUE;
+                rtpctx->last_sr.ntp_timestamp = AV_NOPTS_VALUE;
                 rtpctx->first_rtcp_ntp_time = AV_NOPTS_VALUE;
                 rtpctx->base_timestamp      = 0;
                 rtpctx->timestamp           = 0;
@@ -604,6 +610,112 @@ static int rtsp_read_pause(AVFormatContext *s)
     }
     rt->state = RTSP_STATE_PAUSED;
     return 0;
+}
+
+static int rtsp_read_set_state(AVFormatContext *s,
+                               enum FFInputFormatStreamState state)
+{
+    switch (state) {
+        case FF_INFMT_STATE_PLAY:
+            return rtsp_read_play(s);
+        case FF_INFMT_STATE_PAUSE:
+            return rtsp_read_pause(s);
+        default:
+            return AVERROR(ENOTSUP);
+    }
+}
+
+static char *dict_to_headers(AVDictionary *headers)
+{
+    char *buf;
+    AVBPrint bprint;
+    av_bprint_init(&bprint, 0, AV_BPRINT_SIZE_UNLIMITED);
+
+    const AVDictionaryEntry *header = NULL;
+    while ((header = av_dict_iterate(headers, header))) {
+        av_bprintf(&bprint, "%s: %s\r\n", header->key, header->value);
+    }
+
+    av_bprint_finalize(&bprint, &buf);
+    return buf;
+}
+
+static int rtsp_submit_command(struct AVFormatContext *s, enum AVFormatCommandID id, void *data)
+{
+    if (id != AVFORMAT_COMMAND_RTSP_SET_PARAMETER)
+        return AVERROR(ENOTSUP);
+    if (!data)
+        return AVERROR(EINVAL);
+
+    RTSPState *rt = s->priv_data;
+    AVRTSPCommandRequest *req = data;
+
+    if (rt->state == RTSP_STATE_IDLE)
+        // Not ready to send a SET_PARAMETERS command yet
+        return AVERROR(EAGAIN);
+
+    av_log(s, AV_LOG_DEBUG, "Sending SET_PARAMETER command to %s\n", rt->control_uri);
+    char *headers = dict_to_headers(req->headers);
+
+    int ret = ff_rtsp_send_cmd_with_content_async_stored(s, "SET_PARAMETER",
+        rt->control_uri, headers, req->body, req->body_len);
+    av_free(headers);
+
+    if (ret != 0)
+        av_log(s, AV_LOG_ERROR, "Failure sending SET_PARAMETER command: %s\n", av_err2str(ret));
+
+    return ret;
+}
+
+static int rtsp_read_command_reply(AVFormatContext *s, enum AVFormatCommandID id, void **data_out)
+{
+    if (id != AVFORMAT_COMMAND_RTSP_SET_PARAMETER)
+        return AVERROR(ENOTSUP);
+    if (!data_out)
+        return AVERROR(EINVAL);
+
+    unsigned char *body;
+    RTSPMessageHeader *reply;
+    int ret = ff_rtsp_read_reply_async_stored(s, &reply, &body);
+    if (ret < 0)
+        return ret;
+
+    AVRTSPResponse *res = av_malloc(sizeof(*res));
+    if (!res) {
+        av_free(body);
+        av_free(reply);
+        return AVERROR(ENOMEM);
+    }
+
+    res->status_code = reply->status_code;
+    res->body_len = reply->content_length;
+    res->body = body;
+
+    res->reason = av_strdup(reply->reason);
+    if (!res->reason) {
+        av_free(res->body);
+        av_free(res);
+        av_free(reply);
+        return AVERROR(ENOMEM);
+    }
+
+    av_free(reply);
+    *data_out = res;
+    return 0;
+}
+
+static int rtsp_handle_command(struct AVFormatContext *s,
+    enum FFInputFormatCommandOption opt,
+    enum AVFormatCommandID id, void *data)
+{
+    switch (opt) {
+        case FF_INFMT_COMMAND_SUBMIT:
+        return rtsp_submit_command(s, id, data);
+        case FF_INFMT_COMMAND_GET_REPLY:
+        return rtsp_read_command_reply(s, id, data);
+        default:
+        av_unreachable("Invalid command option");
+    }
 }
 
 int ff_rtsp_setup_input_streams(AVFormatContext *s, RTSPMessageHeader *reply)
@@ -801,6 +913,7 @@ redo:
     ret = ffurl_read_complete(rt->rtsp_hd, buf, 3);
     if (ret != 3)
         return AVERROR(EIO);
+    rt->pending_packet = 0;
     id  = buf[0];
     len = AV_RB16(buf + 1);
     av_log(s, AV_LOG_TRACE, "id=%d len=%d\n", id, len);
@@ -989,17 +1102,17 @@ static const AVClass rtsp_demuxer_class = {
     .version        = LIBAVUTIL_VERSION_INT,
 };
 
-const AVInputFormat ff_rtsp_demuxer = {
-    .name           = "rtsp",
-    .long_name      = NULL_IF_CONFIG_SMALL("RTSP input"),
+const FFInputFormat ff_rtsp_demuxer = {
+    .p.name         = "rtsp",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("RTSP input"),
+    .p.flags        = AVFMT_NOFILE,
+    .p.priv_class   = &rtsp_demuxer_class,
     .priv_data_size = sizeof(RTSPState),
     .read_probe     = rtsp_probe,
     .read_header    = rtsp_read_header,
     .read_packet    = rtsp_read_packet,
     .read_close     = rtsp_read_close,
     .read_seek      = rtsp_read_seek,
-    .flags          = AVFMT_NOFILE,
-    .read_play      = rtsp_read_play,
-    .read_pause     = rtsp_read_pause,
-    .priv_class     = &rtsp_demuxer_class,
+    .read_set_state = rtsp_read_set_state,
+    .handle_command = rtsp_handle_command,
 };

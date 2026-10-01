@@ -39,6 +39,7 @@ typedef struct UnixContext {
     int listen;
     int type;
     int fd;
+    int pkt_size;
 } UnixContext;
 
 #define OFFSET(x) offsetof(UnixContext, x)
@@ -46,10 +47,11 @@ typedef struct UnixContext {
 static const AVOption unix_options[] = {
     { "listen",    "Open socket for listening",             OFFSET(listen),  AV_OPT_TYPE_BOOL,  { .i64 = 0 },                    0,       1, ED },
     { "timeout",   "Timeout in ms",                         OFFSET(timeout), AV_OPT_TYPE_INT,   { .i64 = -1 },                  -1, INT_MAX, ED },
-    { "type",      "Socket type",                           OFFSET(type),    AV_OPT_TYPE_INT,   { .i64 = SOCK_STREAM },    INT_MIN, INT_MAX, ED, "type" },
-    { "stream",    "Stream (reliable stream-oriented)",     0,               AV_OPT_TYPE_CONST, { .i64 = SOCK_STREAM },    INT_MIN, INT_MAX, ED, "type" },
-    { "datagram",  "Datagram (unreliable packet-oriented)", 0,               AV_OPT_TYPE_CONST, { .i64 = SOCK_DGRAM },     INT_MIN, INT_MAX, ED, "type" },
-    { "seqpacket", "Seqpacket (reliable packet-oriented",   0,               AV_OPT_TYPE_CONST, { .i64 = SOCK_SEQPACKET }, INT_MIN, INT_MAX, ED, "type" },
+    { "type",      "Socket type",                           OFFSET(type),    AV_OPT_TYPE_INT,   { .i64 = SOCK_STREAM },    INT_MIN, INT_MAX, ED, .unit = "type" },
+    { "stream",    "Stream (reliable stream-oriented)",     0,               AV_OPT_TYPE_CONST, { .i64 = SOCK_STREAM },    INT_MIN, INT_MAX, ED, .unit = "type" },
+    { "datagram",  "Datagram (unreliable packet-oriented)", 0,               AV_OPT_TYPE_CONST, { .i64 = SOCK_DGRAM },     INT_MIN, INT_MAX, ED, .unit = "type" },
+    { "seqpacket", "Seqpacket (reliable packet-oriented)",  0,               AV_OPT_TYPE_CONST, { .i64 = SOCK_SEQPACKET }, INT_MIN, INT_MAX, ED, .unit = "type" },
+    { "pkt_size",  "Maximum packet size",                   OFFSET(pkt_size), AV_OPT_TYPE_INT,  { .i64 = 0 },              0, INT_MAX, ED },
     { NULL }
 };
 
@@ -69,18 +71,26 @@ static int unix_open(URLContext *h, const char *filename, int flags)
     s->addr.sun_family = AF_UNIX;
     av_strlcpy(s->addr.sun_path, filename, sizeof(s->addr.sun_path));
 
-    if ((fd = ff_socket(AF_UNIX, s->type, 0)) < 0)
+    if ((fd = ff_socket(AF_UNIX, s->type, 0, h)) < 0)
         return ff_neterrno();
 
     if (s->timeout < 0 && h->rw_timeout)
         s->timeout = h->rw_timeout / 1000;
 
     if (s->listen) {
-        ret = ff_listen_bind(fd, (struct sockaddr *)&s->addr,
-                             sizeof(s->addr), s->timeout, h);
-        if (ret < 0)
-            goto fail;
-        fd = ret;
+        if (s->type == SOCK_DGRAM) {
+            ret = bind(fd, (struct sockaddr *)&s->addr, sizeof(s->addr));
+            if (ret) {
+                ret = ff_neterrno();
+                goto fail;
+            }
+        } else {
+            ret = ff_listen_bind(fd, (struct sockaddr *)&s->addr,
+                                sizeof(s->addr), s->timeout, h);
+            if (ret < 0)
+                goto fail;
+            fd = ret;
+        }
     } else {
         ret = ff_listen_connect(fd, (struct sockaddr *)&s->addr,
                                 sizeof(s->addr), s->timeout, h, 0);
@@ -89,6 +99,10 @@ static int unix_open(URLContext *h, const char *filename, int flags)
     }
 
     s->fd = fd;
+    h->is_streamed = 1;
+
+    if ((s->type == SOCK_DGRAM || s->type == SOCK_SEQPACKET) && s->pkt_size > 0)
+        h->max_packet_size = s->pkt_size;
 
     return 0;
 

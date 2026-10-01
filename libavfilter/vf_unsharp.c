@@ -37,15 +37,45 @@
  */
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "unsharp.h"
+
+#define MIN_MATRIX_SIZE 3
+#define MAX_MATRIX_SIZE 63
+
+typedef struct UnsharpFilterParam {
+    int msize_x;                             ///< matrix width
+    int msize_y;                             ///< matrix height
+    int amount;                              ///< effect amount
+    int steps_x;                             ///< horizontal step count
+    int steps_y;                             ///< vertical step count
+    int scalebits;                           ///< bits to shift pixel
+    int32_t halfscale;                       ///< amount to add to pixel
+    uint32_t *sr;        ///< finite state machine storage within a row
+    uint32_t **sc;       ///< finite state machine storage across rows
+} UnsharpFilterParam;
+
+typedef struct UnsharpContext {
+    const AVClass *class;
+    int lmsize_x, lmsize_y, cmsize_x, cmsize_y;
+    int amsize_x, amsize_y;
+    float lamount, camount;
+    float aamount;
+    UnsharpFilterParam luma;   ///< luma parameters (width, height, amount)
+    UnsharpFilterParam chroma; ///< chroma parameters (width, height, amount)
+    UnsharpFilterParam alpha;  ///< alpha parameters (width, height, amount)
+    int hsub, vsub;
+    int nb_planes;
+    int bitdepth;
+    int bps;
+    int nb_threads;
+    int (* unsharp_slice)(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
+} UnsharpContext;
 
 typedef struct TheadData {
     UnsharpFilterParam *fp;
@@ -80,8 +110,8 @@ static int name##_##nbits(AVFilterContext *ctx, void *arg, int jobnr, int nb_job
     const int height = td->height;                                                                    \
     const int sc_offset = jobnr * 2 * steps_y;                                                        \
     const int sr_offset = jobnr * (MAX_MATRIX_SIZE - 1);                                              \
-    const int slice_start = (height * jobnr) / nb_jobs;                                               \
-    const int slice_end = (height * (jobnr+1)) / nb_jobs;                                             \
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);                                     \
+    const int slice_end = ff_slice_pos(height, jobnr + 1, nb_jobs);                                   \
                                                                                                       \
     int32_t res;                                                                                      \
     int x, y, z;                                                                                      \
@@ -127,9 +157,9 @@ static int name##_##nbits(AVFilterContext *ctx, void *arg, int jobnr, int nb_job
                 const uint##nbits##_t *srx = src - steps_y * src_stride + x - steps_x;                \
                 uint##nbits##_t *dsx       = dst - steps_y * dst_stride + x - steps_x;                \
                                                                                                       \
-                res = (int32_t)*srx + ((((int32_t) * srx -                                            \
-                      (int32_t)((tmp1 + halfscale) >> scalebits)) * amount) >> (8+nbits));            \
-                *dsx = av_clip_uint##nbits(res);                                                      \
+                res = (int32_t)*srx + (int32_t)(((int64_t)((int32_t)*srx -                            \
+                      (int32_t)((tmp1 + halfscale) >> scalebits)) * amount) >> 16);                   \
+                *dsx = av_clip_uintp2(res, s->bitdepth);                                              \
             }                                                                                         \
         }                                                                                             \
         if (y >= 0) {                                                                                 \
@@ -142,21 +172,22 @@ static int name##_##nbits(AVFilterContext *ctx, void *arg, int jobnr, int nb_job
 DEF_UNSHARP_SLICE_FUNC(unsharp_slice, 16)
 DEF_UNSHARP_SLICE_FUNC(unsharp_slice, 8)
 
-static int apply_unsharp_c(AVFilterContext *ctx, AVFrame *in, AVFrame *out)
+static int apply_unsharp(AVFilterContext *ctx, AVFrame *in, AVFrame *out)
 {
     AVFilterLink *inlink = ctx->inputs[0];
     UnsharpContext *s = ctx->priv;
-    int i, plane_w[3], plane_h[3];
-    UnsharpFilterParam *fp[3];
+    int i, plane_w[4], plane_h[4];
+    UnsharpFilterParam *fp[4];
     ThreadData td;
 
-    plane_w[0] = inlink->w;
+    plane_w[0] = plane_w[3] = inlink->w;
     plane_w[1] = plane_w[2] = AV_CEIL_RSHIFT(inlink->w, s->hsub);
-    plane_h[0] = inlink->h;
+    plane_h[0] = plane_h[3] = inlink->h;
     plane_h[1] = plane_h[2] = AV_CEIL_RSHIFT(inlink->h, s->vsub);
     fp[0] = &s->luma;
     fp[1] = fp[2] = &s->chroma;
-    for (i = 0; i < 3; i++) {
+    fp[3] = &s->alpha;
+    for (i = 0; i < s->nb_planes; i++) {
         td.fp = fp[i];
         td.dst = out->data[i];
         td.src = in->data[i];
@@ -170,7 +201,10 @@ static int apply_unsharp_c(AVFilterContext *ctx, AVFrame *in, AVFrame *out)
     return 0;
 }
 
-static void set_filter_param(UnsharpFilterParam *fp, int msize_x, int msize_y, float amount)
+#define MAX_SCALEBITS 25
+
+static int set_filter_param(AVFilterContext *ctx, const char *name, const char *short_name,
+                            UnsharpFilterParam *fp, int msize_x, int msize_y, float amount)
 {
     fp->msize_x = msize_x;
     fp->msize_y = msize_y;
@@ -180,24 +214,39 @@ static void set_filter_param(UnsharpFilterParam *fp, int msize_x, int msize_y, f
     fp->steps_y = msize_y / 2;
     fp->scalebits = (fp->steps_x + fp->steps_y) * 2;
     fp->halfscale = 1 << (fp->scalebits - 1);
+
+    if (fp->scalebits > MAX_SCALEBITS) {
+        av_log(ctx, AV_LOG_ERROR, "%s matrix size (%sx/2+%sy/2)*2=%d greater than maximum value %d\n",
+               name, short_name, short_name, fp->scalebits, MAX_SCALEBITS);
+        return AVERROR(EINVAL);
+    }
+
+    return 0;
 }
 
 static av_cold int init(AVFilterContext *ctx)
 {
     UnsharpContext *s = ctx->priv;
+    int ret;
 
-    set_filter_param(&s->luma,   s->lmsize_x, s->lmsize_y, s->lamount);
-    set_filter_param(&s->chroma, s->cmsize_x, s->cmsize_y, s->camount);
+#define SET_FILTER_PARAM(name_, short_)                                 \
+    ret = set_filter_param(ctx, #name_, #short_, &s->name_,             \
+                           s->short_##msize_x, s->short_##msize_y, s->short_##amount); \
+    if (ret < 0)                                                        \
+        return ret;                                                     \
 
-    if (s->luma.scalebits >= 26 || s->chroma.scalebits >= 26) {
-        av_log(ctx, AV_LOG_ERROR, "luma or chroma matrix size too big\n");
-        return AVERROR(EINVAL);
-    }
-    s->apply_unsharp = apply_unsharp_c;
+    SET_FILTER_PARAM(luma, l);
+    SET_FILTER_PARAM(chroma, c);
+    SET_FILTER_PARAM(alpha, a);
+
     return 0;
 }
 
 static const enum AVPixelFormat pix_fmts[] = {
+    AV_PIX_FMT_YUVA420P,  AV_PIX_FMT_YUVA422P,   AV_PIX_FMT_YUVA444P,
+    AV_PIX_FMT_YUVA444P9, AV_PIX_FMT_YUVA444P10, AV_PIX_FMT_YUVA444P12, AV_PIX_FMT_YUVA444P16,
+    AV_PIX_FMT_YUVA422P9, AV_PIX_FMT_YUVA422P10, AV_PIX_FMT_YUVA422P12, AV_PIX_FMT_YUVA422P16,
+    AV_PIX_FMT_YUVA420P9, AV_PIX_FMT_YUVA420P10, AV_PIX_FMT_YUVA420P16,
     AV_PIX_FMT_YUV420P,  AV_PIX_FMT_YUV422P,  AV_PIX_FMT_YUV444P,  AV_PIX_FMT_YUV410P,
     AV_PIX_FMT_YUV411P,  AV_PIX_FMT_YUV440P,  AV_PIX_FMT_YUVJ420P, AV_PIX_FMT_YUVJ422P,
     AV_PIX_FMT_YUV420P9, AV_PIX_FMT_YUV422P9, AV_PIX_FMT_YUV444P9,
@@ -242,6 +291,7 @@ static int config_input(AVFilterLink *inlink)
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     int ret;
 
+    s->nb_planes = desc->nb_components;
     s->hsub = desc->log2_chroma_w;
     s->vsub = desc->log2_chroma_h;
     s->bitdepth = desc->comp[0].depth;
@@ -285,7 +335,6 @@ static av_cold void uninit(AVFilterContext *ctx)
 
 static int filter_frame(AVFilterLink *link, AVFrame *in)
 {
-    UnsharpContext *s = link->dst->priv;
     AVFilterLink *outlink   = link->dst->outputs[0];
     AVFrame *out;
     int ret = 0;
@@ -297,7 +346,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *in)
     }
     av_frame_copy_props(out, in);
 
-    ret = s->apply_unsharp(link->dst, in, out);
+    ret = apply_unsharp(link->dst, in, out);
 
     av_frame_free(&in);
 
@@ -325,7 +374,12 @@ static const AVOption unsharp_options[] = {
     { "cy",             "set chroma matrix vertical size",   OFFSET(cmsize_y), AV_OPT_TYPE_INT,   { .i64 = 5 }, MIN_SIZE, MAX_SIZE, FLAGS },
     { "chroma_amount",  "set chroma effect strength",        OFFSET(camount),  AV_OPT_TYPE_FLOAT, { .dbl = 0 },       -2,        5, FLAGS },
     { "ca",             "set chroma effect strength",        OFFSET(camount),  AV_OPT_TYPE_FLOAT, { .dbl = 0 },       -2,        5, FLAGS },
-    { "opencl",         "ignored",                           OFFSET(opencl),   AV_OPT_TYPE_BOOL,  { .i64 = 0 },        0,        1, FLAGS },
+    { "alpha_msize_x",  "set alpha matrix horizontal size",  OFFSET(amsize_x), AV_OPT_TYPE_INT,   { .i64 = 5 }, MIN_SIZE, MAX_SIZE, FLAGS },
+    { "ax",             "set alpha matrix horizontal size",  OFFSET(amsize_x), AV_OPT_TYPE_INT,   { .i64 = 5 }, MIN_SIZE, MAX_SIZE, FLAGS },
+    { "alpha_msize_y",  "set alpha matrix vertical size",    OFFSET(amsize_y), AV_OPT_TYPE_INT,   { .i64 = 5 }, MIN_SIZE, MAX_SIZE, FLAGS },
+    { "ay",             "set alpha matrix vertical size",    OFFSET(amsize_y), AV_OPT_TYPE_INT,   { .i64 = 5 }, MIN_SIZE, MAX_SIZE, FLAGS },
+    { "alpha_amount",   "set alpha effect strength",         OFFSET(aamount),  AV_OPT_TYPE_FLOAT, { .dbl = 0 },       -2,        5, FLAGS },
+    { "aa",             "set alpha effect strength",         OFFSET(aamount),  AV_OPT_TYPE_FLOAT, { .dbl = 0 },       -2,        5, FLAGS },
     { NULL }
 };
 
@@ -340,22 +394,15 @@ static const AVFilterPad avfilter_vf_unsharp_inputs[] = {
     },
 };
 
-static const AVFilterPad avfilter_vf_unsharp_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_unsharp = {
-    .name          = "unsharp",
-    .description   = NULL_IF_CONFIG_SMALL("Sharpen or blur the input video."),
+const FFFilter ff_vf_unsharp = {
+    .p.name        = "unsharp",
+    .p.description = NULL_IF_CONFIG_SMALL("Sharpen or blur the input video."),
+    .p.priv_class  = &unsharp_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(UnsharpContext),
-    .priv_class    = &unsharp_class,
     .init          = init,
     .uninit        = uninit,
     FILTER_INPUTS(avfilter_vf_unsharp_inputs),
-    FILTER_OUTPUTS(avfilter_vf_unsharp_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
 };

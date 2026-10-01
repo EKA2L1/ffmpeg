@@ -27,8 +27,7 @@
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 enum FilterType { WEAK, STRONG, NB_FILTER };
@@ -337,7 +336,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             s->deblockv(dst + x * s->bpc, out->linesize[plane],
                         FFMIN(block, height), s->ath, s->bth, s->gth, s->dth, s->max);
 
-        for (y = block; y < height; y += block) {
+        for (y = block; y < height - block; y += block) {
             dst += out->linesize[plane] * block;
 
             s->deblockh(dst, out->linesize[plane],
@@ -353,6 +352,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                             s->ath, s->bth, s->gth, s->dth, s->max);
             }
         }
+
+        dst += out->linesize[plane] * block;
+        for (x = block; x < width; x += block)
+            s->deblockv(dst + x * s->bpc, out->linesize[plane],
+                        FFMIN(block, height - y), s->ath, s->bth, s->gth, s->dth, s->max);
+
     }
 
     if (in != out)
@@ -376,9 +381,9 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
 static const AVOption deblock_options[] = {
-    { "filter",    "set type of filter",          OFFSET(filter),    AV_OPT_TYPE_INT,   {.i64=STRONG},0, 1,  FLAGS, "filter" },
-    { "weak",      0,                             0,                 AV_OPT_TYPE_CONST, {.i64=WEAK},  0, 0,  FLAGS, "filter" },
-    { "strong",    0,                             0,                 AV_OPT_TYPE_CONST, {.i64=STRONG},0, 0,  FLAGS, "filter" },
+    { "filter",    "set type of filter",          OFFSET(filter),    AV_OPT_TYPE_INT,   {.i64=STRONG},0, 1,  FLAGS, .unit = "filter" },
+    { "weak",      0,                             0,                 AV_OPT_TYPE_CONST, {.i64=WEAK},  0, 0,  FLAGS, .unit = "filter" },
+    { "strong",    0,                             0,                 AV_OPT_TYPE_CONST, {.i64=STRONG},0, 0,  FLAGS, .unit = "filter" },
     { "block",     "set size of block",           OFFSET(block),     AV_OPT_TYPE_INT,   {.i64=8},    4, 512, FLAGS },
     { "alpha",     "set 1st detection threshold", OFFSET(alpha),     AV_OPT_TYPE_FLOAT, {.dbl=.098}, 0,  1,  FLAGS },
     { "beta",      "set 2nd detection threshold", OFFSET(beta),      AV_OPT_TYPE_FLOAT, {.dbl=.05},  0,  1,  FLAGS },
@@ -406,14 +411,14 @@ static const AVFilterPad outputs[] = {
 
 AVFILTER_DEFINE_CLASS(deblock);
 
-const AVFilter ff_vf_deblock = {
-    .name          = "deblock",
-    .description   = NULL_IF_CONFIG_SMALL("Deblock video."),
+const FFFilter ff_vf_deblock = {
+    .p.name        = "deblock",
+    .p.description = NULL_IF_CONFIG_SMALL("Deblock video."),
+    .p.priv_class  = &deblock_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(DeblockContext),
-    .priv_class    = &deblock_class,
     FILTER_INPUTS(inputs),
     FILTER_OUTPUTS(outputs),
     FILTER_PIXFMTS_ARRAY(pixel_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .process_command = process_command,
 };

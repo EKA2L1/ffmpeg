@@ -62,7 +62,7 @@ static inline void set_ue_golomb_long(PutBitContext *pb, uint32_t i)
         put_bits(pb, ff_ue_golomb_len[i], i + 1);
     else {
         int e = av_log2(i + 1);
-        put_bits64(pb, 2 * e + 1, i + 1);
+        put_bits63(pb, 2 * e + 1, i + 1);
     }
 }
 
@@ -103,7 +103,7 @@ static inline void set_ur_golomb(PutBitContext *pb, int i, int k, int limit,
 
     e = i >> k;
     if (e < limit)
-        put_bits(pb, e + k + 1, (1 << k) + av_mod_uintp2(i, k));
+        put_bits(pb, e + k + 1, (1 << k) + av_zero_extend(i, k));
     else
         put_bits(pb, limit + esc_len, i - limit + 1);
 }
@@ -149,20 +149,6 @@ static inline void set_sr_golomb(PutBitContext *pb, int i, int k, int limit,
     v ^= (v >> 31);
 
     set_ur_golomb(pb, v, k, limit, esc_len);
-}
-
-/**
- * write signed golomb rice code (flac).
- */
-static inline void set_sr_golomb_flac(PutBitContext *pb, int i, int k,
-                                      int limit, int esc_len)
-{
-    int v;
-
-    v  = -2 * i - 1;
-    v ^= (v >> 31);
-
-    set_ur_golomb_jpegls(pb, v, k, limit, esc_len);
 }
 
 #endif /* AVCODEC_PUT_GOLOMB_H */

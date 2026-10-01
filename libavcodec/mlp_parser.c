@@ -31,6 +31,7 @@
 #include "parser.h"
 #include "mlp_parse.h"
 #include "mlp.h"
+#include "parser_internal.h"
 
 typedef struct MLPParseContext
 {
@@ -175,21 +176,17 @@ static int mlp_parse(AVCodecParserContext *s,
         avctx->frame_size =
         s->duration = mh.access_unit_size;
 
-        if(!avctx->channels || !avctx->channel_layout) {
+        av_channel_layout_uninit(&avctx->ch_layout);
         if (mh.stream_type == 0xbb) {
             /* MLP stream */
-            avctx->channels       = mh.channels_mlp;
-            avctx->channel_layout = mh.channel_layout_mlp;
+            av_channel_layout_from_mask(&avctx->ch_layout, mh.channel_layout_mlp);
         } else { /* mh.stream_type == 0xba */
             /* TrueHD stream */
             if (!mh.channels_thd_stream2) {
-                avctx->channels       = mh.channels_thd_stream1;
-                avctx->channel_layout = mh.channel_layout_thd_stream1;
+                av_channel_layout_from_mask(&avctx->ch_layout, mh.channel_layout_thd_stream1);
             } else {
-                avctx->channels       = mh.channels_thd_stream2;
-                avctx->channel_layout = mh.channel_layout_thd_stream2;
+                av_channel_layout_from_mask(&avctx->ch_layout, mh.channel_layout_thd_stream2);
             }
-        }
         }
 
         if (!mh.is_vbr) /* Stream is CBR */
@@ -208,10 +205,10 @@ lost_sync:
     return 1;
 }
 
-const AVCodecParser ff_mlp_parser = {
-    .codec_ids      = { AV_CODEC_ID_MLP, AV_CODEC_ID_TRUEHD },
+const FFCodecParser ff_mlp_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_MLP, AV_CODEC_ID_TRUEHD),
     .priv_data_size = sizeof(MLPParseContext),
-    .parser_init    = mlp_init,
-    .parser_parse   = mlp_parse,
-    .parser_close   = ff_parse_close,
+    .init           = mlp_init,
+    .parse          = mlp_parse,
+    .close          = ff_parse_close,
 };

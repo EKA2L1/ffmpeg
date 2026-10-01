@@ -19,10 +19,11 @@
  */
 
 #include <libsmbclient.h>
+#include <string.h>
 #include "libavutil/avstring.h"
+#include "libavutil/error.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "avformat.h"
-#include "internal.h"
 #include "url.h"
 
 typedef struct {

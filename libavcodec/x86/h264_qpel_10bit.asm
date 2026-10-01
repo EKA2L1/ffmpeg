@@ -153,7 +153,7 @@ cglobal %1_h264_qpel%4_%2_10, %5,%6 + 2,%7
 ;cpu, put/avg, mc, 4/8, ...
 %macro cglobal_mc 6
 %assign i %3*2
-%if ARCH_X86_32 || cpuflag(sse2)
+%if cpuflag(sse2)
 MCAxA_OP %1, %2, %3, i, %4,%5,%6
 %endif
 
@@ -211,7 +211,7 @@ cglobal %1_h264_qpel16_mc00_10, 3,4
     lea            r1, [r1+r2*2]
     dec r3d
     jg .loop
-    REP_RET
+    RET
 %endmacro
 
 %define OP_MOV mova
@@ -227,8 +227,6 @@ MC00 avg
 %define OP_MOV mova
 INIT_MMX mmxext
 %1 put, 4
-INIT_XMM sse2, cache64
-%1 put, 8
 INIT_XMM ssse3, cache64
 %1 put, 8
 INIT_XMM sse2
@@ -237,8 +235,6 @@ INIT_XMM sse2
 %define OP_MOV AVG_MOV
 INIT_MMX mmxext
 %1 avg, 4
-INIT_XMM sse2, cache64
-%1 avg, 8
 INIT_XMM ssse3, cache64
 %1 avg, 8
 INIT_XMM sse2

@@ -27,7 +27,15 @@ pw_ff: times 8 dw 0xFF
 
 SECTION .text
 
-%macro FILTER_LINE 1
+INIT_XMM ssse3
+cglobal gradfun_filter_line, 6, 6, 8
+    movd       m5, r4d
+    pxor       m7, m7
+    pshuflw    m5, m5, 0
+    mova       m6, [pw_7f]
+    punpcklqdq m5, m5
+    mova       m4, [r5]
+.loop:
     movh       m0, [r2+r0]
     movh       m1, [r3+r0]
     punpcklbw  m0, m7
@@ -40,45 +48,15 @@ SECTION .text
     pminsw     m2, m7
     pmullw     m2, m2
     psllw      m1, 2
-    paddw      m0, %1
+    paddw      m0, m4
     pmulhw     m1, m2
     paddw      m0, m1
     psraw      m0, 7
     packuswb   m0, m0
     movh  [r1+r0], m0
-%endmacro
-
-INIT_MMX mmxext
-cglobal gradfun_filter_line, 6, 6
-    movh      m5, r4d
-    pxor      m7, m7
-    pshufw    m5, m5,0
-    mova      m6, [pw_7f]
-    mova      m3, [r5]
-    mova      m4, [r5+8]
-.loop:
-    FILTER_LINE m3
-    add       r0, 4
-    jge .end
-    FILTER_LINE m4
-    add       r0, 4
-    jl .loop
-.end:
-    REP_RET
-
-INIT_XMM ssse3
-cglobal gradfun_filter_line, 6, 6, 8
-    movd       m5, r4d
-    pxor       m7, m7
-    pshuflw    m5, m5, 0
-    mova       m6, [pw_7f]
-    punpcklqdq m5, m5
-    mova       m4, [r5]
-.loop:
-    FILTER_LINE m4
     add        r0, 8
     jl .loop
-    REP_RET
+    RET
 
 %macro BLUR_LINE 1
 cglobal gradfun_blur_line_%1, 6, 6, 8
@@ -102,7 +80,7 @@ cglobal gradfun_blur_line_%1, 6, 6, 8
     mova   [r3+r0], m0
     add         r0, 16
     jl .loop
-    REP_RET
+    RET
 %endmacro
 
 INIT_XMM sse2

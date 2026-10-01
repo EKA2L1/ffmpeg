@@ -19,8 +19,14 @@
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
+
+#include "config_components.h"
+
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
+#include "mux.h"
 #include "rawenc.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/internal.h"
@@ -104,6 +110,7 @@ static int apm_read_header(AVFormatContext *s)
     APMExtraData extradata;
     AVCodecParameters *par;
     uint8_t buf[APM_FILE_EXTRADATA_SIZE];
+    int channels;
 
     if (!(st = avformat_new_stream(s, NULL)))
         return AVERROR(ENOMEM);
@@ -116,7 +123,7 @@ static int apm_read_header(AVFormatContext *s)
         return AVERROR_INVALIDDATA;
 
     par = st->codecpar;
-    par->channels              = avio_rl16(s->pb);
+    channels                   = avio_rl16(s->pb);
     par->sample_rate           = avio_rl32(s->pb);
 
     /* Skip the bitrate, it's usually wrong anyway. */
@@ -136,24 +143,19 @@ static int apm_read_header(AVFormatContext *s)
     if (par->bits_per_coded_sample != 4)
         return AVERROR_INVALIDDATA;
 
-    if (par->channels == 2)
-        par->channel_layout    = AV_CH_LAYOUT_STEREO;
-    else if (par->channels == 1)
-        par->channel_layout    = AV_CH_LAYOUT_MONO;
-    else
+    if (channels > 2 || channels == 0)
         return AVERROR_INVALIDDATA;
 
+    av_channel_layout_default(&par->ch_layout, channels);
     par->codec_type            = AVMEDIA_TYPE_AUDIO;
     par->codec_id              = AV_CODEC_ID_ADPCM_IMA_APM;
     par->format                = AV_SAMPLE_FMT_S16;
-    par->bit_rate              = par->channels *
-                                 par->sample_rate *
+    par->bit_rate              = par->ch_layout.nb_channels *
+                                 (int64_t)par->sample_rate *
                                  par->bits_per_coded_sample;
 
-    if ((ret = avio_read(s->pb, buf, APM_FILE_EXTRADATA_SIZE)) < 0)
+    if ((ret = ffio_read_size(s->pb, buf, APM_FILE_EXTRADATA_SIZE)) < 0)
         return ret;
-    else if (ret != APM_FILE_EXTRADATA_SIZE)
-        return AVERROR(EIO);
 
     apm_parse_extradata(&extradata, buf);
 
@@ -175,7 +177,7 @@ static int apm_read_header(AVFormatContext *s)
     st->start_time  = 0;
     st->duration    = extradata.data_size *
                       (8 / par->bits_per_coded_sample) /
-                      par->channels;
+                      par->ch_layout.nb_channels;
     return 0;
 }
 
@@ -195,14 +197,14 @@ static int apm_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     pkt->flags          &= ~AV_PKT_FLAG_CORRUPT;
     pkt->stream_index   = 0;
-    pkt->duration       = ret * (8 / par->bits_per_coded_sample) / par->channels;
+    pkt->duration       = ret * (8 / par->bits_per_coded_sample) / par->ch_layout.nb_channels;
 
     return 0;
 }
 
-const AVInputFormat ff_apm_demuxer = {
-    .name           = "apm",
-    .long_name      = NULL_IF_CONFIG_SMALL("Ubisoft Rayman 2 APM"),
+const FFInputFormat ff_apm_demuxer = {
+    .p.name         = "apm",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Ubisoft Rayman 2 APM"),
     .read_probe     = apm_probe,
     .read_header    = apm_read_header,
     .read_packet    = apm_read_packet
@@ -212,22 +214,9 @@ const AVInputFormat ff_apm_demuxer = {
 #if CONFIG_APM_MUXER
 static int apm_write_init(AVFormatContext *s)
 {
-    AVCodecParameters *par;
+    AVCodecParameters *par = s->streams[0]->codecpar;
 
-    if (s->nb_streams != 1) {
-        av_log(s, AV_LOG_ERROR, "APM files have exactly one stream\n");
-        return AVERROR(EINVAL);
-    }
-
-    par = s->streams[0]->codecpar;
-
-    if (par->codec_id != AV_CODEC_ID_ADPCM_IMA_APM) {
-        av_log(s, AV_LOG_ERROR, "%s codec not supported\n",
-               avcodec_get_name(par->codec_id));
-        return AVERROR(EINVAL);
-    }
-
-    if (par->channels > 2) {
+    if (par->ch_layout.nb_channels > 2) {
         av_log(s, AV_LOG_ERROR, "APM files only support up to 2 channels\n");
         return AVERROR(EINVAL);
     }
@@ -260,10 +249,10 @@ static int apm_write_header(AVFormatContext *s)
      * be used because of the extra 2 bytes.
      */
     avio_wl16(s->pb, APM_TAG_CODEC);
-    avio_wl16(s->pb, par->channels);
+    avio_wl16(s->pb, par->ch_layout.nb_channels);
     avio_wl32(s->pb, par->sample_rate);
-    /* This is the wrong calculation, but it's what the orginal files have. */
-    avio_wl32(s->pb, par->sample_rate * par->channels * 2);
+    /* This is the wrong calculation, but it's what the original files have. */
+    avio_wl32(s->pb, par->sample_rate * par->ch_layout.nb_channels * 2);
     avio_wl16(s->pb, par->block_align);
     avio_wl16(s->pb, par->bits_per_coded_sample);
     avio_wl32(s->pb, APM_FILE_EXTRADATA_SIZE);
@@ -302,12 +291,15 @@ static int apm_write_trailer(AVFormatContext *s)
     return 0;
 }
 
-const AVOutputFormat ff_apm_muxer = {
-    .name           = "apm",
-    .long_name      = NULL_IF_CONFIG_SMALL("Ubisoft Rayman 2 APM"),
-    .extensions     = "apm",
-    .audio_codec    = AV_CODEC_ID_ADPCM_IMA_APM,
-    .video_codec    = AV_CODEC_ID_NONE,
+const FFOutputFormat ff_apm_muxer = {
+    .p.name         = "apm",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Ubisoft Rayman 2 APM"),
+    .p.extensions   = "apm",
+    .p.audio_codec  = AV_CODEC_ID_ADPCM_IMA_APM,
+    .p.video_codec  = AV_CODEC_ID_NONE,
+    .p.subtitle_codec = AV_CODEC_ID_NONE,
+    .flags_internal   = FF_OFMT_FLAG_MAX_ONE_OF_EACH |
+                        FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
     .init           = apm_write_init,
     .write_header   = apm_write_header,
     .write_packet   = ff_raw_write_packet,

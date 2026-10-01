@@ -25,7 +25,10 @@
  */
 
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 
 #define SEQ_FRAME_SIZE         6144
@@ -107,6 +110,7 @@ static int seq_init_frame_buffers(SeqDemuxContext *seq, AVIOContext *pb)
 static int seq_fill_buffer(SeqDemuxContext *seq, AVIOContext *pb, int buffer_num, unsigned int data_offs, int data_size)
 {
     TiertexSeqFrameBuffer *seq_buffer;
+    int ret;
 
     if (buffer_num >= SEQ_NUM_FRAME_BUFFERS)
         return AVERROR_INVALIDDATA;
@@ -116,8 +120,8 @@ static int seq_fill_buffer(SeqDemuxContext *seq, AVIOContext *pb, int buffer_num
         return AVERROR_INVALIDDATA;
 
     avio_seek(pb, seq->current_frame_offs + data_offs, SEEK_SET);
-    if (avio_read(pb, seq_buffer->data + seq_buffer->fill_size, data_size) != data_size)
-        return AVERROR(EIO);
+    if ((ret = ffio_read_size(pb, seq_buffer->data + seq_buffer->fill_size, data_size)) < 0)
+        return ret;
 
     seq_buffer->fill_size += data_size;
     return 0;
@@ -242,12 +246,11 @@ static int seq_read_header(AVFormatContext *s)
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id = AV_CODEC_ID_PCM_S16BE;
     st->codecpar->codec_tag = 0;  /* no tag */
-    st->codecpar->channels = 1;
-    st->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+    st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     st->codecpar->sample_rate = SEQ_SAMPLE_RATE;
     st->codecpar->bits_per_coded_sample = 16;
-    st->codecpar->bit_rate = st->codecpar->sample_rate * st->codecpar->bits_per_coded_sample * st->codecpar->channels;
-    st->codecpar->block_align = st->codecpar->channels * st->codecpar->bits_per_coded_sample / 8;
+    st->codecpar->bit_rate = st->codecpar->sample_rate * st->codecpar->bits_per_coded_sample * st->codecpar->ch_layout.nb_channels;
+    st->codecpar->block_align = st->codecpar->ch_layout.nb_channels * st->codecpar->bits_per_coded_sample / 8;
 
     return 0;
 }
@@ -272,10 +275,11 @@ static int seq_read_packet(AVFormatContext *s, AVPacket *pkt)
 
             pkt->data[0] = 0;
             if (seq->current_pal_data_size) {
+                int ret;
                 pkt->data[0] |= 1;
                 avio_seek(pb, seq->current_frame_offs + seq->current_pal_data_offs, SEEK_SET);
-                if (avio_read(pb, &pkt->data[1], seq->current_pal_data_size) != seq->current_pal_data_size)
-                    return AVERROR(EIO);
+                if ((ret = ffio_read_size(pb, &pkt->data[1], seq->current_pal_data_size)) < 0)
+                    return ret;
             }
             if (seq->current_video_data_size) {
                 pkt->data[0] |= 2;
@@ -294,7 +298,7 @@ static int seq_read_packet(AVFormatContext *s, AVPacket *pkt)
 
     /* audio packet */
     if (seq->current_audio_data_offs == 0) /* end of data reached */
-        return AVERROR(EIO);
+        return AVERROR_EOF;
 
     avio_seek(pb, seq->current_frame_offs + seq->current_audio_data_offs, SEEK_SET);
     rc = av_get_packet(pb, pkt, seq->current_audio_data_size);
@@ -308,11 +312,11 @@ static int seq_read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-const AVInputFormat ff_tiertexseq_demuxer = {
-    .name           = "tiertexseq",
-    .long_name      = NULL_IF_CONFIG_SMALL("Tiertex Limited SEQ"),
+const FFInputFormat ff_tiertexseq_demuxer = {
+    .p.name         = "tiertexseq",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Tiertex Limited SEQ"),
     .priv_data_size = sizeof(SeqDemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = seq_probe,
     .read_header    = seq_read_header,
     .read_packet    = seq_read_packet,

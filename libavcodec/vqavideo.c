@@ -70,14 +70,14 @@
  */
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "libavutil/intreadwrite.h"
-#include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 #define PALETTE_COUNT 256
 #define VQA_HEADER_SIZE 0x2A
@@ -571,8 +571,9 @@ static int vqa_decode_frame_pal8(VqaContext *s, AVFrame *frame)
         }
 
         /* accumulate partial codebook */
-        bytestream2_get_buffer(&s->gb, &s->next_codebook_buffer[s->next_codebook_buffer_index],
-                               chunk_size);
+        if (chunk_size != bytestream2_get_buffer(&s->gb, &s->next_codebook_buffer[s->next_codebook_buffer_index],
+                               chunk_size))
+            return AVERROR_INVALIDDATA;
         s->next_codebook_buffer_index += chunk_size;
 
         s->partial_countdown--;
@@ -600,8 +601,9 @@ static int vqa_decode_frame_pal8(VqaContext *s, AVFrame *frame)
         }
 
         /* accumulate partial codebook */
-        bytestream2_get_buffer(&s->gb, &s->next_codebook_buffer[s->next_codebook_buffer_index],
-                               chunk_size);
+        if (chunk_size != bytestream2_get_buffer(&s->gb, &s->next_codebook_buffer[s->next_codebook_buffer_index],
+                               chunk_size))
+            return AVERROR_INVALIDDATA;
         s->next_codebook_buffer_index += chunk_size;
 
         s->partial_countdown--;
@@ -793,9 +795,8 @@ static int vqa_decode_frame_hicolor(VqaContext *s, AVFrame *frame)
     return 0;
 }
 
-static int vqa_decode_frame(AVCodecContext *avctx,
-                            void *data, int *got_frame,
-                            AVPacket *avpkt)
+static int vqa_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                            int *got_frame, AVPacket *avpkt)
 {
     VqaContext *s = avctx->priv_data;
     int res;
@@ -811,7 +812,6 @@ static int vqa_decode_frame(AVCodecContext *avctx,
 
         /* make the palette available on the way out */
         memcpy(s->frame->data[1], s->palette, PALETTE_COUNT * 4);
-        s->frame->palette_has_changed = 1;
     } else if (avctx->pix_fmt == AV_PIX_FMT_RGB555LE) {
         if ((res = vqa_decode_frame_hicolor(s, s->frame)) < 0)
             return res;
@@ -820,7 +820,7 @@ static int vqa_decode_frame(AVCodecContext *avctx,
         return AVERROR_BUG;
     }
 
-    if ((res = av_frame_ref(data, s->frame)) < 0)
+    if ((res = av_frame_ref(rframe, s->frame)) < 0)
         return res;
 
     *got_frame      = 1;
@@ -841,21 +841,21 @@ static av_cold int vqa_decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-static const AVCodecDefault vqa_defaults[] = {
+static const FFCodecDefault vqa_defaults[] = {
     { "max_pixels", "640*480" },
     { NULL },
 };
 
-const AVCodec ff_vqa_decoder = {
-    .name           = "vqavideo",
-    .long_name      = NULL_IF_CONFIG_SMALL("Westwood Studios VQA (Vector Quantized Animation) video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_WS_VQA,
+const FFCodec ff_vqa_decoder = {
+    .p.name         = "vqavideo",
+    CODEC_LONG_NAME("Westwood Studios VQA (Vector Quantized Animation) video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_WS_VQA,
     .priv_data_size = sizeof(VqaContext),
     .init           = vqa_decode_init,
     .close          = vqa_decode_end,
-    .decode         = vqa_decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
+    FF_CODEC_DECODE_CB(vqa_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
     .defaults       = vqa_defaults,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

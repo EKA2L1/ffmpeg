@@ -19,8 +19,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/imgutils.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 typedef struct CASContext {
@@ -53,8 +52,8 @@ static int cas_slice8(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
     AVFrame *in = s->in;
 
     for (int p = 0; p < s->nb_planes; p++) {
-        const int slice_start = (s->planeheight[p] * jobnr) / nb_jobs;
-        const int slice_end = (s->planeheight[p] * (jobnr+1)) / nb_jobs;
+        const int slice_start = ff_slice_pos(s->planeheight[p], jobnr, nb_jobs);
+        const int slice_end = ff_slice_pos(s->planeheight[p], jobnr + 1, nb_jobs);
         const int linesize = out->linesize[p];
         const int in_linesize = in->linesize[p];
         const int w = s->planewidth[p];
@@ -65,7 +64,7 @@ static int cas_slice8(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
         const uint8_t *src = in->data[p];
 
         if (!((1 << p) & s->planes)) {
-            av_image_copy_plane(dst, linesize, src + slice_start * linesize, in_linesize,
+            av_image_copy_plane(dst, linesize, src + slice_start * in_linesize, in_linesize,
                                 w, slice_end - slice_start);
             continue;
         }
@@ -120,20 +119,20 @@ static int cas_slice16(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs
     AVFrame *in = s->in;
 
     for (int p = 0; p < s->nb_planes; p++) {
-        const int slice_start = (s->planeheight[p] * jobnr) / nb_jobs;
-        const int slice_end = (s->planeheight[p] * (jobnr+1)) / nb_jobs;
+        const int slice_start = ff_slice_pos(s->planeheight[p], jobnr, nb_jobs);
+        const int slice_end = ff_slice_pos(s->planeheight[p], jobnr + 1, nb_jobs);
         const int linesize = out->linesize[p] / 2;
         const int in_linesize = in->linesize[p] / 2;
         const int w = s->planewidth[p];
         const int w1 = w - 1;
         const int h = s->planeheight[p];
         const int h1 = h - 1;
-        uint16_t *dst = (uint16_t *)out->data[p] + slice_start * linesize;
+        uint16_t *dst = ((uint16_t *)out->data[p]) + slice_start * linesize;
         const uint16_t *src = (const uint16_t *)in->data[p];
 
         if (!((1 << p) & s->planes)) {
-            av_image_copy_plane((uint8_t *)dst, linesize, (uint8_t *)(src + slice_start * linesize),
-                                in_linesize, w * 2, slice_end - slice_start);
+            av_image_copy_plane((uint8_t *)dst, linesize * 2, (uint8_t *)(src + slice_start * in_linesize),
+                                in_linesize * 2, w * 2, slice_end - slice_start);
             continue;
         }
 
@@ -255,13 +254,6 @@ static const AVFilterPad cas_inputs[] = {
     },
 };
 
-static const AVFilterPad cas_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
 #define OFFSET(x) offsetof(CASContext, x)
 #define VF AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
@@ -273,14 +265,14 @@ static const AVOption cas_options[] = {
 
 AVFILTER_DEFINE_CLASS(cas);
 
-const AVFilter ff_vf_cas = {
-    .name          = "cas",
-    .description   = NULL_IF_CONFIG_SMALL("Contrast Adaptive Sharpen."),
+const FFFilter ff_vf_cas = {
+    .p.name        = "cas",
+    .p.description = NULL_IF_CONFIG_SMALL("Contrast Adaptive Sharpen."),
+    .p.priv_class  = &cas_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(CASContext),
-    .priv_class    = &cas_class,
     FILTER_INPUTS(cas_inputs),
-    FILTER_OUTPUTS(cas_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pixel_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = ff_filter_process_command,
 };

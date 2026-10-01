@@ -26,8 +26,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/qsort.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "removegrain.h"
 #include "video.h"
 
@@ -501,8 +500,9 @@ static int config_input(AVFilterLink *inlink)
         }
     }
 
-    if (ARCH_X86)
-        ff_removegrain_init_x86(s);
+#if ARCH_X86 && HAVE_X86ASM && CONFIG_GPL
+    ff_removegrain_init_x86(s);
+#endif
 
     return 0;
 }
@@ -523,8 +523,8 @@ static int filter_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
     const int om = in->linesize[i] - 1;
     const int o0 = in->linesize[i]    ;
     const int op = in->linesize[i] + 1;
-    int start = (height *  jobnr   ) / nb_jobs;
-    int end   = (height * (jobnr+1)) / nb_jobs;
+    int start = ff_slice_pos(height, jobnr, nb_jobs);
+    int end   = ff_slice_pos(height, jobnr + 1, nb_jobs);
     int x, y;
 
     start = FFMAX(1, start);
@@ -631,20 +631,13 @@ static const AVFilterPad removegrain_inputs[] = {
     },
 };
 
-static const AVFilterPad removegrain_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_removegrain = {
-    .name          = "removegrain",
-    .description   = NULL_IF_CONFIG_SMALL("Remove grain."),
+const FFFilter ff_vf_removegrain = {
+    .p.name        = "removegrain",
+    .p.description = NULL_IF_CONFIG_SMALL("Remove grain."),
+    .p.priv_class  = &removegrain_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(RemoveGrainContext),
     FILTER_INPUTS(removegrain_inputs),
-    FILTER_OUTPUTS(removegrain_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .priv_class    = &removegrain_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
 };

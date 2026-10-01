@@ -32,19 +32,20 @@
 #include "config.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/avassert.h"
+#include "libavutil/common.h"
 
 #if ARCH_X86_64
 // TODO: Benchmark and optionally enable on other 64-bit architectures.
 typedef uint64_t BitBuf;
 #define AV_WBBUF AV_WB64
 #define AV_WLBUF AV_WL64
+#define BUF_BITS 64
 #else
 typedef uint32_t BitBuf;
 #define AV_WBBUF AV_WB32
 #define AV_WLBUF AV_WL32
+#define BUF_BITS 32
 #endif
-
-static const int BUF_BITS = 8 * sizeof(BitBuf);
 
 typedef struct PutBitContext {
     BitBuf bit_buf;
@@ -71,6 +72,16 @@ static inline void init_put_bits(PutBitContext *s, uint8_t *buffer,
     s->buf_ptr      = s->buf;
     s->bit_left     = BUF_BITS;
     s->bit_buf      = 0;
+}
+
+/**
+ * Inform the compiler that a PutBitContext is flushed (i.e. if it has just
+ * been initialized or flushed). Undefined behaviour occurs if this is used
+ * with a PutBitContext for which this is not true.
+ */
+static inline void put_bits_assume_flushed(const PutBitContext *s)
+{
+    av_assume(s->bit_left == BUF_BITS);
 }
 
 /**
@@ -245,7 +256,7 @@ static inline void put_bits_no_assert(PutBitContext *s, int n, BitBuf value)
  */
 static inline void put_bits(PutBitContext *s, int n, BitBuf value)
 {
-    av_assert2(n <= 31 && value < (1UL << n));
+    av_assert2(n <= 31 && value < (BitBuf)(1U << n));
     put_bits_no_assert(s, n, value);
 }
 
@@ -254,7 +265,7 @@ static inline void put_bits_le(PutBitContext *s, int n, BitBuf value)
     BitBuf bit_buf;
     int bit_left;
 
-    av_assert2(n <= 31 && value < (1UL << n));
+    av_assert2(n <= 31 && value < (BitBuf)(1U << n));
 
     bit_buf  = s->bit_buf;
     bit_left = s->bit_left;
@@ -281,13 +292,13 @@ static inline void put_sbits(PutBitContext *pb, int n, int32_t value)
 {
     av_assert2(n >= 0 && n <= 31);
 
-    put_bits(pb, n, av_mod_uintp2(value, n));
+    put_bits(pb, n, av_zero_extend(value, n));
 }
 
 /**
  * Write exactly 32 bits into a bitstream.
  */
-static void av_unused put_bits32(PutBitContext *s, uint32_t value)
+av_unused static void put_bits32(PutBitContext *s, uint32_t value)
 {
     BitBuf bit_buf;
     int bit_left;
@@ -328,12 +339,15 @@ static void av_unused put_bits32(PutBitContext *s, uint32_t value)
 }
 
 /**
- * Write up to 64 bits into a bitstream.
+ * Write up to 63 bits into a bitstream.
  */
-static inline void put_bits64(PutBitContext *s, int n, uint64_t value)
+static inline void put_bits63(PutBitContext *s, int n, uint64_t value)
 {
-    av_assert2((n == 64) || (n < 64 && value < (UINT64_C(1) << n)));
+    av_assert2(n < 64U && value < (UINT64_C(1) << n));
 
+#if BUF_BITS >= 64
+    put_bits_no_assert(s, n, value);
+#else
     if (n < 32)
         put_bits(s, n, value);
     else if (n == 32)
@@ -348,6 +362,19 @@ static inline void put_bits64(PutBitContext *s, int n, uint64_t value)
         put_bits(s, n - 32, hi);
         put_bits32(s, lo);
 #endif
+    }
+#endif
+}
+
+/**
+ * Write up to 64 bits into a bitstream.
+ */
+static inline void put_bits64(PutBitContext *s, int n, uint64_t value)
+{
+    av_assert2((n == 64) || (n < 64 && value < (UINT64_C(1) << n)));
+
+    if (n < 64) {
+        put_bits63(s, n, value);
     } else {
         uint32_t lo = value & 0xffffffff;
         uint32_t hi = value >> 32;
@@ -358,8 +385,14 @@ static inline void put_bits64(PutBitContext *s, int n, uint64_t value)
         put_bits32(s, hi);
         put_bits32(s, lo);
 #endif
-
     }
+}
+
+static inline void put_sbits63(PutBitContext *pb, int n, int64_t value)
+{
+    av_assert2(n >= 0 && n < 64);
+
+    put_bits63(pb, n, (uint64_t)(value) & (~(UINT64_MAX << n)));
 }
 
 /**

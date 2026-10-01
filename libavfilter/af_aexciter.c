@@ -18,9 +18,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "audio.h"
 
 typedef struct ChannelParams {
@@ -195,7 +196,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     dst = (double *)out->data[0];
     for (int n = 0; n < in->nb_samples; n++) {
-        for (int c = 0; c < inlink->channels; c++) {
+        for (int c = 0; c < inlink->ch_layout.nb_channels; c++) {
             double sample = src[c] * level_in;
 
             sample = distortion_process(s, &s->cp[c], sample);
@@ -208,8 +209,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                 dst[c] = sample;
         }
 
-        src += inlink->channels;
-        dst += inlink->channels;
+        src += inlink->ch_layout.nb_channels;
+        dst += inlink->ch_layout.nb_channels;
     }
 
     if (in != out)
@@ -231,11 +232,11 @@ static int config_input(AVFilterLink *inlink)
     AExciterContext *s = ctx->priv;
 
     if (!s->cp)
-        s->cp = av_calloc(inlink->channels, sizeof(*s->cp));
+        s->cp = av_calloc(inlink->ch_layout.nb_channels, sizeof(*s->cp));
     if (!s->cp)
         return AVERROR(ENOMEM);
 
-    for (int i = 0; i < inlink->channels; i++)
+    for (int i = 0; i < inlink->ch_layout.nb_channels; i++)
         set_params(&s->cp[i], s->blend, s->drive, inlink->sample_rate,
                    s->freq, s->ceil);
 
@@ -264,22 +265,15 @@ static const AVFilterPad avfilter_af_aexciter_inputs[] = {
     },
 };
 
-static const AVFilterPad avfilter_af_aexciter_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
-const AVFilter ff_af_aexciter = {
-    .name          = "aexciter",
-    .description   = NULL_IF_CONFIG_SMALL("Enhance high frequency part of audio."),
+const FFFilter ff_af_aexciter = {
+    .p.name        = "aexciter",
+    .p.description = NULL_IF_CONFIG_SMALL("Enhance high frequency part of audio."),
+    .p.priv_class  = &aexciter_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .priv_size     = sizeof(AExciterContext),
-    .priv_class    = &aexciter_class,
     .uninit        = uninit,
     FILTER_INPUTS(avfilter_af_aexciter_inputs),
-    FILTER_OUTPUTS(avfilter_af_aexciter_outputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
     FILTER_SINGLE_SAMPLEFMT(AV_SAMPLE_FMT_DBL),
     .process_command = process_command,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
 };

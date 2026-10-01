@@ -29,7 +29,10 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "avio_internal.h"
 
@@ -76,6 +79,12 @@ static int vmd_probe(const AVProbeData *p)
     if ((!w || w > 2048 || !h || h > 2048) &&
         sample_rate != 22050)
         return 0;
+    /* the header of a file with a video stream carries the 6bit VGA
+     * palette that vmdvideo_decode_init() loads from offset 28 */
+    if (w && h)
+        for (int i = 28; i < 28 + 3 * 256; i++)
+            if (p->buf[i] > 0x3F)
+                return 0;
 
     /* only return half certainty since this check is a bit sketchy */
     return AVPROBE_SCORE_EXTENSION;
@@ -100,8 +109,8 @@ static int vmd_read_header(AVFormatContext *s)
 
     /* fetch the main header, including the 2 header length bytes */
     avio_seek(pb, 0, SEEK_SET);
-    if (avio_read(pb, vmd->vmd_header, VMD_HEADER_SIZE) != VMD_HEADER_SIZE)
-        return AVERROR(EIO);
+    if ((ret = ffio_read_size(pb, vmd->vmd_header, VMD_HEADER_SIZE)) < 0)
+        return ret;
 
     width = AV_RL16(&vmd->vmd_header[12]);
     height = AV_RL16(&vmd->vmd_header[14]);
@@ -134,6 +143,7 @@ static int vmd_read_header(AVFormatContext *s)
     /* if sample rate is 0, assume no audio */
     vmd->sample_rate = AV_RL16(&vmd->vmd_header[804]);
     if (vmd->sample_rate) {
+        int channels;
         st = avformat_new_stream(s, NULL);
         if (!st)
             return AVERROR(ENOMEM);
@@ -150,24 +160,22 @@ static int vmd_read_header(AVFormatContext *s)
             st->codecpar->bits_per_coded_sample = 8;
         }
         if (vmd->vmd_header[811] & 0x80) {
-            st->codecpar->channels       = 2;
-            st->codecpar->channel_layout = AV_CH_LAYOUT_STEREO;
+            channels = 2;
         } else if (vmd->vmd_header[811] & 0x2) {
             /* Shivers 2 stereo audio */
             /* Frame length is for 1 channel */
-            st->codecpar->channels       = 2;
-            st->codecpar->channel_layout = AV_CH_LAYOUT_STEREO;
+            channels        = 2;
             st->codecpar->block_align = st->codecpar->block_align << 1;
         } else {
-            st->codecpar->channels       = 1;
-            st->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+            channels = 1;
         }
+        av_channel_layout_default(&st->codecpar->ch_layout, channels);
         st->codecpar->bit_rate = st->codecpar->sample_rate *
-            st->codecpar->bits_per_coded_sample * st->codecpar->channels;
+            st->codecpar->bits_per_coded_sample * channels;
 
         /* calculate pts */
         num = st->codecpar->block_align;
-        den = st->codecpar->sample_rate * st->codecpar->channels;
+        den = st->codecpar->sample_rate * channels;
         av_reduce(&num, &den, num, den, (1UL<<31)-1);
         if (vst)
             avpriv_set_pts_info(vst, 33, num, den);
@@ -191,11 +199,8 @@ static int vmd_read_header(AVFormatContext *s)
         ret = AVERROR(ENOMEM);
         goto error;
     }
-    if (avio_read(pb, raw_frame_table, raw_frame_table_size) !=
-        raw_frame_table_size) {
-        ret = AVERROR(EIO);
+    if ((ret = ffio_read_size(pb, raw_frame_table, raw_frame_table_size)) < 0)
         goto error;
-    }
 
     total_frames = 0;
     for (i = 0; i < vmd->frame_count; i++) {
@@ -278,21 +283,18 @@ static int vmd_read_packet(AVFormatContext *s,
     avio_seek(pb, frame->frame_offset, SEEK_SET);
 
     if(ffio_limit(pb, frame->frame_size) != frame->frame_size)
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     ret = av_new_packet(pkt, frame->frame_size + BYTES_PER_FRAME_RECORD);
     if (ret < 0)
         return ret;
     pkt->pos= avio_tell(pb);
     memcpy(pkt->data, frame->frame_record, BYTES_PER_FRAME_RECORD);
     if(vmd->is_indeo3 && frame->frame_record[0] == 0x02)
-        ret = avio_read(pb, pkt->data, frame->frame_size);
+        ret = ffio_read_size(pb, pkt->data, frame->frame_size);
     else
-        ret = avio_read(pb, pkt->data + BYTES_PER_FRAME_RECORD,
+        ret = ffio_read_size(pb, pkt->data + BYTES_PER_FRAME_RECORD,
             frame->frame_size);
 
-    if (ret != frame->frame_size) {
-        ret = AVERROR(EIO);
-    }
     pkt->stream_index = frame->stream_index;
     pkt->pts = frame->pts;
     av_log(s, AV_LOG_DEBUG, " dispatching %s frame with %d bytes and pts %"PRId64"\n",
@@ -314,11 +316,11 @@ static int vmd_read_close(AVFormatContext *s)
     return 0;
 }
 
-const AVInputFormat ff_vmd_demuxer = {
-    .name           = "vmd",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sierra VMD"),
+const FFInputFormat ff_vmd_demuxer = {
+    .p.name         = "vmd",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Sierra VMD"),
     .priv_data_size = sizeof(VmdDemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = vmd_probe,
     .read_header    = vmd_read_header,
     .read_packet    = vmd_read_packet,

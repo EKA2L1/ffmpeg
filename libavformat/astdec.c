@@ -22,6 +22,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "ast.h"
 
@@ -57,14 +58,14 @@ static int ast_read_header(AVFormatContext *s)
         return AVERROR_INVALIDDATA;
     }
 
-    st->codecpar->channels = avio_rb16(s->pb);
-    if (!st->codecpar->channels)
+    st->codecpar->ch_layout.nb_channels = avio_rb16(s->pb);
+    if (!st->codecpar->ch_layout.nb_channels)
         return AVERROR_INVALIDDATA;
 
-    if (st->codecpar->channels == 2)
-        st->codecpar->channel_layout = AV_CH_LAYOUT_STEREO;
-    else if (st->codecpar->channels == 4)
-        st->codecpar->channel_layout = AV_CH_LAYOUT_4POINT0;
+    if (st->codecpar->ch_layout.nb_channels == 2)
+        st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+    else if (st->codecpar->ch_layout.nb_channels == 4)
+        st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_4POINT0;
 
     avio_skip(s->pb, 2);
     st->codecpar->sample_rate = avio_rb32(s->pb);
@@ -90,10 +91,11 @@ static int ast_read_packet(AVFormatContext *s, AVPacket *pkt)
     pos  = avio_tell(s->pb);
     type = avio_rl32(s->pb);
     size = avio_rb32(s->pb);
-    if (!s->streams[0]->codecpar->channels || size > INT_MAX / s->streams[0]->codecpar->channels)
+    if (!s->streams[0]->codecpar->ch_layout.nb_channels ||
+        size > INT_MAX / s->streams[0]->codecpar->ch_layout.nb_channels)
         return AVERROR_INVALIDDATA;
 
-    size *= s->streams[0]->codecpar->channels;
+    size *= s->streams[0]->codecpar->ch_layout.nb_channels;
     if ((ret = avio_skip(s->pb, 24)) < 0) // padding
         return ret;
 
@@ -110,13 +112,13 @@ static int ast_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-const AVInputFormat ff_ast_demuxer = {
-    .name           = "ast",
-    .long_name      = NULL_IF_CONFIG_SMALL("AST (Audio Stream)"),
+const FFInputFormat ff_ast_demuxer = {
+    .p.name         = "ast",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("AST (Audio Stream)"),
+    .p.extensions   = "ast",
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.codec_tag    = ff_ast_codec_tags_list,
     .read_probe     = ast_probe,
     .read_header    = ast_read_header,
     .read_packet    = ast_read_packet,
-    .extensions     = "ast",
-    .flags          = AVFMT_GENERIC_INDEX,
-    .codec_tag      = ff_ast_codec_tags_list,
 };

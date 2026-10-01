@@ -21,6 +21,7 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 static int sdr2_probe(const AVProbeData *p)
@@ -54,7 +55,7 @@ static int sdr2_read_header(AVFormatContext *s)
     ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL;
 
     ast->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
-    ast->codecpar->channels    = 1;
+    ast->codecpar->ch_layout.nb_channels = 1;
     ast->codecpar->sample_rate = 8000;
     ast->codecpar->codec_id    = AV_CODEC_ID_PCM_S16LE;
     avpriv_set_pts_info(ast, 64, 1, 8000);
@@ -109,12 +110,12 @@ static int sdr2_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-const AVInputFormat ff_sdr2_demuxer = {
-    .name        = "sdr2",
-    .long_name   = NULL_IF_CONFIG_SMALL("SDR2"),
+const FFInputFormat ff_sdr2_demuxer = {
+    .p.name      = "sdr2",
+    .p.long_name = NULL_IF_CONFIG_SMALL("SDR2"),
+    .p.extensions= "sdr2",
+    .p.flags     = AVFMT_GENERIC_INDEX,
     .read_probe  = sdr2_probe,
     .read_header = sdr2_read_header,
     .read_packet = sdr2_read_packet,
-    .extensions  = "sdr2",
-    .flags       = AVFMT_GENERIC_INDEX,
 };

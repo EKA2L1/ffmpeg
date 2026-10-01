@@ -27,13 +27,12 @@
 #include <string.h>
 
 #include "libavutil/internal.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "libavutil/timestamp.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 #define LAG 25
@@ -454,7 +453,7 @@ static int extract_lines(AVFilterContext *ctx, void *arg,
     for (int i = start; i < end; i++) {
         ScanItem *scan = &s->scan[i];
 
-        extract_line(ctx, in, scan, inlink->w, i);
+        extract_line(ctx, in, scan, inlink->w, s->start + i);
     }
 
     return 0;
@@ -539,24 +538,17 @@ static const AVFilterPad readeia608_inputs[] = {
     },
 };
 
-static const AVFilterPad readeia608_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_readeia608 = {
-    .name          = "readeia608",
-    .description   = NULL_IF_CONFIG_SMALL("Read EIA-608 Closed Caption codes from input video and write them to frame metadata."),
-    .priv_size     = sizeof(ReadEIA608Context),
-    .priv_class    = &readeia608_class,
-    FILTER_INPUTS(readeia608_inputs),
-    FILTER_OUTPUTS(readeia608_outputs),
-    FILTER_PIXFMTS_ARRAY(pixel_fmts),
-    .uninit        = uninit,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC |
+const FFFilter ff_vf_readeia608 = {
+    .p.name        = "readeia608",
+    .p.description = NULL_IF_CONFIG_SMALL("Read EIA-608 Closed Caption codes from input video and write them to frame metadata."),
+    .p.priv_class  = &readeia608_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC |
                      AVFILTER_FLAG_SLICE_THREADS            |
                      AVFILTER_FLAG_METADATA_ONLY,
+    .priv_size     = sizeof(ReadEIA608Context),
+    FILTER_INPUTS(readeia608_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_PIXFMTS_ARRAY(pixel_fmts),
+    .uninit        = uninit,
     .process_command = process_command,
 };

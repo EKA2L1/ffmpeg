@@ -21,10 +21,11 @@
  */
 
 /**
- * @file
- * audio decoding with libavcodec API example
- *
+ * @file libavcodec audio decoding API usage example
  * @example decode_audio.c
+ *
+ * Decode data from an MP2 input file and generate a raw audio file to
+ * be played with ffplay.
  */
 
 #include <stdio.h>
@@ -97,7 +98,7 @@ static void decode(AVCodecContext *dec_ctx, AVPacket *pkt, AVFrame *frame,
             exit(1);
         }
         for (i = 0; i < frame->nb_samples; i++)
-            for (ch = 0; ch < dec_ctx->channels; ch++)
+            for (ch = 0; ch < dec_ctx->ch_layout.nb_channels; ch++)
                 fwrite(frame->data[ch] + data_size*i, 1, data_size, outfile);
     }
 }
@@ -127,6 +128,10 @@ int main(int argc, char **argv)
     outfilename = argv[2];
 
     pkt = av_packet_alloc();
+    if (!pkt) {
+        fprintf(stderr, "Could not allocate AVPacket\n");
+        exit(1); /* or proper cleanup and returning */
+    }
 
     /* find the MPEG audio decoder */
     codec = avcodec_find_decoder(AV_CODEC_ID_MP2);
@@ -160,7 +165,7 @@ int main(int argc, char **argv)
     }
     outfile = fopen(outfilename, "wb");
     if (!outfile) {
-        av_free(c);
+        fprintf(stderr, "Could not open %s\n", outfilename);
         exit(1);
     }
 
@@ -215,7 +220,7 @@ int main(int argc, char **argv)
         sfmt = av_get_packed_sample_fmt(sfmt);
     }
 
-    n_channels = c->channels;
+    n_channels = c->ch_layout.nb_channels;
     if ((ret = get_format_from_sample_fmt(&fmt, sfmt)) < 0)
         goto end;
 

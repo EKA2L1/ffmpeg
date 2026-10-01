@@ -19,13 +19,22 @@
  */
 
 #include "libavutil/avassert.h"
+#include "libavutil/file_open.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "formats.h"
 #include "video.h"
+
+enum HintModes {
+    ABSOLUTE_HINT,
+    RELATIVE_HINT,
+    PATTERN_HINT,
+    NB_HINTS,
+};
 
 typedef struct FieldHintContext {
     const AVClass *class;
@@ -48,9 +57,10 @@ typedef struct FieldHintContext {
 
 static const AVOption fieldhint_options[] = {
     { "hint", "set hint file", OFFSET(hint_file_str), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
-    { "mode", "set hint mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, "mode" },
-    {   "absolute", 0, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "mode" },
-    {   "relative", 0, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "mode" },
+    { "mode", "set hint mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_HINTS-1, FLAGS, .unit = "mode" },
+    {   "absolute", 0, 0, AV_OPT_TYPE_CONST, {.i64=ABSOLUTE_HINT}, 0, 0, FLAGS, .unit = "mode" },
+    {   "relative", 0, 0, AV_OPT_TYPE_CONST, {.i64=RELATIVE_HINT}, 0, 0, FLAGS, .unit = "mode" },
+    {   "pattern",  0, 0, AV_OPT_TYPE_CONST, {.i64=PATTERN_HINT},  0, 0, FLAGS, .unit = "mode" },
     { NULL }
 };
 
@@ -65,7 +75,7 @@ static av_cold int init(AVFilterContext *ctx)
         av_log(ctx, AV_LOG_ERROR, "Hint file must be set.\n");
         return AVERROR(EINVAL);
     }
-    s->hint = av_fopen_utf8(s->hint_file_str, "r");
+    s->hint = avpriv_fopen_utf8(s->hint_file_str, "r");
     if (!s->hint) {
         ret = AVERROR(errno);
         av_log(ctx, AV_LOG_ERROR, "%s: %s\n", s->hint_file_str, av_err2str(ret));
@@ -75,13 +85,16 @@ static av_cold int init(AVFilterContext *ctx)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     int reject_flags = AV_PIX_FMT_FLAG_BITSTREAM |
                        AV_PIX_FMT_FLAG_HWACCEL   |
                        AV_PIX_FMT_FLAG_PAL;
 
-    return ff_set_common_formats(ctx, ff_formats_pixdesc_filter(0, reject_flags));
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out,
+                                  ff_formats_pixdesc_filter(0, reject_flags));
 }
 
 static int config_input(AVFilterLink *inlink)
@@ -103,8 +116,10 @@ static int config_input(AVFilterLink *inlink)
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
+    FilterLink *inl = ff_filter_link(inlink);
     AVFilterContext *ctx = inlink->dst;
     AVFilterLink *outlink = ctx->outputs[0];
+    FilterLink *outl = ff_filter_link(outlink);
     FieldHintContext *s = ctx->priv;
     AVFrame *out, *top, *bottom;
     char buf[1024] = { 0 };
@@ -141,23 +156,31 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                 return AVERROR_INVALIDDATA;
             }
             switch (s->mode) {
-            case 0:
-                if (tf > outlink->frame_count_in + 1 || tf < FFMAX(0, outlink->frame_count_in - 1) ||
-                    bf > outlink->frame_count_in + 1 || bf < FFMAX(0, outlink->frame_count_in - 1)) {
-                    av_log(ctx, AV_LOG_ERROR, "Out of range frames %"PRId64" and/or %"PRId64" on line %"PRId64" for %"PRId64". input frame.\n", tf, bf, s->line, inlink->frame_count_out);
+            case ABSOLUTE_HINT:
+                if (tf > outl->frame_count_in + 1 || tf < FFMAX(0, outl->frame_count_in - 1) ||
+                    bf > outl->frame_count_in + 1 || bf < FFMAX(0, outl->frame_count_in - 1)) {
+                    av_log(ctx, AV_LOG_ERROR, "Out of range frames %"PRId64" and/or %"PRId64" on line %"PRId64" for %"PRId64". input frame.\n", tf, bf, s->line, inl->frame_count_out);
                     return AVERROR_INVALIDDATA;
                 }
                 break;
-            case 1:
+            case PATTERN_HINT:
+            case RELATIVE_HINT:
                 if (tf > 1 || tf < -1 ||
                     bf > 1 || bf < -1) {
-                    av_log(ctx, AV_LOG_ERROR, "Out of range %"PRId64" and/or %"PRId64" on line %"PRId64" for %"PRId64". input frame.\n", tf, bf, s->line, inlink->frame_count_out);
+                    av_log(ctx, AV_LOG_ERROR, "Out of range %"PRId64" and/or %"PRId64" on line %"PRId64" for %"PRId64". input frame.\n", tf, bf, s->line, inl->frame_count_out);
                     return AVERROR_INVALIDDATA;
                 }
+                break;
+            default:
+                return AVERROR_BUG;
             };
             break;
         } else {
-            av_log(ctx, AV_LOG_ERROR, "Missing entry for %"PRId64". input frame.\n", inlink->frame_count_out);
+            if (s->mode == PATTERN_HINT) {
+                fseek(s->hint, 0, SEEK_SET);
+                continue;
+            }
+            av_log(ctx, AV_LOG_ERROR, "Missing entry for %"PRId64". input frame.\n", inl->frame_count_out);
             return AVERROR_INVALIDDATA;
         }
     }
@@ -168,11 +191,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     av_frame_copy_props(out, s->frame[1]);
 
     switch (s->mode) {
-    case 0:
-        top    = s->frame[tf - outlink->frame_count_in + 1];
-        bottom = s->frame[bf - outlink->frame_count_in + 1];
+    case ABSOLUTE_HINT:
+        top    = s->frame[tf - outl->frame_count_in + 1];
+        bottom = s->frame[bf - outl->frame_count_in + 1];
         break;
-    case 1:
+    case PATTERN_HINT:
+    case RELATIVE_HINT:
         top    = s->frame[1 + tf];
         bottom = s->frame[1 + bf];
         break;
@@ -199,10 +223,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     switch (hint) {
     case '+':
-        out->interlaced_frame = 1;
+        out->flags |= AV_FRAME_FLAG_INTERLACED;
         break;
     case '-':
-        out->interlaced_frame = 0;
+        out->flags &= ~AV_FRAME_FLAG_INTERLACED;
         break;
     case '=':
         break;
@@ -289,14 +313,14 @@ static const AVFilterPad outputs[] = {
     },
 };
 
-const AVFilter ff_vf_fieldhint = {
-    .name          = "fieldhint",
-    .description   = NULL_IF_CONFIG_SMALL("Field matching using hints."),
+const FFFilter ff_vf_fieldhint = {
+    .p.name        = "fieldhint",
+    .p.description = NULL_IF_CONFIG_SMALL("Field matching using hints."),
+    .p.priv_class  = &fieldhint_class,
     .priv_size     = sizeof(FieldHintContext),
-    .priv_class    = &fieldhint_class,
     .init          = init,
     .uninit        = uninit,
     FILTER_INPUTS(inputs),
     FILTER_OUTPUTS(outputs),
-    FILTER_QUERY_FUNC(query_formats),
+    FILTER_QUERY_FUNC2(query_formats),
 };

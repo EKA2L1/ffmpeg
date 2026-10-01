@@ -1,6 +1,7 @@
 /*
- * TLS/SSL Protocol
+ * TLS/DTLS/SSL Protocol
  * Copyright (c) 2011 Martin Storsjo
+ * Copyright (c) 2025 Jack Lau
  *
  * This file is part of FFmpeg.
  *
@@ -26,31 +27,28 @@
 #include "url.h"
 #include "tls.h"
 #include "libavutil/avstring.h"
-#include "libavutil/opt.h"
+#include "libavutil/getenv_utf8.h"
+#include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/parseutils.h"
 
-static void set_options(TLSShared *c, const char *uri)
+int ff_tls_parse_host(TLSShared *s, char *hostname, int hostname_size, int *port_ptr, const char *uri)
 {
-    char buf[1024];
-    const char *p = strchr(uri, '?');
-    if (!p)
-        return;
+    struct addrinfo hints = { .ai_flags = AI_NUMERICHOST }, *ai;
 
-    if (!c->ca_file && av_find_info_tag(buf, sizeof(buf), "cafile", p))
-        c->ca_file = av_strdup(buf);
+    if (!hostname || hostname_size <= 0)
+        return AVERROR(EINVAL);
 
-    if (!c->verify && av_find_info_tag(buf, sizeof(buf), "verify", p)) {
-        char *endptr = NULL;
-        c->verify = strtol(buf, &endptr, 10);
-        if (buf == endptr)
-            c->verify = 1;
+    av_url_split(NULL, 0, NULL, 0, hostname, hostname_size, port_ptr, NULL, 0, uri);
+    if (!getaddrinfo(hostname, NULL, &hints, &ai)) {
+        s->numerichost = 1;
+        freeaddrinfo(ai);
     }
 
-    if (!c->cert_file && av_find_info_tag(buf, sizeof(buf), "cert", p))
-        c->cert_file = av_strdup(buf);
+    if (!s->host && !(s->host = av_strdup(hostname)))
+        return AVERROR(ENOMEM);
 
-    if (!c->key_file && av_find_info_tag(buf, sizeof(buf), "key", p))
-        c->key_file = av_strdup(buf);
+    return 0;
 }
 
 int ff_tls_open_underlying(TLSShared *c, URLContext *parent, const char *uri, AVDictionary **options)
@@ -58,18 +56,24 @@ int ff_tls_open_underlying(TLSShared *c, URLContext *parent, const char *uri, AV
     int port;
     const char *p;
     char buf[200], opts[50] = "";
-    struct addrinfo hints = { 0 }, *ai = NULL;
     const char *proxy_path;
+    char *env_http_proxy, *env_no_proxy;
     int use_proxy;
-
-    set_options(c, uri);
-
-    if (c->listen)
-        snprintf(opts, sizeof(opts), "?listen=1");
-
-    av_url_split(NULL, 0, NULL, 0, c->underlying_host, sizeof(c->underlying_host), &port, NULL, 0, uri);
+    int ret;
 
     p = strchr(uri, '?');
+    if (p) {
+        ret = ff_parse_opts_from_query_string(c, p, 1);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (c->listen && !c->is_dtls)
+        snprintf(opts, sizeof(opts), "?listen=1");
+
+    ret = ff_tls_parse_host(c, c->underlying_host, sizeof(c->underlying_host), &port, uri);
+    if (ret < 0)
+        return ret;
 
     if (!p) {
         p = opts;
@@ -78,22 +82,17 @@ int ff_tls_open_underlying(TLSShared *c, URLContext *parent, const char *uri, AV
             c->listen = 1;
     }
 
-    ff_url_join(buf, sizeof(buf), "tcp", NULL, c->underlying_host, port, "%s", p);
+    ff_url_join(buf, sizeof(buf), c->is_dtls ? "udp" : "tcp", NULL, (c->is_dtls && c->listen) ? "" : c->underlying_host, port, "%s", p);
 
-    hints.ai_flags = AI_NUMERICHOST;
-    if (!getaddrinfo(c->underlying_host, NULL, &hints, &ai)) {
-        c->numerichost = 1;
-        freeaddrinfo(ai);
-    }
+    env_http_proxy = getenv_utf8("http_proxy");
+    proxy_path = c->http_proxy ? c->http_proxy : env_http_proxy;
 
-    if (!c->host && !(c->host = av_strdup(c->underlying_host)))
-        return AVERROR(ENOMEM);
-
-    proxy_path = c->http_proxy ? c->http_proxy : getenv("http_proxy");
-    use_proxy = !ff_http_match_no_proxy(getenv("no_proxy"), c->underlying_host) &&
+    env_no_proxy = getenv_utf8("no_proxy");
+    use_proxy = !ff_http_match_no_proxy(env_no_proxy, c->underlying_host) &&
                 proxy_path && av_strstart(proxy_path, "http://", NULL);
+    freeenv_utf8(env_no_proxy);
 
-    if (use_proxy) {
+    if (!c->is_dtls && use_proxy) {
         char proxy_host[200], proxy_auth[200], dest[200];
         int proxy_port;
         av_url_split(NULL, 0, proxy_auth, sizeof(proxy_auth),
@@ -104,7 +103,73 @@ int ff_tls_open_underlying(TLSShared *c, URLContext *parent, const char *uri, AV
                     proxy_port, "/%s", dest);
     }
 
-    return ffurl_open_whitelist(&c->tcp, buf, AVIO_FLAG_READ_WRITE,
-                                &parent->interrupt_callback, options,
-                                parent->protocol_whitelist, parent->protocol_blacklist, parent);
+    freeenv_utf8(env_http_proxy);
+    if (c->is_dtls) {
+        if (c->listen) {
+            av_dict_set_int(options, "localport", port, 0);
+            av_dict_set(options, "localaddr", c->underlying_host, 0);
+        } else {
+            av_dict_set_int(options, "localport", 0, 0);
+            av_dict_set_int(options, "connect", 1, 0);
+        }
+        av_dict_set_int(options, "fifo_size", 0, 0);
+        /* Set the max packet size to the buffer size. */
+        av_dict_set_int(options, "pkt_size", c->mtu, 0);
+    }
+    ret = ffurl_open_whitelist(c->is_dtls ? &c->udp : &c->tcp, buf, AVIO_FLAG_READ_WRITE,
+                               &parent->interrupt_callback, options,
+                               parent->protocol_whitelist, parent->protocol_blacklist, parent);
+    return ret;
+}
+
+/**
+ * Read all data from the given URL url and store it in the given buffer bp.
+ */
+int ff_url_read_all(const char *url, AVBPrint *bp)
+{
+    int ret = 0;
+    AVDictionary *opts = NULL;
+    URLContext *uc = NULL;
+    char buf[MAX_URL_SIZE];
+
+    ret = ffurl_open_whitelist(&uc, url, AVIO_FLAG_READ, NULL, &opts, NULL, NULL, NULL);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "TLS: Failed to open url %s\n", url);
+        goto end;
+    }
+
+    while (1) {
+        ret = ffurl_read(uc, buf, sizeof(buf));
+        if (ret == AVERROR_EOF) {
+            /* Reset the error because we read all response as answer util EOF. */
+            ret = 0;
+            break;
+        }
+        if (ret <= 0) {
+            av_log(NULL, AV_LOG_ERROR, "TLS: Failed to read from url=%s, key is %s\n", url, bp->str);
+            goto end;
+        }
+
+        av_bprintf(bp, "%.*s", ret, buf);
+        if (!av_bprint_is_complete(bp)) {
+            av_log(NULL, AV_LOG_ERROR, "TLS: Exceed max size %.*s, %s\n", ret, buf, bp->str);
+            ret = AVERROR(EIO);
+            goto end;
+        }
+    }
+
+end:
+    ffurl_closep(&uc);
+    av_dict_free(&opts);
+    return ret;
+}
+
+int ff_is_dtls_packet(const uint8_t *buf, int size)
+{
+    if (size > DTLS_RECORD_LAYER_HEADER_LEN) {
+        uint16_t version = AV_RB16(&buf[1]);
+        return buf[0] >= DTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC &&
+               (version == DTLS_VERSION_10 || version == DTLS_VERSION_12);
+    }
+    return 0;
 }

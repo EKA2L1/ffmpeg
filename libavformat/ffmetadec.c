@@ -21,9 +21,10 @@
 
 #include "libavutil/bprint.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "demux.h"
 #include "ffmeta.h"
-#include "internal.h"
 #include "libavutil/dict.h"
 
 static int probe(const AVProbeData *p)
@@ -181,7 +182,7 @@ static int read_header(AVFormatContext *s)
     while(!avio_feof(s->pb)) {
         get_bprint_line(s->pb, &bp);
 
-        if (!memcmp(bp.str, ID_STREAM, strlen(ID_STREAM))) {
+        if (bp.len == strlen(ID_STREAM) && !memcmp(bp.str, ID_STREAM, strlen(ID_STREAM))) {
             AVStream *st = avformat_new_stream(s, NULL);
 
             if (!st)
@@ -191,7 +192,7 @@ static int read_header(AVFormatContext *s)
             st->codecpar->codec_id   = AV_CODEC_ID_FFMETADATA;
 
             m = &st->metadata;
-        } else if (!memcmp(bp.str, ID_CHAPTER, strlen(ID_CHAPTER))) {
+        } else if (bp.len == strlen(ID_CHAPTER) && !memcmp(bp.str, ID_CHAPTER, strlen(ID_CHAPTER))) {
             AVChapter *ch = read_chapter(s);
 
             if (!ch)
@@ -222,9 +223,9 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     return AVERROR_EOF;
 }
 
-const AVInputFormat ff_ffmetadata_demuxer = {
-    .name        = "ffmetadata",
-    .long_name   = NULL_IF_CONFIG_SMALL("FFmpeg metadata in text"),
+const FFInputFormat ff_ffmetadata_demuxer = {
+    .p.name      = "ffmetadata",
+    .p.long_name = NULL_IF_CONFIG_SMALL("FFmpeg metadata in text"),
     .read_probe  = probe,
     .read_header = read_header,
     .read_packet = read_packet,

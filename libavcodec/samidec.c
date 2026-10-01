@@ -25,10 +25,12 @@
  */
 
 #include "ass.h"
+#include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
+#include "libavutil/mem.h"
+#include "codec_internal.h"
 #include "htmlsubtitles.h"
-#include "internal.h"
 
 typedef struct {
     AVBPrint source;
@@ -132,10 +134,9 @@ end:
     return ret;
 }
 
-static int sami_decode_frame(AVCodecContext *avctx,
-                             void *data, int *got_sub_ptr, AVPacket *avpkt)
+static int sami_decode_frame(AVCodecContext *avctx, AVSubtitle *sub,
+                             int *got_sub_ptr, const AVPacket *avpkt)
 {
-    AVSubtitle *sub = data;
     const char *ptr = avpkt->data;
     SAMIContext *sami = avctx->priv_data;
 
@@ -174,22 +175,21 @@ static av_cold int sami_close(AVCodecContext *avctx)
     return 0;
 }
 
-static void sami_flush(AVCodecContext *avctx)
+static av_cold void sami_flush(AVCodecContext *avctx)
 {
     SAMIContext *sami = avctx->priv_data;
     if (!(avctx->flags2 & AV_CODEC_FLAG2_RO_FLUSH_NOOP))
         sami->readorder = 0;
 }
 
-const AVCodec ff_sami_decoder = {
-    .name           = "sami",
-    .long_name      = NULL_IF_CONFIG_SMALL("SAMI subtitle"),
-    .type           = AVMEDIA_TYPE_SUBTITLE,
-    .id             = AV_CODEC_ID_SAMI,
+const FFCodec ff_sami_decoder = {
+    .p.name         = "sami",
+    CODEC_LONG_NAME("SAMI subtitle"),
+    .p.type         = AVMEDIA_TYPE_SUBTITLE,
+    .p.id           = AV_CODEC_ID_SAMI,
     .priv_data_size = sizeof(SAMIContext),
     .init           = sami_init,
     .close          = sami_close,
-    .decode         = sami_decode_frame,
+    FF_CODEC_DECODE_SUB_CB(sami_decode_frame),
     .flush          = sami_flush,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
 };

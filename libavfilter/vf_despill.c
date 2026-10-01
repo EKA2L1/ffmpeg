@@ -19,11 +19,9 @@
  */
 
 #include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
+#include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
-#include "video.h"
+#include "filters.h"
 
 typedef struct DespillContext {
     const AVClass *class;
@@ -45,8 +43,8 @@ static int do_despill_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_j
     DespillContext *s = ctx->priv;
     AVFrame *frame = arg;
     const int ro = s->co[0], go = s->co[1], bo = s->co[2], ao = s->co[3];
-    const int slice_start = (frame->height * jobnr) / nb_jobs;
-    const int slice_end = (frame->height * (jobnr + 1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(frame->height, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(frame->height, jobnr + 1, nb_jobs);
     const float brightness = s->brightness;
     const float redscale = s->redscale;
     const float greenscale = s->greenscale;
@@ -143,9 +141,9 @@ static const AVFilterPad despill_outputs[] = {
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
 static const AVOption despill_options[] = {
-    { "type",       "set the screen type",     OFFSET(type),        AV_OPT_TYPE_INT,     {.i64=0},     0,   1, FLAGS, "type" },
-    {   "green",    "greenscreen",             0,                   AV_OPT_TYPE_CONST,   {.i64=0},     0,   0, FLAGS, "type" },
-    {   "blue",     "bluescreen",              0,                   AV_OPT_TYPE_CONST,   {.i64=1},     0,   0, FLAGS, "type" },
+    { "type",       "set the screen type",     OFFSET(type),        AV_OPT_TYPE_INT,     {.i64=0},     0,   1, FLAGS, .unit = "type" },
+    {   "green",    "greenscreen",             0,                   AV_OPT_TYPE_CONST,   {.i64=0},     0,   0, FLAGS, .unit = "type" },
+    {   "blue",     "bluescreen",              0,                   AV_OPT_TYPE_CONST,   {.i64=1},     0,   0, FLAGS, .unit = "type" },
     { "mix",        "set the spillmap mix",    OFFSET(spillmix),    AV_OPT_TYPE_FLOAT,   {.dbl=0.5},   0,   1, FLAGS },
     { "expand",     "set the spillmap expand", OFFSET(spillexpand), AV_OPT_TYPE_FLOAT,   {.dbl=0},     0,   1, FLAGS },
     { "red",        "set red scale",           OFFSET(redscale),    AV_OPT_TYPE_FLOAT,   {.dbl=0},  -100, 100, FLAGS },
@@ -158,14 +156,14 @@ static const AVOption despill_options[] = {
 
 AVFILTER_DEFINE_CLASS(despill);
 
-const AVFilter ff_vf_despill = {
-    .name          = "despill",
-    .description   = NULL_IF_CONFIG_SMALL("Despill video."),
+const FFFilter ff_vf_despill = {
+    .p.name        = "despill",
+    .p.description = NULL_IF_CONFIG_SMALL("Despill video."),
+    .p.priv_class  = &despill_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(DespillContext),
-    .priv_class    = &despill_class,
     FILTER_INPUTS(despill_inputs),
     FILTER_OUTPUTS(despill_outputs),
     FILTER_PIXFMTS_ARRAY(pixel_fmts),
     .process_command = ff_filter_process_command,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
 };

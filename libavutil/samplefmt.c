@@ -16,11 +16,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "common.h"
+#include "error.h"
+#include "macros.h"
+#include "mem.h"
 #include "samplefmt.h"
 
+#include <limits.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 typedef struct SampleFmtInfo {
@@ -217,7 +219,7 @@ int av_samples_alloc_array_and_samples(uint8_t ***audio_data, int *linesize, int
     return ret;
 }
 
-int av_samples_copy(uint8_t **dst, uint8_t * const *src, int dst_offset,
+int av_samples_copy(uint8_t * const *dst, uint8_t * const *src, int dst_offset,
                     int src_offset, int nb_samples, int nb_channels,
                     enum AVSampleFormat sample_fmt)
 {
@@ -241,7 +243,7 @@ int av_samples_copy(uint8_t **dst, uint8_t * const *src, int dst_offset,
     return 0;
 }
 
-int av_samples_set_silence(uint8_t **audio_data, int offset, int nb_samples,
+int av_samples_set_silence(uint8_t * const *audio_data, int offset, int nb_samples,
                            int nb_channels, enum AVSampleFormat sample_fmt)
 {
     int planar      = av_sample_fmt_is_planar(sample_fmt);

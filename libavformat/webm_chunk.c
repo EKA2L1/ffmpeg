@@ -28,12 +28,14 @@
 #include "avio.h"
 #include "avio_internal.h"
 #include "internal.h"
+#include "mux.h"
 
+#include "libavutil/attributes_internal.h"
+#include "libavutil/bprint.h"
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/mathematics.h"
-
-#define MAX_FILENAME_SIZE 1024
 
 typedef struct WebMChunkContext {
     const AVClass *class;
@@ -50,7 +52,6 @@ typedef struct WebMChunkContext {
 static int webm_chunk_init(AVFormatContext *s)
 {
     WebMChunkContext *wc = s->priv_data;
-    const AVOutputFormat *oformat;
     AVFormatContext *oc;
     AVStream *st, *ost = s->streams[0];
     AVDictionary *dict = NULL;
@@ -67,11 +68,9 @@ static int webm_chunk_init(AVFormatContext *s)
 
     wc->prev_pts = AV_NOPTS_VALUE;
 
-    oformat = av_guess_format("webm", s->url, "video/webm");
-    if (!oformat)
-        return AVERROR_MUXER_NOT_FOUND;
+    EXTERN const FFOutputFormat ff_webm_muxer;
 
-    ret = avformat_alloc_output_context2(&wc->avf, oformat, NULL, NULL);
+    ret = avformat_alloc_output_context2(&wc->avf, &ff_webm_muxer.p, NULL, NULL);
     if (ret < 0)
         return ret;
     oc = wc->avf;
@@ -90,11 +89,9 @@ static int webm_chunk_init(AVFormatContext *s)
     if ((ret = av_dict_copy(&oc->metadata, s->metadata, 0)) < 0)
         return ret;
 
-    if (!(st = avformat_new_stream(oc, NULL)))
+    st = ff_stream_clone(oc, ost);
+    if (!st)
         return AVERROR(ENOMEM);
-
-    if ((ret = ff_stream_encode_params_copy(st, ost)) < 0)
-        return ret;
 
     if (wc->http_method)
         if ((ret = av_dict_set(&dict, "method", wc->http_method, 0)) < 0)
@@ -127,21 +124,19 @@ fail:
     s->avoid_negative_ts  = oc->avoid_negative_ts;
     ffformatcontext(s)->avoid_negative_ts_use_pts =
         ffformatcontext(oc)->avoid_negative_ts_use_pts;
-    oc->avoid_negative_ts = 0;
+    oc->avoid_negative_ts = AVFMT_AVOID_NEG_TS_DISABLED;
+    ffformatcontext(oc)->avoid_negative_ts_status = AVOID_NEGATIVE_TS_DISABLED;
 
     return 0;
 }
 
-static int get_chunk_filename(AVFormatContext *s, char filename[MAX_FILENAME_SIZE])
+static int get_chunk_filename(AVFormatContext *s, AVBPrint *filename)
 {
     WebMChunkContext *wc = s->priv_data;
-    if (!filename) {
-        return AVERROR(EINVAL);
-    }
-    if (av_get_frame_filename(filename, MAX_FILENAME_SIZE,
-                              s->url, wc->chunk_index - 1) < 0) {
+    int ret = ff_bprint_get_frame_filename(filename, s->url, wc->chunk_index - 1, 0);
+    if (ret < 0) {
         av_log(s, AV_LOG_ERROR, "Invalid chunk filename template '%s'\n", s->url);
-        return AVERROR(EINVAL);
+        return ret;
     }
     return 0;
 }
@@ -150,10 +145,13 @@ static int webm_chunk_write_header(AVFormatContext *s)
 {
     WebMChunkContext *wc = s->priv_data;
     AVFormatContext *oc = wc->avf;
+    AVStream *st = s->streams[0], *ost = oc->streams[0];
     int ret;
 
     ret = avformat_write_header(oc, NULL);
     ff_format_io_close(s, &oc->pb);
+    ffstream(st)->lowest_ts_allowed = ffstream(ost)->lowest_ts_allowed;
+    ffstream(ost)->lowest_ts_allowed = 0;
     wc->header_written = 1;
     if (ret < 0)
         return ret;
@@ -181,7 +179,7 @@ static int chunk_end(AVFormatContext *s, int flush)
     int buffer_size;
     uint8_t *buffer;
     AVIOContext *pb;
-    char filename[MAX_FILENAME_SIZE];
+    AVBPrint filename;
     AVDictionary *options = NULL;
 
     if (!oc->pb)
@@ -192,19 +190,21 @@ static int chunk_end(AVFormatContext *s, int flush)
         av_write_frame(oc, NULL);
     buffer_size = avio_close_dyn_buf(oc->pb, &buffer);
     oc->pb = NULL;
-    ret = get_chunk_filename(s, filename);
+    av_bprint_init(&filename, 0, AV_BPRINT_SIZE_UNLIMITED);
+    ret = get_chunk_filename(s, &filename);
     if (ret < 0)
         goto fail;
     if (wc->http_method)
         if ((ret = av_dict_set(&options, "method", wc->http_method, 0)) < 0)
             goto fail;
-    ret = s->io_open(s, &pb, filename, AVIO_FLAG_WRITE, &options);
+    ret = s->io_open(s, &pb, filename.str, AVIO_FLAG_WRITE, &options);
     av_dict_free(&options);
     if (ret < 0)
         goto fail;
     avio_write(pb, buffer, buffer_size);
     ff_format_io_close(s, &pb);
 fail:
+    av_bprint_finalize(&filename, NULL);
     av_free(buffer);
     return (ret < 0) ? ret : 0;
 }
@@ -289,18 +289,18 @@ static const AVClass webm_chunk_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVOutputFormat ff_webm_chunk_muxer = {
-    .name           = "webm_chunk",
-    .long_name      = NULL_IF_CONFIG_SMALL("WebM Chunk Muxer"),
-    .mime_type      = "video/webm",
-    .extensions     = "chk",
-    .flags          = AVFMT_NOFILE | AVFMT_GLOBALHEADER | AVFMT_NEEDNUMBER |
+const FFOutputFormat ff_webm_chunk_muxer = {
+    .p.name         = "webm_chunk",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("WebM Chunk Muxer"),
+    .p.mime_type    = "video/webm",
+    .p.extensions   = "chk",
+    .p.flags        = AVFMT_NOFILE | AVFMT_GLOBALHEADER | AVFMT_NEEDNUMBER |
                       AVFMT_TS_NONSTRICT,
+    .p.priv_class   = &webm_chunk_class,
     .priv_data_size = sizeof(WebMChunkContext),
     .init           = webm_chunk_init,
     .write_header   = webm_chunk_write_header,
     .write_packet   = webm_chunk_write_packet,
     .write_trailer  = webm_chunk_write_trailer,
     .deinit         = webm_chunk_deinit,
-    .priv_class     = &webm_chunk_class,
 };

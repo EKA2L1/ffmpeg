@@ -23,6 +23,7 @@
 #include "libavutil/dict.h"
 #include "libavutil/mathematics.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct R3DContext {
@@ -57,7 +58,7 @@ static int r3d_read_red1(AVFormatContext *s)
     char filename[258];
     int tmp;
     int ret;
-    int av_unused tmp2;
+    av_unused int tmp2;
     AVRational framerate;
 
     if (!st)
@@ -142,7 +143,7 @@ static int r3d_read_rdvo(AVFormatContext *s, Atom *atom)
 static void r3d_read_reos(AVFormatContext *s)
 {
     R3DContext *r3d = s->priv_data;
-    int av_unused tmp;
+    av_unused int tmp;
 
     r3d->rdvo_offset = avio_rb32(s->pb);
     avio_rb32(s->pb); // rdvs offset
@@ -219,7 +220,7 @@ static int r3d_read_redv(AVFormatContext *s, AVPacket *pkt, Atom *atom)
 {
     AVStream *st = s->streams[0];
     int tmp;
-    int av_unused tmp2;
+    av_unused int tmp2;
     int64_t pos = avio_tell(s->pb);
     unsigned dts;
     int ret;
@@ -274,7 +275,7 @@ static int r3d_read_reda(AVFormatContext *s, AVPacket *pkt, Atom *atom)
 {
     R3DContext *r3d = s->priv_data;
     AVStream *st;
-    int av_unused tmp, tmp2;
+    av_unused int tmp, tmp2;
     int samples, size;
     int64_t pos = avio_tell(s->pb);
     unsigned dts;
@@ -286,7 +287,7 @@ static int r3d_read_reda(AVFormatContext *s, AVPacket *pkt, Atom *atom)
             return AVERROR(ENOMEM);
         st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
         st->codecpar->codec_id = AV_CODEC_ID_PCM_S32BE;
-        st->codecpar->channels = r3d->audio_channels;
+        st->codecpar->ch_layout.nb_channels = r3d->audio_channels;
         avpriv_set_pts_info(st, 32, 1, s->streams[0]->time_base.den);
     } else {
         st = s->streams[1];
@@ -401,9 +402,9 @@ static int r3d_seek(AVFormatContext *s, int stream_index, int64_t sample_time, i
     return 0;
 }
 
-const AVInputFormat ff_r3d_demuxer = {
-    .name           = "r3d",
-    .long_name      = NULL_IF_CONFIG_SMALL("REDCODE R3D"),
+const FFInputFormat ff_r3d_demuxer = {
+    .p.name         = "r3d",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("REDCODE R3D"),
     .priv_data_size = sizeof(R3DContext),
     .read_probe     = r3d_probe,
     .read_header    = r3d_read_header,

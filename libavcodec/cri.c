@@ -27,12 +27,14 @@
 
 #define BITSTREAM_READER_LE
 
+#include "libavutil/attributes_internal.h"
 #include "libavutil/intfloat.h"
 #include "libavutil/display.h"
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
-#include "internal.h"
 #include "thread.h"
 
 typedef struct CRIContext {
@@ -50,7 +52,6 @@ typedef struct CRIContext {
 static av_cold int cri_decode_init(AVCodecContext *avctx)
 {
     CRIContext *s = avctx->priv_data;
-    const AVCodec *codec;
     int ret;
 
     s->jpgframe = av_frame_alloc();
@@ -61,17 +62,15 @@ static av_cold int cri_decode_init(AVCodecContext *avctx)
     if (!s->jpkt)
         return AVERROR(ENOMEM);
 
-    codec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
-    if (!codec)
-        return AVERROR_BUG;
-    s->jpeg_avctx = avcodec_alloc_context3(codec);
+    EXTERN const FFCodec ff_mjpeg_decoder;
+    s->jpeg_avctx = avcodec_alloc_context3(&ff_mjpeg_decoder.p);
     if (!s->jpeg_avctx)
         return AVERROR(ENOMEM);
     s->jpeg_avctx->flags = avctx->flags;
     s->jpeg_avctx->flags2 = avctx->flags2;
-    s->jpeg_avctx->dct_algo = avctx->dct_algo;
     s->jpeg_avctx->idct_algo = avctx->idct_algo;
-    ret = avcodec_open2(s->jpeg_avctx, codec, NULL);
+    s->jpeg_avctx->max_pixels = avctx->max_pixels;
+    ret = avcodec_open2(s->jpeg_avctx, NULL, NULL);
     if (ret < 0)
         return ret;
 
@@ -169,16 +168,14 @@ static void unpack_10bit(GetByteContext *gb, uint16_t *dst, int shift,
     }
 }
 
-static int cri_decode_frame(AVCodecContext *avctx, void *data,
+static int cri_decode_frame(AVCodecContext *avctx, AVFrame *p,
                             int *got_frame, AVPacket *avpkt)
 {
     CRIContext *s = avctx->priv_data;
     GetByteContext *gb = &s->gb;
-    ThreadFrame frame = { .f = data };
     int ret, bps, hflip = 0, vflip = 0;
     AVFrameSideData *rotation;
     int compressed = 0;
-    AVFrame *p = data;
 
     s->data = NULL;
     s->data_size = 0;
@@ -222,10 +219,12 @@ static int cri_decode_frame(AVCodecContext *avctx, void *data,
             if (bytestream2_get_le32(gb) != 0)
                 return AVERROR_INVALIDDATA;
             break;
-        case 102:
-            bytestream2_get_buffer(gb, codec_name, FFMIN(length, sizeof(codec_name) - 1));
-            length -= FFMIN(length, sizeof(codec_name) - 1);
-            if (strncmp(codec_name, "cintel_craw", FFMIN(length, sizeof(codec_name) - 1)))
+        case 102:;
+            int read_len = FFMIN(length, sizeof(codec_name) - 1);
+            if (read_len != bytestream2_get_buffer(gb, codec_name, read_len))
+                return AVERROR_INVALIDDATA;
+            length -= read_len;
+            if (strncmp(codec_name, "cintel_craw", read_len))
                 return AVERROR_INVALIDDATA;
             compressed = 1;
             goto skip;
@@ -236,10 +235,14 @@ static int cri_decode_frame(AVCodecContext *avctx, void *data,
             s->data_size = length;
             goto skip;
         case 105:
+            if (length <= 0)
+                return AVERROR_INVALIDDATA;
             hflip = bytestream2_get_byte(gb) != 0;
             length--;
             goto skip;
         case 106:
+            if (length <= 0)
+                return AVERROR_INVALIDDATA;
             vflip = bytestream2_get_byte(gb) != 0;
             length--;
             goto skip;
@@ -318,7 +321,10 @@ skip:
     if (!s->data || !s->data_size)
         return AVERROR_INVALIDDATA;
 
-    if ((ret = ff_thread_get_buffer(avctx, &frame, 0)) < 0)
+    if (avctx->skip_frame >= AVDISCARD_ALL)
+        return avpkt->size;
+
+    if ((ret = ff_thread_get_buffer(avctx, p, 0)) < 0)
         return ret;
 
     avctx->bits_per_raw_sample = bps;
@@ -397,16 +403,13 @@ skip:
     }
 
     if (hflip || vflip) {
-        rotation = av_frame_new_side_data(p, AV_FRAME_DATA_DISPLAYMATRIX,
-                                          sizeof(int32_t) * 9);
+        ff_frame_new_side_data(avctx, p, AV_FRAME_DATA_DISPLAYMATRIX,
+                               sizeof(int32_t) * 9, &rotation);
         if (rotation) {
             av_display_rotation_set((int32_t *)rotation->data, 0.f);
             av_display_matrix_flip((int32_t *)rotation->data, hflip, vflip);
         }
     }
-
-    p->pict_type = AV_PICTURE_TYPE_I;
-    p->key_frame = 1;
 
     *got_frame = 1;
 
@@ -424,15 +427,16 @@ static av_cold int cri_decode_close(AVCodecContext *avctx)
     return 0;
 }
 
-const AVCodec ff_cri_decoder = {
-    .name           = "cri",
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_CRI,
+const FFCodec ff_cri_decoder = {
+    .p.name         = "cri",
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_CRI,
     .priv_data_size = sizeof(CRIContext),
     .init           = cri_decode_init,
-    .decode         = cri_decode_frame,
+    FF_CODEC_DECODE_CB(cri_decode_frame),
     .close          = cri_decode_close,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
-    .long_name      = NULL_IF_CONFIG_SMALL("Cintel RAW"),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP |
+                      FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM,
+    CODEC_LONG_NAME("Cintel RAW"),
 };

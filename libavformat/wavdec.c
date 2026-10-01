@@ -27,16 +27,19 @@
 
 #include <stdint.h>
 
-#include "config.h"
+#include "config_components.h"
 #include "libavutil/avassert.h"
 #include "libavutil/dict.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
+#include "libavcodec/internal.h"
 #include "avformat.h"
 #include "avio.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "id3v2.h"
 #include "internal.h"
 #include "metadata.h"
@@ -72,9 +75,17 @@ static const AVOption demux_options[] = {
 #if CONFIG_WAV_DEMUXER
     { "ignore_length", "Ignore length", OFFSET(ignore_length), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, DEC },
 #endif
-    { "max_size",      "max size of single packet", OFFSET(max_size), AV_OPT_TYPE_INT, { .i64 = 4096 }, 1024, 1 << 22, DEC },
+    { "max_size",      "max size of single packet", OFFSET(max_size), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1 << 22, DEC },
     { NULL },
 };
+
+static void set_max_size(AVStream *st, WAVDemuxContext *wav)
+{
+    if (wav->max_size <= 0) {
+        int max_size = ff_pcm_default_packet_size(st->codecpar);
+        wav->max_size = max_size < 0 ? 4096 : max_size;
+    }
+}
 
 static void set_spdif(AVFormatContext *s, WAVDemuxContext *wav)
 {
@@ -120,11 +131,11 @@ static int64_t next_tag(AVIOContext *pb, uint32_t *tag, int big_endian)
 }
 
 /* RIFF chunks are always at even offsets relative to where they start. */
-static int64_t wav_seek_tag(WAVDemuxContext * wav, AVIOContext *s, int64_t offset, int whence)
+static int64_t wav_seek_tag(WAVDemuxContext * wav, AVIOContext *s, int64_t offset)
 {
     offset += offset < INT64_MAX && offset + wav->unaligned & 1;
 
-    return avio_seek(s, offset, whence);
+    return avio_seek(s, offset, SEEK_SET);
 }
 
 /* return the size of the found tag */
@@ -133,13 +144,16 @@ static int64_t find_tag(WAVDemuxContext * wav, AVIOContext *pb, uint32_t tag1)
     unsigned int tag;
     int64_t size;
 
+    if (avio_tell(pb) + wav->unaligned & 1)
+        avio_skip(pb, 1);
+
     for (;;) {
         if (avio_feof(pb))
             return AVERROR_EOF;
         size = next_tag(pb, &tag, wav->rifx);
         if (tag == tag1)
             break;
-        wav_seek_tag(wav, pb, size, SEEK_CUR);
+        avio_skip(pb, size + (size & 1));
     }
     return size;
 }
@@ -167,7 +181,7 @@ static void handle_stream_probing(AVStream *st)
 {
     if (st->codecpar->codec_id == AV_CODEC_ID_PCM_S16LE) {
         FFStream *const sti = ffstream(st);
-        sti->request_probe = AVPROBE_SCORE_EXTENSION;
+        sti->request_probe = AVPROBE_SCORE_EXTENSION + 1;
         sti->probe_packets = FFMIN(sti->probe_packets, 32);
     }
 }
@@ -221,9 +235,11 @@ static int wav_parse_xma2_tag(AVFormatContext *s, int64_t size, AVStream *st)
         channels += avio_r8(pb);
         avio_skip(pb, 3);
     }
-    st->codecpar->channels = channels;
+    av_channel_layout_uninit(&st->codecpar->ch_layout);
+    st->codecpar->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    st->codecpar->ch_layout.nb_channels = channels;
 
-    if (st->codecpar->channels <= 0 || st->codecpar->sample_rate <= 0)
+    if (st->codecpar->ch_layout.nb_channels <= 0 || st->codecpar->sample_rate <= 0)
         return AVERROR_INVALIDDATA;
 
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
@@ -409,7 +425,7 @@ static int wav_read_header(AVFormatContext *s)
     for (;;) {
         AVStream *vst;
         size         = next_tag(pb, &tag, wav->rifx);
-        next_tag_ofs = avio_tell(pb) + size;
+        next_tag_ofs = avio_tell(pb) + size + (size & 1);
 
         if (avio_feof(pb))
             break;
@@ -441,10 +457,12 @@ static int wav_read_header(AVFormatContext *s)
             }
 
             if (rf64 || bw64) {
-                next_tag_ofs = wav->data_end = avio_tell(pb) + data_size;
-            } else if (size != 0xFFFFFFFF) {
+                wav->data_end = av_sat_add64(avio_tell(pb), data_size);
+                next_tag_ofs = wav->data_end + (data_size & 1);
+            } else if (size > 0 && size != 0xFFFFFFFF) {
                 data_size    = size;
-                next_tag_ofs = wav->data_end = size ? next_tag_ofs : INT64_MAX;
+                wav->data_end = avio_tell(pb) + size;
+                next_tag_ofs = wav->data_end + (size & 1);
             } else {
                 av_log(s, AV_LOG_WARNING, "Ignoring maximum wav data size, "
                        "file may be invalid\n");
@@ -552,7 +570,7 @@ static int wav_read_header(AVFormatContext *s)
         case MKTAG('I', 'D', '3', ' '):
         case MKTAG('i', 'd', '3', ' '): {
             ID3v2ExtraMeta *id3v2_extra_meta;
-            ff_id3v2_read_dict(pb, &ffformatcontext(s)->id3v2_meta, ID3v2_DEFAULT_MAGIC, &id3v2_extra_meta);
+            ff_id3v2_read(s, ID3v2_DEFAULT_MAGIC, &id3v2_extra_meta, 0);
             if (id3v2_extra_meta) {
                 ff_id3v2_parse_apic(s, id3v2_extra_meta);
                 ff_id3v2_parse_chapters(s, id3v2_extra_meta);
@@ -586,7 +604,7 @@ static int wav_read_header(AVFormatContext *s)
 
         /* seek to next tag unless we know that we'll run into EOF */
         if ((avio_size(pb) > 0 && next_tag_ofs >= avio_size(pb)) ||
-            wav_seek_tag(wav, pb, next_tag_ofs, SEEK_SET) < 0) {
+            wav_seek_tag(wav, pb, next_tag_ofs) < 0) {
             break;
         }
     }
@@ -611,15 +629,15 @@ break_loop:
 
     if (   st->codecpar->bit_rate > 0 && data_size > 0
         && st->codecpar->sample_rate > 0
-        && sample_count > 0 && st->codecpar->channels > 1
-        && sample_count % st->codecpar->channels == 0) {
-        if (fabs(8.0 * data_size * st->codecpar->channels * st->codecpar->sample_rate /
+        && sample_count > 0 && st->codecpar->ch_layout.nb_channels > 1
+        && sample_count % st->codecpar->ch_layout.nb_channels == 0) {
+        if (fabs(8.0 * data_size * st->codecpar->ch_layout.nb_channels * st->codecpar->sample_rate /
             sample_count /st->codecpar->bit_rate - 1.0) < 0.3)
-            sample_count /= st->codecpar->channels;
+            sample_count /= st->codecpar->ch_layout.nb_channels;
     }
 
-    if (   data_size > 0 && sample_count && st->codecpar->channels
-        && (data_size << 3) / sample_count / st->codecpar->channels > st->codecpar->bits_per_coded_sample  + 1) {
+    if (data_size > 0 && sample_count && st->codecpar->ch_layout.nb_channels &&
+        (data_size << 3) / sample_count / st->codecpar->ch_layout.nb_channels > st->codecpar->bits_per_coded_sample  + 1) {
         av_log(s, AV_LOG_WARNING, "ignoring wrong sample_count %"PRId64"\n", sample_count);
         sample_count = 0;
     }
@@ -632,40 +650,41 @@ break_loop:
     }
 
     if (!sample_count || av_get_exact_bits_per_sample(st->codecpar->codec_id) > 0)
-        if (   st->codecpar->channels
+        if (   st->codecpar->ch_layout.nb_channels
             && data_size
             && av_get_bits_per_sample(st->codecpar->codec_id)
             && wav->data_end <= avio_size(pb))
             sample_count = (data_size << 3)
                                   /
-                (st->codecpar->channels * (uint64_t)av_get_bits_per_sample(st->codecpar->codec_id));
+                (st->codecpar->ch_layout.nb_channels * (uint64_t)av_get_bits_per_sample(st->codecpar->codec_id));
 
     if (sample_count)
         st->duration = sample_count;
 
     if (st->codecpar->codec_id == AV_CODEC_ID_PCM_S32LE &&
-        st->codecpar->block_align == st->codecpar->channels * 4 &&
+        st->codecpar->block_align == st->codecpar->ch_layout.nb_channels * 4 &&
         st->codecpar->bits_per_coded_sample == 32 &&
         st->codecpar->extradata_size == 2 &&
         AV_RL16(st->codecpar->extradata) == 1) {
         st->codecpar->codec_id = AV_CODEC_ID_PCM_F16LE;
         st->codecpar->bits_per_coded_sample = 16;
     } else if (st->codecpar->codec_id == AV_CODEC_ID_PCM_S24LE &&
-               st->codecpar->block_align == st->codecpar->channels * 4 &&
+               st->codecpar->block_align == st->codecpar->ch_layout.nb_channels * 4 &&
                st->codecpar->bits_per_coded_sample == 24) {
         st->codecpar->codec_id = AV_CODEC_ID_PCM_F24LE;
     } else if (st->codecpar->codec_id == AV_CODEC_ID_XMA1 ||
                st->codecpar->codec_id == AV_CODEC_ID_XMA2) {
         st->codecpar->block_align = 2048;
-    } else if (st->codecpar->codec_id == AV_CODEC_ID_ADPCM_MS && st->codecpar->channels > 2 &&
-               st->codecpar->block_align < INT_MAX / st->codecpar->channels) {
-        st->codecpar->block_align *= st->codecpar->channels;
+    } else if (st->codecpar->codec_id == AV_CODEC_ID_ADPCM_MS && st->codecpar->ch_layout.nb_channels > 2 &&
+               st->codecpar->block_align < INT_MAX / st->codecpar->ch_layout.nb_channels) {
+        st->codecpar->block_align *= st->codecpar->ch_layout.nb_channels;
     }
 
     ff_metadata_conv_ctx(s, NULL, wav_metadata_conv);
     ff_metadata_conv_ctx(s, NULL, ff_riff_info_conv);
 
     set_spdif(s, wav);
+    set_max_size(st, wav);
 
     return 0;
 }
@@ -680,7 +699,8 @@ static int64_t find_guid(AVIOContext *pb, const uint8_t guid1[16])
     int64_t size;
 
     while (!avio_feof(pb)) {
-        avio_read(pb, guid, 16);
+        if (avio_read(pb, guid, 16) != 16)
+            break;
         size = avio_rl64(pb);
         if (size <= 24 || size > INT64_MAX - 8)
             return AVERROR_INVALIDDATA;
@@ -727,6 +747,10 @@ smv_retry:
                 goto smv_out;
             }
             size = avio_rl24(s->pb);
+            if (size > wav->smv_block_size) {
+                ret = AVERROR_EOF;
+                goto smv_out;
+            }
             ret  = av_get_packet(s->pb, pkt, size);
             if (ret < 0)
                 goto smv_out;
@@ -760,6 +784,8 @@ smv_out:
                 goto smv_retry;
             return AVERROR_EOF;
         }
+        if (INT64_MAX - left < avio_tell(s->pb))
+            return AVERROR_INVALIDDATA;
         wav->data_end = avio_tell(s->pb) + left;
     }
 
@@ -819,17 +845,17 @@ static const AVClass wav_demuxer_class = {
     .option     = demux_options,
     .version    = LIBAVUTIL_VERSION_INT,
 };
-const AVInputFormat ff_wav_demuxer = {
-    .name           = "wav",
-    .long_name      = NULL_IF_CONFIG_SMALL("WAV / WAVE (Waveform Audio)"),
+const FFInputFormat ff_wav_demuxer = {
+    .p.name         = "wav",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("WAV / WAVE (Waveform Audio)"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.codec_tag    = ff_wav_codec_tags_list,
+    .p.priv_class   = &wav_demuxer_class,
     .priv_data_size = sizeof(WAVDemuxContext),
     .read_probe     = wav_probe,
     .read_header    = wav_read_header,
     .read_packet    = wav_read_packet,
     .read_seek      = wav_read_seek,
-    .flags          = AVFMT_GENERIC_INDEX,
-    .codec_tag      = ff_wav_codec_tags_list,
-    .priv_class     = &wav_demuxer_class,
 };
 #endif /* CONFIG_WAV_DEMUXER */
 
@@ -852,9 +878,11 @@ static int w64_read_header(AVFormatContext *s)
     WAVDemuxContext *wav = s->priv_data;
     AVStream *st;
     uint8_t guid[16];
-    int ret;
+    int ret = ffio_read_size(pb, guid, 16);
 
-    avio_read(pb, guid, 16);
+    if (ret < 0)
+        return ret;
+
     if (memcmp(guid, ff_w64_guid_riff, 16))
         return AVERROR_INVALIDDATA;
 
@@ -862,7 +890,9 @@ static int w64_read_header(AVFormatContext *s)
     if (avio_rl64(pb) < 16 + 8 + 16 + 8 + 16 + 8)
         return AVERROR_INVALIDDATA;
 
-    avio_read(pb, guid, 16);
+    ret = ffio_read_size(pb, guid, 16);
+    if (ret < 0)
+        return ret;
     if (memcmp(guid, ff_w64_guid_wave, 16)) {
         av_log(s, AV_LOG_ERROR, "could not find wave guid\n");
         return AVERROR_INVALIDDATA;
@@ -878,8 +908,11 @@ static int w64_read_header(AVFormatContext *s)
         if (avio_read(pb, guid, 16) != 16)
             break;
         size = avio_rl64(pb);
-        if (size <= 24 || INT64_MAX - size < avio_tell(pb))
+        if (size <= 24 || INT64_MAX - size - 7 < avio_tell(pb)) {
+            if (data_ofs)
+                break;
             return AVERROR_INVALIDDATA;
+        }
 
         if (!memcmp(guid, ff_w64_guid_fmt, 16)) {
             /* subtract chunk header size - normal wav file doesn't count it */
@@ -887,7 +920,20 @@ static int w64_read_header(AVFormatContext *s)
             if (ret < 0)
                 return ret;
             avio_skip(pb, FFALIGN(size, INT64_C(8)) - size);
+            if (st->codecpar->block_align &&
+                st->codecpar->ch_layout.nb_channels < FF_SANE_NB_CHANNELS &&
+                st->codecpar->bits_per_coded_sample < 128) {
+                int64_t block_align = st->codecpar->block_align;
 
+                block_align = FFMAX(block_align,
+                                    ((st->codecpar->bits_per_coded_sample + 7LL) / 8) *
+                                    st->codecpar->ch_layout.nb_channels);
+                if (block_align > st->codecpar->block_align) {
+                    av_log(s, AV_LOG_WARNING, "invalid block_align: %d, broken file.\n",
+                           st->codecpar->block_align);
+                    st->codecpar->block_align = block_align;
+                }
+            }
             avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
         } else if (!memcmp(guid, ff_w64_guid_fact, 16)) {
             int64_t samples;
@@ -958,6 +1004,7 @@ static int w64_read_header(AVFormatContext *s)
     avio_seek(pb, data_ofs, SEEK_SET);
 
     set_spdif(s, wav);
+    set_max_size(st, wav);
 
     return 0;
 }
@@ -969,16 +1016,17 @@ static const AVClass w64_demuxer_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVInputFormat ff_w64_demuxer = {
-    .name           = "w64",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sony Wave64"),
+const FFInputFormat ff_w64_demuxer = {
+    .p.name         = "w64",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Sony Wave64"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
+    .p.codec_tag    = ff_wav_codec_tags_list,
+    .p.priv_class   = &w64_demuxer_class,
     .priv_data_size = sizeof(WAVDemuxContext),
+    .flags_internal = FF_INFMT_FLAG_ID3V2_AUTO,
     .read_probe     = w64_probe,
     .read_header    = w64_read_header,
     .read_packet    = wav_read_packet,
     .read_seek      = wav_read_seek,
-    .flags          = AVFMT_GENERIC_INDEX,
-    .codec_tag      = ff_wav_codec_tags_list,
-    .priv_class     = &w64_demuxer_class,
 };
 #endif /* CONFIG_W64_DEMUXER */

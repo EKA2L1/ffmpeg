@@ -24,8 +24,10 @@
 #include "libavutil/error.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "riff.h"
 
 int ff_get_guid(AVIOContext *s, ff_asf_guid *g)
@@ -57,15 +59,18 @@ enum AVCodecID ff_codec_guid_get_id(const AVCodecGuid *guids, ff_asf_guid guid)
  * an openended structure.
  */
 
-static void parse_waveformatex(AVFormatContext *s, AVIOContext *pb, AVCodecParameters *par)
+static void parse_waveformatex(void *logctx, AVIOContext *pb, AVCodecParameters *par)
 {
     ff_asf_guid subformat;
     int bps;
+    uint64_t mask;
 
     bps = avio_rl16(pb);
     if (bps)
         par->bits_per_coded_sample = bps;
-    par->channel_layout        = avio_rl32(pb); /* dwChannelMask */
+
+    mask = avio_rl32(pb); /* dwChannelMask */
+    av_channel_layout_from_mask(&par->ch_layout, mask);
 
     ff_get_guid(pb, &subformat);
     if (!memcmp(subformat + 4,
@@ -80,9 +85,55 @@ static void parse_waveformatex(AVFormatContext *s, AVIOContext *pb, AVCodecParam
     } else {
         par->codec_id = ff_codec_guid_get_id(ff_codec_wav_guids, subformat);
         if (!par->codec_id)
-            av_log(s, AV_LOG_WARNING,
+            av_log(logctx, AV_LOG_WARNING,
                    "unknown subformat:"FF_PRI_GUID"\n",
                    FF_ARG_GUID(subformat));
+    }
+}
+
+/*
+ * Compute the expected bit_rate for codecs with a deterministic block
+ * structure. Returns 0 when the codec is not handled or the parameters
+ * are not sufficient to derive a reliable value.
+ */
+static int64_t compute_bitrate(const AVCodecParameters *par)
+{
+    if (par->sample_rate <= 0 || par->block_align <= 0 ||
+        par->ch_layout.nb_channels <= 0)
+        return 0;
+
+    switch (par->codec_id) {
+    case AV_CODEC_ID_PCM_S8:
+    case AV_CODEC_ID_PCM_U8:
+    case AV_CODEC_ID_PCM_S16LE:
+    case AV_CODEC_ID_PCM_S16BE:
+    case AV_CODEC_ID_PCM_U16LE:
+    case AV_CODEC_ID_PCM_U16BE:
+    case AV_CODEC_ID_PCM_S24LE:
+    case AV_CODEC_ID_PCM_S24BE:
+    case AV_CODEC_ID_PCM_S32LE:
+    case AV_CODEC_ID_PCM_S32BE:
+    case AV_CODEC_ID_PCM_S64LE:
+    case AV_CODEC_ID_PCM_F32LE:
+    case AV_CODEC_ID_PCM_F64LE:
+    case AV_CODEC_ID_PCM_ALAW:
+    case AV_CODEC_ID_PCM_MULAW: {
+        int block_align = ((par->bits_per_coded_sample + 7) / 8) *
+                         par->ch_layout.nb_channels;
+        if (par->block_align != block_align)
+            return 0;
+        return (int64_t)par->sample_rate * block_align * 8;
+    }
+    case AV_CODEC_ID_ADPCM_MS:
+    case AV_CODEC_ID_ADPCM_IMA_WAV: {
+        int frame_size = av_get_audio_frame_duration2((AVCodecParameters *)par,
+                                                      par->block_align);
+        if (frame_size <= 0)
+            return 0;
+        return 8LL * par->sample_rate * par->block_align / frame_size;
+    }
+    default:
+        return 0;
     }
 }
 
@@ -90,7 +141,7 @@ static void parse_waveformatex(AVFormatContext *s, AVIOContext *pb, AVCodecParam
 int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb,
                       AVCodecParameters *par, int size, int big_endian)
 {
-    int id;
+    int id, channels = 0, ret;
     uint64_t bitrate = 0;
 
     if (size < 14) {
@@ -98,18 +149,20 @@ int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb,
         return AVERROR_INVALIDDATA;
     }
 
+    av_channel_layout_uninit(&par->ch_layout);
+
     par->codec_type  = AVMEDIA_TYPE_AUDIO;
     if (!big_endian) {
         id                 = avio_rl16(pb);
         if (id != 0x0165) {
-            par->channels    = avio_rl16(pb);
+            channels         = avio_rl16(pb);
             par->sample_rate = avio_rl32(pb);
             bitrate            = avio_rl32(pb) * 8LL;
             par->block_align = avio_rl16(pb);
         }
     } else {
         id                 = avio_rb16(pb);
-        par->channels    = avio_rb16(pb);
+        channels           = avio_rb16(pb);
         par->sample_rate = avio_rb32(pb);
         bitrate            = avio_rb32(pb) * 8LL;
         par->block_align = avio_rb16(pb);
@@ -142,10 +195,25 @@ int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb,
             parse_waveformatex(s, pb, par);
             cbSize -= 22;
             size   -= 22;
+        } else if (cbSize >= 12 && id == 0x1610) { /* HEAACWAVEFORMAT */
+            int wPayloadType = avio_rl16(pb);
+            if (wPayloadType == 3)
+                par->codec_id = AV_CODEC_ID_AAC_LATM;
+            avio_skip(pb, 2); // wAudioProfileLevelIndication
+            int wStructType = avio_rl16(pb);
+            if (wStructType) {
+                avpriv_report_missing_feature(s, "HEAACWAVEINFO wStructType \"%d\"", wStructType);
+                return AVERROR_PATCHWELCOME;
+            }
+            avio_skip(pb, 2); // wReserved1
+            avio_skip(pb, 4); // dwReserved2
+            cbSize -= 12;
+            size   -= 12;
         }
         if (cbSize > 0) {
-            if (ff_get_extradata(s, par, pb, cbSize) < 0)
-                return AVERROR(ENOMEM);
+            ret = ff_get_extradata(s, par, pb, cbSize);
+            if (ret < 0)
+                return ret;
             size -= cbSize;
         }
 
@@ -156,16 +224,17 @@ int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb,
         int nb_streams, i;
 
         size -= 4;
-        if (ff_get_extradata(s, par, pb, size) < 0)
-            return AVERROR(ENOMEM);
+        ret = ff_get_extradata(s, par, pb, size);
+        if (ret < 0)
+            return ret;
         nb_streams         = AV_RL16(par->extradata + 4);
         par->sample_rate   = AV_RL32(par->extradata + 12);
-        par->channels      = 0;
+        channels           = 0;
         bitrate            = 0;
         if (size < 8 + nb_streams * 20)
             return AVERROR_INVALIDDATA;
         for (i = 0; i < nb_streams; i++)
-            par->channels += par->extradata[8 + i * 20 + 17];
+            channels += par->extradata[8 + i * 20 + 17];
     }
 
     par->bit_rate = bitrate;
@@ -175,15 +244,32 @@ int ff_get_wav_header(AVFormatContext *s, AVIOContext *pb,
                "Invalid sample rate: %d\n", par->sample_rate);
         return AVERROR_INVALIDDATA;
     }
+
     if (par->codec_id == AV_CODEC_ID_AAC_LATM) {
         /* Channels and sample_rate values are those prior to applying SBR
          * and/or PS. */
-        par->channels    = 0;
+        channels         = 0;
         par->sample_rate = 0;
     }
     /* override bits_per_coded_sample for G.726 */
     if (par->codec_id == AV_CODEC_ID_ADPCM_G726 && par->sample_rate)
         par->bits_per_coded_sample = par->bit_rate / par->sample_rate;
+
+    /* ignore WAVEFORMATEXTENSIBLE layout if different from channel count */
+    if (channels != par->ch_layout.nb_channels) {
+        av_channel_layout_uninit(&par->ch_layout);
+        par->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+        par->ch_layout.nb_channels = channels;
+    }
+
+    int64_t expected_bitrate = compute_bitrate(par);
+    if (expected_bitrate && par->bit_rate / 8 != expected_bitrate / 8) {
+        av_log(s, AV_LOG_WARNING,
+               "nAvgBytesPerSec %"PRId64" inconsistent with other fields"
+               " (expected %"PRId64"), overriding.\n",
+               par->bit_rate / 8, expected_bitrate / 8);
+        par->bit_rate = expected_bitrate;
+    }
 
     return 0;
 }

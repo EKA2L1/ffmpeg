@@ -19,17 +19,17 @@
  */
 
 #include "libavutil/avassert.h"
-#include "libavutil/avstring.h"
 #include "libavutil/common.h"
 #include "libavutil/internal.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/lfg.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/random_seed.h"
 
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 typedef struct ShufflePixelsContext {
@@ -204,8 +204,8 @@ static int shuffle_horizontal## name(AVFilterContext *ctx, void *arg,        \
     AVFrame *out = td->out;                                                  \
                                                                              \
     for (int p = 0; p < s->nb_planes; p++) {                                 \
-        const int slice_start = (s->planeheight[p] * jobnr) / nb_jobs;       \
-        const int slice_end = (s->planeheight[p] * (jobnr+1)) / nb_jobs;     \
+        const int slice_start = ff_slice_pos(s->planeheight[p], jobnr, nb_jobs); \
+        const int slice_end = ff_slice_pos(s->planeheight[p], jobnr + 1, nb_jobs); \
         type *dst = (type *)(out->data[p] + slice_start * out->linesize[p]); \
         const type *src = (const type *)(in->data[p] +                       \
                                          slice_start * in->linesize[p]);     \
@@ -237,8 +237,8 @@ static int shuffle_vertical## name(AVFilterContext *ctx, void *arg,          \
     AVFrame *out = td->out;                                                  \
                                                                              \
     for (int p = 0; p < s->nb_planes; p++) {                                 \
-        const int slice_start = (s->planeheight[p] * jobnr) / nb_jobs;       \
-        const int slice_end = (s->planeheight[p] * (jobnr+1)) / nb_jobs;     \
+        const int slice_start = ff_slice_pos(s->planeheight[p], jobnr, nb_jobs); \
+        const int slice_end = ff_slice_pos(s->planeheight[p], jobnr + 1, nb_jobs); \
         type *dst = (type *)(out->data[p] + slice_start * out->linesize[p]); \
         const int32_t *map = s->map;                                         \
                                                                              \
@@ -267,8 +267,8 @@ static int shuffle_block## name(AVFilterContext *ctx, void *arg,             \
     AVFrame *out = td->out;                                                  \
                                                                              \
     for (int p = 0; p < s->nb_planes; p++) {                                 \
-        const int slice_start = (s->planeheight[p] * jobnr) / nb_jobs;       \
-        const int slice_end = (s->planeheight[p] * (jobnr+1)) / nb_jobs;     \
+        const int slice_start = ff_slice_pos(s->planeheight[p], jobnr, nb_jobs); \
+        const int slice_end = ff_slice_pos(s->planeheight[p], jobnr + 1, nb_jobs); \
         type *dst = (type *)(out->data[p] + slice_start * out->linesize[p]); \
         const type *src = (const type *)in->data[p];                         \
         const int32_t *map = s->map + slice_start * s->planewidth[p];        \
@@ -404,15 +404,15 @@ static av_cold void uninit(AVFilterContext *ctx)
 #define OFFSET(x) offsetof(ShufflePixelsContext, x)
 #define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
 static const AVOption shufflepixels_options[] = {
-    { "direction",  "set shuffle direction",  OFFSET(direction), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, "dir" },
-    { "d",          "set shuffle direction",  OFFSET(direction), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, "dir" },
-    {  "forward",    0,  0,  AV_OPT_TYPE_CONST,     {.i64=0}, 0,  0, FLAGS, "dir" },
-    {  "inverse",    0,  0,  AV_OPT_TYPE_CONST,     {.i64=1}, 0,  0, FLAGS, "dir" },
-    { "mode",       "set shuffle mode",  OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, "mode" },
-    { "m",          "set shuffle mode",  OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, "mode" },
-    {  "horizontal",  0,  0,  AV_OPT_TYPE_CONST,     {.i64=0}, 0,  0, FLAGS, "mode" },
-    {  "vertical",    0,  0,  AV_OPT_TYPE_CONST,     {.i64=1}, 0,  0, FLAGS, "mode" },
-    {  "block",       0,  0,  AV_OPT_TYPE_CONST,     {.i64=2}, 0,  0, FLAGS, "mode" },
+    { "direction",  "set shuffle direction",  OFFSET(direction), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, .unit = "dir" },
+    { "d",          "set shuffle direction",  OFFSET(direction), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, .unit = "dir" },
+    {  "forward",    0,  0,  AV_OPT_TYPE_CONST,     {.i64=0}, 0,  0, FLAGS, .unit = "dir" },
+    {  "inverse",    0,  0,  AV_OPT_TYPE_CONST,     {.i64=1}, 0,  0, FLAGS, .unit = "dir" },
+    { "mode",       "set shuffle mode",  OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, .unit = "mode" },
+    { "m",          "set shuffle mode",  OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, .unit = "mode" },
+    {  "horizontal",  0,  0,  AV_OPT_TYPE_CONST,     {.i64=0}, 0,  0, FLAGS, .unit = "mode" },
+    {  "vertical",    0,  0,  AV_OPT_TYPE_CONST,     {.i64=1}, 0,  0, FLAGS, .unit = "mode" },
+    {  "block",       0,  0,  AV_OPT_TYPE_CONST,     {.i64=2}, 0,  0, FLAGS, .unit = "mode" },
     { "width",      "set block width",  OFFSET(block_w), AV_OPT_TYPE_INT, {.i64=10}, 1, 8000, FLAGS },
     { "w",          "set block width",  OFFSET(block_w), AV_OPT_TYPE_INT, {.i64=10}, 1, 8000, FLAGS },
     { "height",     "set block height", OFFSET(block_h), AV_OPT_TYPE_INT, {.i64=10}, 1, 8000, FLAGS },
@@ -440,14 +440,14 @@ static const AVFilterPad shufflepixels_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_shufflepixels = {
-    .name          = "shufflepixels",
-    .description   = NULL_IF_CONFIG_SMALL("Shuffle video pixels."),
+const FFFilter ff_vf_shufflepixels = {
+    .p.name        = "shufflepixels",
+    .p.description = NULL_IF_CONFIG_SMALL("Shuffle video pixels."),
+    .p.priv_class  = &shufflepixels_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ShufflePixelsContext),
-    .priv_class    = &shufflepixels_class,
     .uninit        = uninit,
     FILTER_INPUTS(shufflepixels_inputs),
     FILTER_OUTPUTS(shufflepixels_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
 };

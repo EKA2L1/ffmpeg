@@ -21,7 +21,8 @@
 
 #include "movenc.h"
 #include "libavutil/intreadwrite.h"
-#include "internal.h"
+#include "libavutil/mem.h"
+#include "mux.h"
 #include "rtpenc_chain.h"
 #include "avio_internal.h"
 #include "rtp.h"
@@ -35,7 +36,11 @@ int ff_mov_init_hinting(AVFormatContext *s, int index, int src_index)
     int ret = AVERROR(ENOMEM);
 
     track->tag = MKTAG('r','t','p',' ');
-    track->src_track = src_index;
+    track->src_track = av_malloc(sizeof(*track->src_track));
+    if (!track->src_track)
+        return AVERROR(ENOMEM);
+    *track->src_track = src_index;
+    track->nb_src_track = 1;
 
     track->par = avcodec_parameters_alloc();
     if (!track->par)
@@ -96,7 +101,7 @@ static void sample_queue_free(HintSampleQueue *queue)
  * not copied. sample_queue_retain should be called before pkt->data
  * is reused/freed.
  */
-static void sample_queue_push(HintSampleQueue *queue, uint8_t *data, int size,
+static void sample_queue_push(HintSampleQueue *queue, const uint8_t *data, int size,
                               int sample)
 {
     /* No need to keep track of smaller samples, since describing them

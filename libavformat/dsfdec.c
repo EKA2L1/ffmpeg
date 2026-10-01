@@ -22,6 +22,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "id3v2.h"
 
@@ -38,15 +39,15 @@ static int dsf_probe(const AVProbeData *p)
     return AVPROBE_SCORE_MAX;
 }
 
-static const uint64_t dsf_channel_layout[] = {
-    0,
-    AV_CH_LAYOUT_MONO,
-    AV_CH_LAYOUT_STEREO,
-    AV_CH_LAYOUT_SURROUND,
-    AV_CH_LAYOUT_QUAD,
-    AV_CH_LAYOUT_4POINT0,
-    AV_CH_LAYOUT_5POINT0_BACK,
-    AV_CH_LAYOUT_5POINT1_BACK,
+static const AVChannelLayout dsf_channel_layout[] = {
+    { .order = AV_CHANNEL_ORDER_UNSPEC },
+    AV_CHANNEL_LAYOUT_MONO,
+    AV_CHANNEL_LAYOUT_STEREO,
+    AV_CHANNEL_LAYOUT_SURROUND,
+    AV_CHANNEL_LAYOUT_QUAD,
+    AV_CHANNEL_LAYOUT_4POINT0,
+    AV_CHANNEL_LAYOUT_5POINT0_BACK,
+    AV_CHANNEL_LAYOUT_5POINT1_BACK,
 };
 
 static void read_id3(AVFormatContext *s, uint64_t id3pos)
@@ -70,6 +71,7 @@ static int dsf_read_header(AVFormatContext *s)
     AVStream *st;
     uint64_t id3pos;
     unsigned int channel_type;
+    int channels;
 
     avio_skip(pb, 4);
     if (avio_rl64(pb) != 28)
@@ -104,15 +106,21 @@ static int dsf_read_header(AVFormatContext *s)
 
     channel_type = avio_rl32(pb);
     if (channel_type < FF_ARRAY_ELEMS(dsf_channel_layout))
-        st->codecpar->channel_layout = dsf_channel_layout[channel_type];
-    if (!st->codecpar->channel_layout)
+        st->codecpar->ch_layout = dsf_channel_layout[channel_type];
+    if (!st->codecpar->ch_layout.nb_channels)
         avpriv_request_sample(s, "channel type %i", channel_type);
 
     st->codecpar->codec_type   = AVMEDIA_TYPE_AUDIO;
-    st->codecpar->channels     = avio_rl32(pb);
+    channels = avio_rl32(pb);
+    if (!st->codecpar->ch_layout.nb_channels) {
+        st->codecpar->ch_layout.nb_channels = channels;
+    } else if (channels != st->codecpar->ch_layout.nb_channels) {
+        av_log(s, AV_LOG_ERROR, "Channel count mismatch\n");
+        return AVERROR(EINVAL);
+    }
     st->codecpar->sample_rate  = avio_rl32(pb) / 8;
 
-    if (st->codecpar->channels <= 0)
+    if (st->codecpar->ch_layout.nb_channels <= 0)
         return AVERROR_INVALIDDATA;
 
     switch(avio_rl32(pb)) {
@@ -123,14 +131,15 @@ static int dsf_read_header(AVFormatContext *s)
         return AVERROR_INVALIDDATA;
     }
 
-    dsf->audio_size = avio_rl64(pb) / 8 * st->codecpar->channels;
+    dsf->audio_size = avio_rl64(pb) / 8 * st->codecpar->ch_layout.nb_channels;
     st->codecpar->block_align = avio_rl32(pb);
-    if (st->codecpar->block_align > INT_MAX / st->codecpar->channels || st->codecpar->block_align <= 0) {
+    if (st->codecpar->block_align > INT_MAX / st->codecpar->ch_layout.nb_channels ||
+        st->codecpar->block_align <= 0) {
         avpriv_request_sample(s, "block_align invalid");
         return AVERROR_INVALIDDATA;
     }
-    st->codecpar->block_align *= st->codecpar->channels;
-    st->codecpar->bit_rate = st->codecpar->channels * 8LL * st->codecpar->sample_rate;
+    st->codecpar->block_align *= st->codecpar->ch_layout.nb_channels;
+    st->codecpar->bit_rate = st->codecpar->ch_layout.nb_channels * 8LL * st->codecpar->sample_rate;
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
     avio_skip(pb, 4);
 
@@ -152,6 +161,7 @@ static int dsf_read_packet(AVFormatContext *s, AVPacket *pkt)
     AVIOContext *pb = s->pb;
     AVStream *st = s->streams[0];
     int64_t pos = avio_tell(pb);
+    int channels = st->codecpar->ch_layout.nb_channels;
     int ret;
 
     if (pos >= dsf->data_end)
@@ -165,7 +175,7 @@ static int dsf_read_packet(AVFormatContext *s, AVPacket *pkt)
             int64_t packet_size = dsf->audio_size - data_pos;
             int64_t skip_size = dsf->data_size - data_pos - packet_size;
             uint8_t *dst;
-            int ch, ret;
+            int ch;
 
             if (packet_size <= 0 || skip_size <= 0)
                 return AVERROR_INVALIDDATA;
@@ -173,19 +183,19 @@ static int dsf_read_packet(AVFormatContext *s, AVPacket *pkt)
             if ((ret = av_new_packet(pkt, packet_size)) < 0)
                 return ret;
             dst = pkt->data;
-            for (ch = 0; ch < st->codecpar->channels; ch++) {
-                ret = avio_read(pb, dst,  packet_size / st->codecpar->channels);
-                if (ret < packet_size / st->codecpar->channels)
+            for (ch = 0; ch < st->codecpar->ch_layout.nb_channels; ch++) {
+                ret = avio_read(pb, dst,  packet_size / st->codecpar->ch_layout.nb_channels);
+                if (ret < packet_size / st->codecpar->ch_layout.nb_channels)
                     return AVERROR_EOF;
 
                 dst += ret;
-                avio_skip(pb, skip_size / st->codecpar->channels);
+                avio_skip(pb, skip_size / st->codecpar->ch_layout.nb_channels);
             }
 
             pkt->pos = pos;
             pkt->stream_index = 0;
-            pkt->pts = (pos - si->data_offset) / st->codecpar->channels;
-            pkt->duration = packet_size / st->codecpar->channels;
+            pkt->pts = (pos - si->data_offset) / channels;
+            pkt->duration = packet_size / channels;
             return 0;
         }
     }
@@ -194,18 +204,18 @@ static int dsf_read_packet(AVFormatContext *s, AVPacket *pkt)
         return ret;
 
     pkt->stream_index = 0;
-    pkt->pts = (pos - si->data_offset) / st->codecpar->channels;
-    pkt->duration = st->codecpar->block_align / st->codecpar->channels;
+    pkt->pts = (pos - si->data_offset) / channels;
+    pkt->duration = st->codecpar->block_align / channels;
 
     return 0;
 }
 
-const AVInputFormat ff_dsf_demuxer = {
-    .name           = "dsf",
-    .long_name      = NULL_IF_CONFIG_SMALL("DSD Stream File (DSF)"),
+const FFInputFormat ff_dsf_demuxer = {
+    .p.name         = "dsf",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("DSD Stream File (DSF)"),
+    .p.flags        = AVFMT_GENERIC_INDEX | AVFMT_NO_BYTE_SEEK,
     .priv_data_size = sizeof(DSFContext),
     .read_probe     = dsf_probe,
     .read_header    = dsf_read_header,
     .read_packet    = dsf_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX | AVFMT_NO_BYTE_SEEK,
 };

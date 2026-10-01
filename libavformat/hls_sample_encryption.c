@@ -26,12 +26,15 @@
  * https://developer.apple.com/library/ios/documentation/AudioVideo/Conceptual/HLS_Sample_Encryption
  */
 
+#include "libavutil/aes.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 
 #include "hls_sample_encryption.h"
 
 #include "libavcodec/adts_header.h"
 #include "libavcodec/adts_parser.h"
+#include "libavcodec/ac3tab.h"
 #include "libavcodec/ac3_parser_internal.h"
 
 
@@ -62,6 +65,7 @@ void ff_hls_senc_read_audio_setup_info(HLSAudioSetupInfo *info, const uint8_t *b
 
     info->codec_tag = AV_RL32(buf);
 
+    /* Always keep this list in sync with the one from hls_read_header() */
     if (info->codec_tag == MKTAG('z','a','a','c'))
         info->codec_id = AV_CODEC_ID_AAC;
     else if (info->codec_tag == MKTAG('z','a','c','3'))
@@ -84,6 +88,7 @@ void ff_hls_senc_read_audio_setup_info(HLSAudioSetupInfo *info, const uint8_t *b
         return;
 
     memcpy(info->setup_data, buf, info->setup_data_length);
+    memset(info->setup_data + info->setup_data_length, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 }
 
 int ff_hls_senc_parse_audio_setup_info(AVStream *st, HLSAudioSetupInfo *info)
@@ -103,19 +108,19 @@ int ff_hls_senc_parse_audio_setup_info(AVStream *st, HLSAudioSetupInfo *info)
 
         ret = avpriv_ac3_parse_header(&ac3hdr, info->setup_data, info->setup_data_length);
         if (ret < 0) {
-            if (ret != AVERROR(ENOMEM))
-                av_free(ac3hdr);
+            av_free(ac3hdr);
             return ret;
         }
 
         st->codecpar->sample_rate       = ac3hdr->sample_rate;
-        st->codecpar->channels          = ac3hdr->channels;
-        st->codecpar->channel_layout    = ac3hdr->channel_layout;
+        av_channel_layout_uninit(&st->codecpar->ch_layout);
+        av_channel_layout_from_mask(&st->codecpar->ch_layout, ac3hdr->channel_layout);
         st->codecpar->bit_rate          = ac3hdr->bit_rate;
 
         av_free(ac3hdr);
     } else {  /*  Parse 'dec3' EC3SpecificBox */
         GetBitContext gb;
+        uint64_t mask;
         int data_rate, fscod, acmod, lfeon;
 
         ret = init_get_bits8(&gb, info->setup_data, info->setup_data_length);
@@ -131,11 +136,12 @@ int ff_hls_senc_parse_audio_setup_info(AVStream *st, HLSAudioSetupInfo *info)
 
         st->codecpar->sample_rate = eac3_sample_rate_tab[fscod];
 
-        st->codecpar->channel_layout = ff_ac3_channel_layout_tab[acmod];
+        mask = ff_ac3_channel_layout_tab[acmod];
         if (lfeon)
-            st->codecpar->channel_layout |= AV_CH_LOW_FREQUENCY;
+            mask |= AV_CH_LOW_FREQUENCY;
 
-        st->codecpar->channels = av_get_channel_layout_nb_channels(st->codecpar->channel_layout);
+        av_channel_layout_uninit(&st->codecpar->ch_layout);
+        av_channel_layout_from_mask(&st->codecpar->ch_layout, mask);
 
         st->codecpar->bit_rate = data_rate*1000;
     }
@@ -313,8 +319,7 @@ static int get_next_ac3_eac3_sync_frame(CodecParserContext *ctx, AudioFrame *fra
 
     ret = avpriv_ac3_parse_header(&hdr, frame->data, ctx->buf_end - frame->data);
     if (ret < 0) {
-        if (ret != AVERROR(ENOMEM))
-            av_free(hdr);
+        av_free(hdr);
         return ret;
     }
 
@@ -369,6 +374,13 @@ static int decrypt_audio_frame(enum AVCodecID codec_id, HLSCryptoContext *crypto
         ret = get_next_sync_frame(codec_id, &ctx, &frame);
         if (ret < 0)
             return ret;
+        if (frame.length < frame.header_length ||
+            frame.length > ctx.buf_end - frame.data) {
+            av_log(NULL, AV_LOG_ERROR,
+                   "Sample-AES: declared frame length %d exceeds packet data\n",
+                   frame.length);
+            return AVERROR_INVALIDDATA;
+        }
         if (frame.length - frame.header_length > 31) {
             ret = decrypt_sync_frame(codec_id, crypto_ctx, &frame);
             if (ret < 0)

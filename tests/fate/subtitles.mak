@@ -22,12 +22,18 @@ fate-binsub-mksenc: CMD = md5pipe -i $(TARGET_SAMPLES)/sub/1ededcbd7b.ass -c cop
 FATE_SUBTITLES_ASS-$(call DEMDEC, JACOSUB, JACOSUB) += fate-sub-jacosub
 fate-sub-jacosub: CMD = fmtstdout ass -i $(TARGET_SAMPLES)/sub/JACOsub_capability_tester.jss
 
-FATE_SUBTITLES-$(call DEMMUX, JACOSUB, JACOSUB) += fate-sub-jacosub-remux
+FATE_SUBTITLES-$(call REMUX, JACOSUB) += fate-sub-jacosub-remux
 fate-sub-jacosub-remux: CMD = transcode jacosub $(TARGET_SAMPLES)/sub/JACOsub_capability_tester.jss jacosub "-map 0 -c copy" "-map 0 -c copy"
 fate-sub-jacosub-remux: CMP = diff
 
 FATE_SUBTITLES-$(call DEMMUX, LRC, LRC) += fate-sub-lrc-remux
 fate-sub-lrc-remux: CMD = fmtstdout lrc -i $(TARGET_SAMPLES)/sub/test-lrc.lrc
+
+FATE_SUBTITLES-$(call DEMMUX, LRC, LRC) += fate-sub-lrc-ms-remux
+fate-sub-lrc-ms-remux: CMD = fmtstdout lrc -i $(TARGET_SAMPLES)/sub/test-lrc-ms.lrc
+
+FATE_SUBTITLES-$(call DEMMUX, LRC, LRC) += fate-sub-lrc-ms-ms-remux
+fate-sub-lrc-ms-ms-remux: CMD = fmtstdout lrc -i $(TARGET_SAMPLES)/sub/test-lrc-ms.lrc -precision 3
 
 FATE_SUBTITLES_ASS-$(call DEMDEC, MICRODVD, MICRODVD) += fate-sub-microdvd
 fate-sub-microdvd: CMD = fmtstdout ass -i $(TARGET_SAMPLES)/sub/MicroDVD_capability_tester.sub
@@ -38,8 +44,8 @@ fate-sub-microdvd-remux: CMD = fmtstdout microdvd -i $(TARGET_SAMPLES)/sub/Micro
 FATE_SUBTITLES_ASS-$(call DEMDEC, MOV, MOVTEXT) += fate-sub-movtext
 fate-sub-movtext: CMD = fmtstdout ass -i $(TARGET_SAMPLES)/sub/MovText_capability_tester.mp4
 
-FATE_SUBTITLES-$(call ENCDEC, MOVTEXT, MOV) += fate-binsub-movtextenc
-fate-binsub-movtextenc: CMD = md5 -i $(TARGET_SAMPLES)/sub/MovText_capability_tester.mp4 -map 0 -scodec mov_text -f mp4 -flags +bitexact -fflags +bitexact -movflags frag_keyframe+empty_moov
+FATE_SUBTITLES-$(call ENCDEC, MOVTEXT, MP4 MOV) += fate-binsub-movtextenc
+fate-binsub-movtextenc: CMD = md5 -i $(TARGET_SAMPLES)/sub/MovText_capability_tester.mp4 -map 0 -scodec mov_text -f mp4 -flags +bitexact -fflags +bitexact -movflags +frag_keyframe+empty_moov
 
 FATE_SUBTITLES_ASS-$(call DEMDEC, MPL2, MPL2) += fate-sub-mpl2
 fate-sub-mpl2: CMD = fmtstdout ass -i $(TARGET_SAMPLES)/sub/MPL2_capability_tester.txt
@@ -49,6 +55,11 @@ fate-sub-mpsub: CMD = fmtstdout ass -i $(TARGET_SAMPLES)/sub/MPSub_capability_te
 
 FATE_SUBTITLES_ASS-$(call DEMDEC, MPSUB, TEXT) += fate-sub-mpsub-frames
 fate-sub-mpsub-frames: CMD = fmtstdout ass -i $(TARGET_SAMPLES)/sub/MPSub_capability_tester_frames.sub
+
+# FIXME?: The dts in the input file are not monotonous and so the
+# timestamps of the remuxed file have been fixed up.
+FATE_SUBTITLES-$(call REMUX, SUP) += fate-sub-pgs-remux
+fate-sub-pgs-remux: CMD = transcode sup $(TARGET_SAMPLES)/sub/pgs_sub.sup sup "-copyts -c:s copy" "-copyts -c:s copy"
 
 FATE_SUBTITLES_ASS-$(call DEMDEC, PJS, PJS) += fate-sub-pjs
 fate-sub-pjs: CMD = fmtstdout ass -i $(TARGET_SAMPLES)/sub/PJS_capability_tester.pjs
@@ -109,18 +120,46 @@ fate-sub-charenc: CMD = fmtstdout ass -sub_charenc cp1251 -i $(TARGET_SAMPLES)/s
 
 FATE_SUBTITLES-$(call DEMDEC, SCC, CCAPTION) += fate-sub-scc
 fate-sub-scc: CMD = fmtstdout ass -ss 57 -i $(TARGET_SAMPLES)/sub/witch.scc
+fate-sub-scc: CMP = diff
 
 FATE_SUBTITLES-$(call DEMMUX, SCC, SCC) += fate-sub-scc-remux
 fate-sub-scc-remux: CMD = fmtstdout scc -i $(TARGET_SAMPLES)/sub/witch.scc -ss 4:00 -map 0 -c copy
 
-FATE_SUBTITLES-$(call ALLYES, MPEGTS_DEMUXER DVBSUB_DECODER DVBSUB_ENCODER) += fate-sub-dvb
+FATE_SUBTITLES-$(call DEMMUX, SCC, RCWT) += fate-sub-rcwt
+fate-sub-rcwt: CMD = md5 -i $(TARGET_SAMPLES)/sub/witch.scc -map 0 -c copy -f rcwt
+fate-sub-rcwt: CMP = oneline
+fate-sub-rcwt: REF = d86f179094a5752d68aa97d82cf887b0
+
+FATE_SUBTITLES-$(call ALLYES, AVDEVICE LAVFI_INDEV MOVIE_FILTER MPEGTS_DEMUXER MCC_MUXER EIA608_TO_SMPTE436M_BSF) += fate-sub-mcc
+fate-sub-mcc: CMD = md5 -f lavfi -i "movie=$(TARGET_SAMPLES)/sub/scte20.ts[out0+subcc]" -map 0:s -c copy -override_time_code_rate ntsc -creation_time "1970-01-02T00:00:00" -bitexact -f mcc
+fate-sub-mcc: CMP = oneline
+fate-sub-mcc: REF = 73982c4db86f3a809c1e8262d3701fc2
+
+FATE_SUBTITLES-$(call DEMMUX, MCC, MCC, SMPTE436M_TO_EIA608_BSF EIA608_TO_SMPTE436M_BSF) += fate-sub-mcc-remux-eia608-bsf
+fate-sub-mcc-remux-eia608-bsf: CMD = fmtstdout mcc -f mcc -i $(SRC_PATH)/tests/ref/fate/sub-mcc-remux -map 0:s -c copy -bsf "eia608_to_smpte436m=cdp_frame_rate=60000/1001:initial_cdp_sequence_cntr=65535:line_number=11" -override_time_code_rate ntsc -creation_time "1970-01-02T00:00:00"
+fate-sub-mcc-remux-eia608-bsf: CMP = rawdiff
+
+FATE_SUBTITLES-$(call DEMMUX, MCC, MCC, SMPTE436M_TO_EIA608_BSF EIA608_TO_SMPTE436M_BSF) += fate-sub-mcc-remux-eia608
+fate-sub-mcc-remux-eia608: CMD = fmtstdout mcc -f mcc -i $(SRC_PATH)/tests/ref/fate/sub-mcc-remux -map 0:s -c copy -override_time_code_rate ntsc -creation_time "1970-01-02T00:00:00"
+fate-sub-mcc-remux-eia608: CMP = rawdiff
+
+FATE_SUBTITLES-$(call DEMMUX, MCC, MCC, SMPTE436M_TO_EIA608_BSF EIA608_TO_SMPTE436M_BSF) += fate-sub-mcc-remux-eia608-recode
+fate-sub-mcc-remux-eia608-recode: CMD = fmtstdout mcc -eia608_extract 0 -f mcc -i $(SRC_PATH)/tests/ref/fate/sub-mcc-remux -map 0:d -c copy -bsf smpte436m_to_eia608 -override_time_code_rate ntsc -creation_time "1970-01-02T00:00:00"
+fate-sub-mcc-remux-eia608-recode: CMP = rawdiff
+
+FATE_SUBTITLES-$(call DEMMUX, MCC, MCC) += fate-sub-mcc-remux
+fate-sub-mcc-remux: CMD = fmtstdout mcc -eia608_extract 0 -f mcc -i $(SRC_PATH)/tests/ref/fate/sub-mcc-remux -map 0:d -c copy -override_time_code_rate ntsc -creation_time "1970-01-02T00:00:00"
+fate-sub-mcc-remux: CMP = rawdiff
+
+FATE_SUBTITLES-$(call FRAMECRC, MPEGTS, DVBSUB, DVBSUB_ENCODER) += fate-sub-dvb
 fate-sub-dvb: CMD = framecrc -i $(TARGET_SAMPLES)/sub/dvbsubtest_filter.ts -map s:0 -c dvbsub
 
-FATE_SUBTITLES-$(call ALLYES, FILE_PROTOCOL PIPE_PROTOCOL SRT_DEMUXER SUBRIP_DECODER TTML_ENCODER TTML_MUXER) += fate-sub-ttmlenc
+FATE_SUBTITLES-$(call ALLYES, PIPE_PROTOCOL SRT_DEMUXER SUBRIP_DECODER TTML_ENCODER TTML_MUXER) += fate-sub-ttmlenc
 fate-sub-ttmlenc: CMD = fmtstdout ttml -i $(TARGET_SAMPLES)/sub/SubRip_capability_tester.srt
 
 FATE_SUBTITLES-$(call ENCMUX, ASS, ASS) += $(FATE_SUBTITLES_ASS-yes)
 FATE_SUBTITLES += $(FATE_SUBTITLES-yes)
+FATE_SUBTITLES := $(if $(CONFIG_PIPE_PROTOCOL), $(FATE_SUBTITLES))
 
 fate-sub-%: CMP = rawdiff
 

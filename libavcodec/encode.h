@@ -27,6 +27,12 @@
 #include "packet.h"
 
 /**
+ * Used by some encoders as upper bound for the length of headers.
+ * TODO: Use proper codec-specific upper bounds.
+ */
+#define FF_INPUT_BUFFER_MIN_SIZE 16384
+
+/**
  * Called by encoders to get the next frame for encoding.
  *
  * @param frame An empty frame to be filled with data.
@@ -45,9 +51,14 @@ int ff_encode_get_frame(AVCodecContext *avctx, AVFrame *frame);
 int ff_get_encode_buffer(AVCodecContext *avctx, AVPacket *avpkt, int64_t size, int flags);
 
 /**
+ * Allocate buffers for a frame. Encoder equivalent to ff_get_buffer().
+ */
+int ff_encode_alloc_frame(AVCodecContext *avctx, AVFrame *frame);
+
+/**
  * Check AVPacket size and allocate data.
  *
- * Encoders supporting AVCodec.encode2() can use this as a convenience to
+ * Encoders of type FF_CODEC_CB_TYPE_ENCODE can use this as a convenience to
  * obtain a big enough buffer for the encoded bitstream.
  *
  * @param avctx   the AVCodecContext of the encoder
@@ -59,10 +70,54 @@ int ff_get_encode_buffer(AVCodecContext *avctx, AVPacket *avpkt, int64_t size, i
  */
 int ff_alloc_packet(AVCodecContext *avctx, AVPacket *avpkt, int64_t size);
 
-/*
- * Perform encoder initialization and validation.
- * Called when opening the encoder, before the AVCodec.init() call.
+/**
+ * Propagate user opaque values from the frame to avctx/pkt as needed.
  */
-int ff_encode_preinit(AVCodecContext *avctx);
+int ff_encode_reordered_opaque(AVCodecContext *avctx,
+                               AVPacket *pkt, const AVFrame *frame);
+
+int ff_encode_encode_cb(AVCodecContext *avctx, AVPacket *avpkt,
+                        AVFrame *frame, int *got_packet);
+
+/**
+ * Add a CPB properties side data to an encoding context.
+ */
+AVCPBProperties *ff_encode_add_cpb_side_data(AVCodecContext *avctx);
+
+int ff_encode_add_stats_side_data(AVPacket *pkt, int quality, const int64_t error[],
+                                  int error_count, enum AVPictureType pict_type);
+
+/**
+ * Rescale from sample rate to AVCodecContext.time_base.
+ */
+static av_always_inline int64_t ff_samples_to_time_base(const AVCodecContext *avctx,
+                                                        int64_t samples)
+{
+    if (samples == AV_NOPTS_VALUE)
+        return AV_NOPTS_VALUE;
+    return av_rescale_q(samples, (AVRational){ 1, avctx->sample_rate },
+                        avctx->time_base);
+}
+
+/**
+ * Rescale from time base to AVCodecContext.sample_rate.
+ */
+static av_always_inline int64_t ff_samples_from_time_base(const AVCodecContext *avctx,
+                                                          int64_t duration)
+{
+    if (!duration)
+        return duration;
+    return av_rescale_q(duration, avctx->time_base,
+                        (AVRational){ 1, avctx->sample_rate });
+}
+
+/**
+ * Check if the elements of codec context matrices (intra_matrix, inter_matrix or
+ * chroma_intra_matrix) are within the specified range.
+ */
+#define FF_MATRIX_TYPE_INTRA        (1U << 0)
+#define FF_MATRIX_TYPE_INTER        (1U << 1)
+#define FF_MATRIX_TYPE_CHROMA_INTRA (1U << 2)
+int ff_check_codec_matrices(AVCodecContext *avctx, unsigned types, uint16_t min, uint16_t max);
 
 #endif /* AVCODEC_ENCODE_H */

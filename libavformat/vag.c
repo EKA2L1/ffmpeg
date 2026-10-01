@@ -21,6 +21,7 @@
 
 #include "libavutil/channel_layout.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 static int vag_probe(const AVProbeData *p)
@@ -42,9 +43,9 @@ static int vag_read_header(AVFormatContext *s)
     avio_skip(s->pb, 4);
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id    = AV_CODEC_ID_ADPCM_PSX;
-    st->codecpar->channels    = 1 + (avio_rb32(s->pb) == 0x00000004);
+    st->codecpar->ch_layout.nb_channels = 1 + (avio_rb32(s->pb) == 0x00000004);
     avio_skip(s->pb, 4);
-    if (st->codecpar->channels > 1) {
+    if (st->codecpar->ch_layout.nb_channels > 1) {
         st->duration       = avio_rb32(s->pb);
     } else {
         st->duration       = avio_rb32(s->pb) / 16 * 28;
@@ -54,12 +55,12 @@ static int vag_read_header(AVFormatContext *s)
         return AVERROR_INVALIDDATA;
     avio_seek(s->pb, 0x1000, SEEK_SET);
     if (avio_rl32(s->pb) == MKTAG('V','A','G','p')) {
-        st->codecpar->block_align = 0x1000 * st->codecpar->channels;
+        st->codecpar->block_align = 0x1000 * st->codecpar->ch_layout.nb_channels;
         avio_seek(s->pb, 0, SEEK_SET);
         st->duration = st->duration / 16 * 28;
     } else {
-        st->codecpar->block_align = 16 * st->codecpar->channels;
-        avio_seek(s->pb, st->codecpar->channels > 1 ? 0x80 : 0x30, SEEK_SET);
+        st->codecpar->block_align = 16 * st->codecpar->ch_layout.nb_channels;
+        avio_seek(s->pb, st->codecpar->ch_layout.nb_channels > 1 ? 0x80 : 0x30, SEEK_SET);
     }
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
 
@@ -73,11 +74,11 @@ static int vag_read_packet(AVFormatContext *s, AVPacket *pkt)
     return av_get_packet(s->pb, pkt, par->block_align);
 }
 
-const AVInputFormat ff_vag_demuxer = {
-    .name           = "vag",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sony PS2 VAG"),
+const FFInputFormat ff_vag_demuxer = {
+    .p.name         = "vag",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Sony PS2 VAG"),
+    .p.extensions   = "vag",
     .read_probe     = vag_probe,
     .read_header    = vag_read_header,
     .read_packet    = vag_read_packet,
-    .extensions     = "vag",
 };

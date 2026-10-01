@@ -22,6 +22,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavcodec/internal.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 static int probe(const AVProbeData *p)
@@ -55,15 +56,16 @@ static int read_header(AVFormatContext *s)
     avio_rl32(s->pb);
     avio_rl32(s->pb);
     st->codecpar->sample_rate = avio_rl32(s->pb);
-    st->codecpar->channels    = avio_rl32(s->pb);
-    if (st->codecpar->channels > FF_SANE_NB_CHANNELS || st->codecpar->channels <= 0)
+    st->codecpar->ch_layout.nb_channels    = avio_rl32(s->pb);
+    if (st->codecpar->ch_layout.nb_channels > FF_SANE_NB_CHANNELS ||
+        st->codecpar->ch_layout.nb_channels <= 0)
         return AVERROR(ENOSYS);
     ffformatcontext(s)->data_offset = data_offset = avio_rl32(s->pb);
     avio_r8(s->pb);
     st->codecpar->block_align = avio_rl32(s->pb);
     if (st->codecpar->block_align > INT_MAX / FF_SANE_NB_CHANNELS || st->codecpar->block_align <= 0)
         return AVERROR_INVALIDDATA;
-    st->codecpar->block_align *= st->codecpar->channels;
+    st->codecpar->block_align *= st->codecpar->ch_layout.nb_channels;
 
     avio_seek(s->pb, data_offset, SEEK_SET);
 
@@ -77,11 +79,11 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     return av_get_packet(s->pb, pkt, st->codecpar->block_align);
 }
 
-const AVInputFormat ff_boa_demuxer = {
-    .name           = "boa",
-    .long_name      = NULL_IF_CONFIG_SMALL("Black Ops Audio"),
+const FFInputFormat ff_boa_demuxer = {
+    .p.name         = "boa",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Black Ops Audio"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe     = probe,
     .read_header    = read_header,
     .read_packet    = read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
 };

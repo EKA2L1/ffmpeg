@@ -24,7 +24,6 @@
 SECTION_RODATA
 
 max_19bit_int: times 4 dd 0x7ffff
-max_19bit_flt: times 4 dd 524287.0
 minshort:      times 8 dw 0x8000
 unicoeff:      times 4 dd 0x20000000
 
@@ -34,7 +33,7 @@ SECTION .text
 ; horizontal line scaling
 ;
 ; void hscale<source_width>to<intermediate_nbits>_<filterSize>_<opt>
-;                               (SwsContext *c, int{16,32}_t *dst,
+;                               (SwsInternal *c, int{16,32}_t *dst,
 ;                                int dstW, const uint{8,16}_t *src,
 ;                                const int16_t *filter,
 ;                                const int32_t *filterPos, int filterSize);
@@ -61,13 +60,7 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
 %define mov32 mov
 %endif ; x86-64
 %if %2 == 19
-%if mmsize == 8 ; mmx
     mova          m2, [max_19bit_int]
-%elif cpuflag(sse4)
-    mova          m2, [max_19bit_int]
-%else ; ssse3/sse2
-    mova          m2, [max_19bit_flt]
-%endif ; mmx/sse2/ssse3/sse4
 %endif ; %2 == 19
 %if %1 == 16
     mova          m6, [minshort]
@@ -110,9 +103,6 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
     mov32      pos0q, dword [fltposq+wq*4+ 0]   ; filterPos[0]
     mov32      pos1q, dword [fltposq+wq*4+ 4]   ; filterPos[1]
     movlh         m0, [srcq+pos0q*srcmul]       ; src[filterPos[0] + {0,1,2,3}]
-%if mmsize == 8
-    movlh         m1, [srcq+pos1q*srcmul]       ; src[filterPos[1] + {0,1,2,3}]
-%else ; mmsize == 16
 %if %1 > 8
     movhps        m0, [srcq+pos1q*srcmul]       ; src[filterPos[1] + {0,1,2,3}]
 %else ; %1 == 8
@@ -128,7 +118,6 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
     punpckldq     m0, m4
     punpckldq     m1, m5
 %endif ; %1 == 8
-%endif ; mmsize == 8/16
 %if %1 == 8
     punpcklbw     m0, m3                        ; byte -> word
     punpcklbw     m1, m3                        ; byte -> word
@@ -144,12 +133,7 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
     pmaddwd       m1, [filterq+wq*8+mmsize*1]   ; *= filter[{8,9,..,14,15}]
 
     ; add up horizontally (4 srcpix * 4 coefficients -> 1 dstpix)
-%if mmsize == 8 ; mmx
-    movq          m4, m0
-    punpckldq     m0, m1
-    punpckhdq     m4, m1
-    paddd         m0, m4
-%elif notcpuflag(ssse3) ; sse2
+%if notcpuflag(ssse3) ; sse2
     mova          m4, m0
     shufps        m0, m1, 10001000b
     shufps        m4, m1, 11011101b
@@ -159,23 +143,17 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
                                                 ; filter[{ 4, 5, 6, 7}]*src[filterPos[1]+{0,1,2,3}],
                                                 ; filter[{ 8, 9,10,11}]*src[filterPos[2]+{0,1,2,3}],
                                                 ; filter[{12,13,14,15}]*src[filterPos[3]+{0,1,2,3}]
-%endif ; mmx/sse2/ssse3/sse4
+%endif ; sse2/ssse3/sse4
 %else ; %3 == 8, i.e. filterSize == 8 scaling
     ; load 2x8 or 4x8 source pixels into m0, m1, m4 and m5
     mov32      pos0q, dword [fltposq+wq*2+0]    ; filterPos[0]
     mov32      pos1q, dword [fltposq+wq*2+4]    ; filterPos[1]
     movbh         m0, [srcq+ pos0q   *srcmul]   ; src[filterPos[0] + {0,1,2,3,4,5,6,7}]
-%if mmsize == 8
-    movbh         m1, [srcq+(pos0q+4)*srcmul]   ; src[filterPos[0] + {4,5,6,7}]
-    movbh         m4, [srcq+ pos1q   *srcmul]   ; src[filterPos[1] + {0,1,2,3}]
-    movbh         m5, [srcq+(pos1q+4)*srcmul]   ; src[filterPos[1] + {4,5,6,7}]
-%else ; mmsize == 16
     movbh         m1, [srcq+ pos1q   *srcmul]   ; src[filterPos[1] + {0,1,2,3,4,5,6,7}]
     mov32      pos0q, dword [fltposq+wq*2+8]    ; filterPos[2]
     mov32      pos1q, dword [fltposq+wq*2+12]   ; filterPos[3]
     movbh         m4, [srcq+ pos0q   *srcmul]   ; src[filterPos[2] + {0,1,2,3,4,5,6,7}]
     movbh         m5, [srcq+ pos1q   *srcmul]   ; src[filterPos[3] + {0,1,2,3,4,5,6,7}]
-%endif ; mmsize == 8/16
 %if %1 == 8
     punpcklbw     m0, m3                        ; byte -> word
     punpcklbw     m1, m3                        ; byte -> word
@@ -197,14 +175,7 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
     pmaddwd       m5, [filterq+wq*8+mmsize*3]   ; *= filter[{24,25,..,30,31}]
 
     ; add up horizontally (8 srcpix * 8 coefficients -> 1 dstpix)
-%if mmsize == 8
-    paddd         m0, m1
-    paddd         m4, m5
-    movq          m1, m0
-    punpckldq     m0, m4
-    punpckhdq     m1, m4
-    paddd         m0, m1
-%elif notcpuflag(ssse3) ; sse2
+%if notcpuflag(ssse3) ; sse2
 %if %1 == 8
 %define mex m6
 %else
@@ -233,7 +204,7 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
                                                 ; filter[{ 8, 9,...,14,15}]*src[filterPos[1]+{0,1,...,6,7}],
                                                 ; filter[{16,17,...,22,23}]*src[filterPos[2]+{0,1,...,6,7}],
                                                 ; filter[{24,25,...,30,31}]*src[filterPos[3]+{0,1,...,6,7}]
-%endif ; mmx/sse2/ssse3/sse4
+%endif ; sse2/ssse3/sse4
 %endif ; %3 == 4/8
 
 %else ; %3 == X, i.e. any filterSize scaling
@@ -274,7 +245,7 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
     mov         srcq, srcmemmp
 
 .innerloop:
-    ; load 2x4 (mmx) or 2x8 (sse) source pixels into m0/m1 -> m4/m5
+    ; load 2x8 (sse) source pixels into m0/m1 -> m4/m5
     movbh         m0, [srcq+ pos0q     *srcmul] ; src[filterPos[0] + {0,1,2,3(,4,5,6,7)}]
     movbh         m1, [srcq+(pos1q+dlt)*srcmul] ; src[filterPos[1] + {0,1,2,3(,4,5,6,7)}]
 %if %1 == 8
@@ -319,12 +290,6 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
 
     lea      filterq, [filterq+(fltsizeq+dlt)*2]
 
-%if mmsize == 8 ; mmx
-    movq          m0, m4
-    punpckldq     m4, m5
-    punpckhdq     m0, m5
-    paddd         m0, m4
-%else ; mmsize == 16
 %if notcpuflag(ssse3) ; sse2
     mova          m1, m4
     punpcklqdq    m4, m5
@@ -344,7 +309,6 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
     phaddd        m4, m4
     SWAP           0, 4
 %endif ; sse2/ssse3/sse4
-%endif ; mmsize == 8/16
 %endif ; %3 ==/!= X
 
 %if %1 == 16 ; add 0x8000 * sum(coeffs), i.e. back from signed -> unsigned
@@ -372,25 +336,21 @@ cglobal hscale%1to%2_%4, %5, 10, %6, pos0, dst, w, srcmem, filter, fltpos, fltsi
 %endif ; %3 ==/!= X
 %endif ; %2 == 15/19
 %ifnidn %3, X
-    add           wq, (mmsize<<wshr)/4          ; both 8tap and 4tap really only do 4 pixels (or for mmx: 2 pixels)
+    add           wq, (mmsize<<wshr)/4          ; both 8tap and 4tap really only do 4 pixels
                                                 ; per iteration. see "shl wq,1" above as for why we do this
 %else ; %3 == X
     add           wq, 2
 %endif ; %3 ==/!= X
     jl .loop
-    REP_RET
+    RET
 %endmacro
 
 ; SCALE_FUNCS source_width, intermediate_nbits, n_xmm
 %macro SCALE_FUNCS 3
 SCALE_FUNC %1, %2, 4, 4,  6, %3
 SCALE_FUNC %1, %2, 8, 8,  6, %3
-%if mmsize == 8
-SCALE_FUNC %1, %2, X, X,  7, %3
-%else
 SCALE_FUNC %1, %2, X, X4, 7, %3
 SCALE_FUNC %1, %2, X, X8, 7, %3
-%endif
 %endmacro
 
 ; SCALE_FUNCS2 8_xmm_args, 9to10_xmm_args, 16_xmm_args
@@ -411,10 +371,6 @@ SCALE_FUNCS 14, 19, %2
 SCALE_FUNCS 16, 19, %3
 %endmacro
 
-%if ARCH_X86_32
-INIT_MMX mmx
-SCALE_FUNCS2 0, 0, 0
-%endif
 INIT_XMM sse2
 SCALE_FUNCS2 7, 6, 8
 INIT_XMM ssse3

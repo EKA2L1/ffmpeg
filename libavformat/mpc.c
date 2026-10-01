@@ -20,8 +20,10 @@
  */
 
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "apetag.h"
 #include "id3v1.h"
@@ -95,8 +97,7 @@ static int mpc_read_header(AVFormatContext *s)
 
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id = AV_CODEC_ID_MUSEPACK7;
-    st->codecpar->channels = 2;
-    st->codecpar->channel_layout = AV_CH_LAYOUT_STEREO;
+    st->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
     st->codecpar->bits_per_coded_sample = 16;
 
     if ((ret = ff_get_extradata(s, st->codecpar, s->pb, 16)) < 0)
@@ -111,7 +112,7 @@ static int mpc_read_header(AVFormatContext *s)
     if (s->pb->seekable & AVIO_SEEKABLE_NORMAL) {
         int64_t pos = avio_tell(s->pb);
         ff_ape_parse_tag(s);
-        if (!av_dict_get(s->metadata, "", NULL, AV_DICT_IGNORE_SUFFIX))
+        if (av_dict_count(s->metadata) == 0)
             ff_id3v1_read(s);
         avio_seek(s->pb, pos, SEEK_SET);
     }
@@ -170,7 +171,7 @@ static int mpc_read_packet(AVFormatContext *s, AVPacket *pkt)
     if(c->curbits)
         avio_seek(s->pb, -4, SEEK_CUR);
     if(ret < size){
-        return ret < 0 ? ret : AVERROR(EIO);
+        return ret < 0 ? ret : AVERROR_INVALIDDATA;
     }
     pkt->size = ret + 4;
 
@@ -219,13 +220,13 @@ static int mpc_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp
 }
 
 
-const AVInputFormat ff_mpc_demuxer = {
-    .name           = "mpc",
-    .long_name      = NULL_IF_CONFIG_SMALL("Musepack"),
+const FFInputFormat ff_mpc_demuxer = {
+    .p.name         = "mpc",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Musepack"),
+    .p.extensions   = "mpc",
     .priv_data_size = sizeof(MPCContext),
     .read_probe     = mpc_probe,
     .read_header    = mpc_read_header,
     .read_packet    = mpc_read_packet,
     .read_seek      = mpc_read_seek,
-    .extensions     = "mpc",
 };

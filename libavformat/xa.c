@@ -29,6 +29,7 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define XA00_TAG MKTAG('X', 'A', 0, 0)
@@ -78,16 +79,16 @@ static int xa_read_header(AVFormatContext *s)
     avio_skip(pb, 4);       /* Skip the XA ID */
     xa->out_size            =  avio_rl32(pb);
     avio_skip(pb, 2);       /* Skip the tag */
-    st->codecpar->channels     = avio_rl16(pb);
+    st->codecpar->ch_layout.nb_channels = avio_rl16(pb);
     st->codecpar->sample_rate  = avio_rl32(pb);
     avio_skip(pb, 4);       /* Skip average byte rate */
     avio_skip(pb, 2);       /* Skip block align */
     avio_skip(pb, 2);       /* Skip bits-per-sample */
 
-    if (!st->codecpar->channels || !st->codecpar->sample_rate)
+    if (!st->codecpar->ch_layout.nb_channels || !st->codecpar->sample_rate)
         return AVERROR_INVALIDDATA;
 
-    st->codecpar->bit_rate = av_clip(15LL * st->codecpar->channels * 8 *
+    st->codecpar->bit_rate = av_clip(15LL * st->codecpar->ch_layout.nb_channels * 8 *
                                   st->codecpar->sample_rate / 28, 0, INT_MAX);
 
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
@@ -108,7 +109,7 @@ static int xa_read_packet(AVFormatContext *s,
     if (xa->sent_bytes >= xa->out_size)
         return AVERROR_EOF;
     /* 1 byte header and 14 bytes worth of samples * number channels per block */
-    packet_size = 15*st->codecpar->channels;
+    packet_size = 15*st->codecpar->ch_layout.nb_channels;
 
     ret = av_get_packet(pb, pkt, packet_size);
     if(ret < 0)
@@ -121,9 +122,9 @@ static int xa_read_packet(AVFormatContext *s,
     return ret;
 }
 
-const AVInputFormat ff_xa_demuxer = {
-    .name           = "xa",
-    .long_name      = NULL_IF_CONFIG_SMALL("Maxis XA"),
+const FFInputFormat ff_xa_demuxer = {
+    .p.name         = "xa",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Maxis XA"),
     .priv_data_size = sizeof(MaxisXADemuxContext),
     .read_probe     = xa_probe,
     .read_header    = xa_read_header,

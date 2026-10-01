@@ -23,14 +23,17 @@
  * send commands filter
  */
 
+#include "config_components.h"
+
 #include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/eval.h"
 #include "libavutil/file.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "audio.h"
 #include "video.h"
 
@@ -41,22 +44,24 @@
 static const char *const var_names[] = {
     "N",     /* frame number */
     "T",     /* frame time in seconds */
-    "POS",   /* original position in the file of the frame */
     "PTS",   /* frame pts */
     "TS",    /* interval start time in seconds */
     "TE",    /* interval end time in seconds */
     "TI",    /* interval interpolated value: TI = (T - TS) / (TE - TS) */
+    "W",     /* width for video frames */
+    "H",     /* height for video frames */
     NULL
 };
 
 enum var_name {
     VAR_N,
     VAR_T,
-    VAR_POS,
     VAR_PTS,
     VAR_TS,
     VAR_TE,
     VAR_TI,
+    VAR_W,
+    VAR_H,
     VAR_VARS_NB
 };
 
@@ -132,6 +137,18 @@ static void skip_comments(const char **buf)
 }
 
 #define COMMAND_DELIMS " \f\t\n\r,;"
+
+/**
+ * Clears fields and frees the buffers used by @p cmd
+ */
+static void clear_command(Command *cmd)
+{
+    cmd->flags = 0;
+    cmd->index = 0;
+    av_freep(&cmd->target);
+    av_freep(&cmd->command);
+    av_freep(&cmd->arg);
+}
 
 static int parse_command(Command *cmd, int cmd_count, int interval_count,
                          const char **buf, void *log_ctx)
@@ -212,9 +229,7 @@ static int parse_command(Command *cmd, int cmd_count, int interval_count,
     return 1;
 
 fail:
-    av_freep(&cmd->target);
-    av_freep(&cmd->command);
-    av_freep(&cmd->arg);
+    clear_command(cmd);
     return ret;
 }
 
@@ -242,6 +257,7 @@ static int parse_commands(Command **cmds, int *nb_cmds, int interval_count,
             if (!*cmds) {
                 av_log(log_ctx, AV_LOG_ERROR,
                        "Could not (re)allocate command array\n");
+                clear_command(&cmd);
                 return AVERROR(ENOMEM);
             }
         }
@@ -466,9 +482,7 @@ static av_cold void uninit(AVFilterContext *ctx)
         Interval *interval = &s->intervals[i];
         for (j = 0; j < interval->nb_commands; j++) {
             Command *cmd = &interval->commands[j];
-            av_freep(&cmd->target);
-            av_freep(&cmd->command);
-            av_freep(&cmd->arg);
+            clear_command(cmd);
         }
         av_freep(&interval->commands);
     }
@@ -477,6 +491,7 @@ static av_cold void uninit(AVFilterContext *ctx)
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *ref)
 {
+    FilterLink *inl = ff_filter_link(inlink);
     AVFilterContext *ctx = inlink->dst;
     SendCmdContext *s = ctx->priv;
     int64_t ts;
@@ -524,13 +539,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *ref)
                         double end = TS2T(interval->end_ts, AV_TIME_BASE_Q);
                         double current = TS2T(ref->pts, inlink->time_base);
 
-                        var_values[VAR_N]   = inlink->frame_count_in;
-                        var_values[VAR_POS] = ref->pkt_pos == -1 ? NAN : ref->pkt_pos;
+                        var_values[VAR_N]   = inl->frame_count_in;
                         var_values[VAR_PTS] = TS2D(ref->pts);
                         var_values[VAR_T]   = current;
                         var_values[VAR_TS]  = start;
                         var_values[VAR_TE]  = end;
                         var_values[VAR_TI]  = (current - start) / (end - start);
+                        var_values[VAR_W]   = ref->width;
+                        var_values[VAR_H]   = ref->height;
 
                         if ((ret = av_expr_parse_and_eval(&res, cmd->arg, var_names, var_values,
                                                           NULL, NULL, NULL, NULL, NULL, 0, NULL)) < 0) {
@@ -548,7 +564,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *ref)
                     av_log(ctx, AV_LOG_VERBOSE,
                            "Processing command #%d target:%s command:%s arg:%s\n",
                            cmd->index, cmd->target, cmd->command, cmd_arg);
-                    ret = avfilter_graph_send_command(inlink->graph,
+                    ret = avfilter_graph_send_command(inl->graph,
                                                       cmd->target, cmd->command, cmd_arg,
                                                       buf, sizeof(buf),
                                                       AVFILTER_CMD_FLAG_ONE);
@@ -584,23 +600,16 @@ static const AVFilterPad sendcmd_inputs[] = {
     },
 };
 
-static const AVFilterPad sendcmd_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_sendcmd = {
-    .name        = "sendcmd",
-    .description = NULL_IF_CONFIG_SMALL("Send commands to filters."),
+const FFFilter ff_vf_sendcmd = {
+    .p.name        = "sendcmd",
+    .p.description = NULL_IF_CONFIG_SMALL("Send commands to filters."),
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
+    .p.priv_class  = &sendcmd_class,
     .init        = init,
     .uninit      = uninit,
     .priv_size   = sizeof(SendCmdContext),
-    .flags       = AVFILTER_FLAG_METADATA_ONLY,
     FILTER_INPUTS(sendcmd_inputs),
-    FILTER_OUTPUTS(sendcmd_outputs),
-    .priv_class  = &sendcmd_class,
+    FILTER_OUTPUTS(ff_video_default_filterpad),
 };
 
 #endif
@@ -615,23 +624,16 @@ static const AVFilterPad asendcmd_inputs[] = {
     },
 };
 
-static const AVFilterPad asendcmd_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
-const AVFilter ff_af_asendcmd = {
-    .name        = "asendcmd",
-    .description = NULL_IF_CONFIG_SMALL("Send commands to filters."),
-    .priv_class  = &sendcmd_class,
+const FFFilter ff_af_asendcmd = {
+    .p.name        = "asendcmd",
+    .p.description = NULL_IF_CONFIG_SMALL("Send commands to filters."),
+    .p.priv_class  = &sendcmd_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .init        = init,
     .uninit      = uninit,
     .priv_size   = sizeof(SendCmdContext),
-    .flags       = AVFILTER_FLAG_METADATA_ONLY,
     FILTER_INPUTS(asendcmd_inputs),
-    FILTER_OUTPUTS(asendcmd_outputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
 };
 
 #endif

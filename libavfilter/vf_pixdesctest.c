@@ -24,9 +24,10 @@
  */
 
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 typedef struct PixdescTestContext {
@@ -47,7 +48,7 @@ static int config_props(AVFilterLink *inlink)
     priv->pix_desc = av_pix_fmt_desc_get(inlink->format);
 
     av_freep(&priv->line);
-    if (!(priv->line = av_malloc_array(sizeof(*priv->line), inlink->w)))
+    if (!(priv->line = av_malloc_array(inlink->w, sizeof(*priv->line))))
         return AVERROR(ENOMEM);
 
     return 0;
@@ -83,7 +84,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     if (priv->pix_desc->flags & AV_PIX_FMT_FLAG_PAL)
         memcpy(out->data[1], in->data[1], AVPALETTE_SIZE);
 
-    for (c = 0; c < priv->pix_desc->nb_components; c++) {
+    for (c = 0; c < FF_ARRAY_ELEMS(priv->pix_desc->comp); c++) {
         const int w1 = c == 1 || c == 2 ? cw : w;
         const int h1 = c == 1 || c == 2 ? ch : h;
 
@@ -115,18 +116,11 @@ static const AVFilterPad avfilter_vf_pixdesctest_inputs[] = {
     },
 };
 
-static const AVFilterPad avfilter_vf_pixdesctest_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_pixdesctest = {
-    .name        = "pixdesctest",
-    .description = NULL_IF_CONFIG_SMALL("Test pixel format definitions."),
+const FFFilter ff_vf_pixdesctest = {
+    .p.name        = "pixdesctest",
+    .p.description = NULL_IF_CONFIG_SMALL("Test pixel format definitions."),
     .priv_size   = sizeof(PixdescTestContext),
     .uninit      = uninit,
     FILTER_INPUTS(avfilter_vf_pixdesctest_inputs),
-    FILTER_OUTPUTS(avfilter_vf_pixdesctest_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
 };

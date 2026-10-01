@@ -21,20 +21,29 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
+#include "hwaccel_internal.h"
 #include "hwconfig.h"
-#include "internal.h"
 #include "profiles.h"
+#include "progressframe.h"
+#include "libavutil/refstruct.h"
 #include "thread.h"
 #include "pthread_internal.h"
 
 #include "videodsp.h"
-#include "vp56.h"
+#include "vp89_rac.h"
 #include "vp9.h"
 #include "vp9data.h"
 #include "vp9dec.h"
+#include "vpx_rac.h"
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/video_enc_params.h"
 
@@ -47,7 +56,6 @@ DEFINE_OFFSET_ARRAY(VP9Context, vp9_context, pthread_init_cnt,
 
 static int vp9_alloc_entries(AVCodecContext *avctx, int n) {
     VP9Context *s = avctx->priv_data;
-    int i;
 
     if (avctx->active_thread_type & FF_THREAD_SLICE)  {
         if (s->entries)
@@ -56,9 +64,6 @@ static int vp9_alloc_entries(AVCodecContext *avctx, int n) {
         s->entries = av_malloc_array(n, sizeof(atomic_int));
         if (!s->entries)
             return AVERROR(ENOMEM);
-
-        for (i  = 0; i < n; i++)
-            atomic_init(&s->entries[i], 0);
     }
     return 0;
 }
@@ -90,13 +95,13 @@ static void vp9_tile_data_free(VP9TileData *td)
     av_freep(&td->block_structure);
 }
 
-static void vp9_frame_unref(AVCodecContext *avctx, VP9Frame *f)
+static void vp9_frame_unref(VP9Frame *f)
 {
-    ff_thread_release_buffer(avctx, &f->tf);
-    av_buffer_unref(&f->extradata);
-    av_buffer_unref(&f->hwaccel_priv_buf);
+    ff_progress_frame_unref(&f->tf);
+    av_refstruct_unref(&f->header_ref);
+    av_refstruct_unref(&f->extradata);
+    av_refstruct_unref(&f->hwaccel_picture_private);
     f->segmentation_map = NULL;
-    f->hwaccel_picture_private = NULL;
 }
 
 static int vp9_frame_alloc(AVCodecContext *avctx, VP9Frame *f)
@@ -104,94 +109,80 @@ static int vp9_frame_alloc(AVCodecContext *avctx, VP9Frame *f)
     VP9Context *s = avctx->priv_data;
     int ret, sz;
 
-    ret = ff_thread_get_buffer(avctx, &f->tf, AV_GET_BUFFER_FLAG_REF);
+    ret = ff_progress_frame_get_buffer(avctx, &f->tf, AV_GET_BUFFER_FLAG_REF);
     if (ret < 0)
         return ret;
 
     sz = 64 * s->sb_cols * s->sb_rows;
     if (sz != s->frame_extradata_pool_size) {
-        av_buffer_pool_uninit(&s->frame_extradata_pool);
-        s->frame_extradata_pool = av_buffer_pool_init(sz * (1 + sizeof(VP9mvrefPair)), NULL);
+        av_refstruct_pool_uninit(&s->frame_extradata_pool);
+        s->frame_extradata_pool = av_refstruct_pool_alloc(sz * (1 + sizeof(VP9mvrefPair)),
+                                                          AV_REFSTRUCT_POOL_FLAG_ZERO_EVERY_TIME);
         if (!s->frame_extradata_pool) {
             s->frame_extradata_pool_size = 0;
+            ret = AVERROR(ENOMEM);
             goto fail;
         }
         s->frame_extradata_pool_size = sz;
     }
-    f->extradata = av_buffer_pool_get(s->frame_extradata_pool);
+    f->extradata = av_refstruct_pool_get(s->frame_extradata_pool);
     if (!f->extradata) {
+        ret = AVERROR(ENOMEM);
         goto fail;
     }
-    memset(f->extradata->data, 0, f->extradata->size);
 
-    f->segmentation_map = f->extradata->data;
-    f->mv = (VP9mvrefPair *) (f->extradata->data + sz);
+    f->segmentation_map = f->extradata;
+    f->mv = (VP9mvrefPair *) ((char*)f->extradata + sz);
 
-    if (avctx->hwaccel) {
-        const AVHWAccel *hwaccel = avctx->hwaccel;
-        av_assert0(!f->hwaccel_picture_private);
-        if (hwaccel->frame_priv_data_size) {
-            f->hwaccel_priv_buf = av_buffer_allocz(hwaccel->frame_priv_data_size);
-            if (!f->hwaccel_priv_buf)
-                goto fail;
-            f->hwaccel_picture_private = f->hwaccel_priv_buf->data;
-        }
-    }
+    ret = ff_hwaccel_frame_priv_alloc(avctx, &f->hwaccel_picture_private);
+    if (ret < 0)
+        goto fail;
 
     return 0;
 
 fail:
-    vp9_frame_unref(avctx, f);
-    return AVERROR(ENOMEM);
+    vp9_frame_unref(f);
+    return ret;
 }
 
-static int vp9_frame_ref(AVCodecContext *avctx, VP9Frame *dst, VP9Frame *src)
+static void vp9_frame_replace(VP9Frame *dst, const VP9Frame *src)
 {
-    int ret;
+    av_refstruct_replace(&dst->header_ref, src->header_ref);
+    dst->frame_header = src->frame_header;
 
-    ret = ff_thread_ref_frame(&dst->tf, &src->tf);
-    if (ret < 0)
-        return ret;
+    ff_progress_frame_replace(&dst->tf, &src->tf);
 
-    dst->extradata = av_buffer_ref(src->extradata);
-    if (!dst->extradata)
-        goto fail;
+    av_refstruct_replace(&dst->extradata, src->extradata);
 
     dst->segmentation_map = src->segmentation_map;
     dst->mv = src->mv;
     dst->uses_2pass = src->uses_2pass;
 
-    if (src->hwaccel_picture_private) {
-        dst->hwaccel_priv_buf = av_buffer_ref(src->hwaccel_priv_buf);
-        if (!dst->hwaccel_priv_buf)
-            goto fail;
-        dst->hwaccel_picture_private = dst->hwaccel_priv_buf->data;
-    }
-
-    return 0;
-
-fail:
-    vp9_frame_unref(avctx, dst);
-    return AVERROR(ENOMEM);
+    av_refstruct_replace(&dst->hwaccel_picture_private,
+                          src->hwaccel_picture_private);
 }
 
 static int update_size(AVCodecContext *avctx, int w, int h)
 {
 #define HWACCEL_MAX (CONFIG_VP9_DXVA2_HWACCEL + \
                      CONFIG_VP9_D3D11VA_HWACCEL * 2 + \
+                     CONFIG_VP9_D3D12VA_HWACCEL + \
                      CONFIG_VP9_NVDEC_HWACCEL + \
                      CONFIG_VP9_VAAPI_HWACCEL + \
                      CONFIG_VP9_VDPAU_HWACCEL + \
-                     CONFIG_VP9_VIDEOTOOLBOX_HWACCEL)
+                     CONFIG_VP9_VIDEOTOOLBOX_HWACCEL + \
+                     CONFIG_VP9_VULKAN_HWACCEL)
     enum AVPixelFormat pix_fmts[HWACCEL_MAX + 2], *fmtp = pix_fmts;
     VP9Context *s = avctx->priv_data;
     uint8_t *p;
     int bytesperpixel = s->bytesperpixel, ret, cols, rows;
     int lflvl_len, i;
+    int changed = 0;
 
     av_assert0(w > 0 && h > 0);
 
     if (!(s->pix_fmt == s->gf_fmt && w == s->w && h == s->h)) {
+        changed = 1;
         if ((ret = ff_set_dimensions(avctx, w, h)) < 0)
             return ret;
 
@@ -205,6 +196,9 @@ static int update_size(AVCodecContext *avctx, int w, int h)
             *fmtp++ = AV_PIX_FMT_D3D11VA_VLD;
             *fmtp++ = AV_PIX_FMT_D3D11;
 #endif
+#if CONFIG_VP9_D3D12VA_HWACCEL
+            *fmtp++ = AV_PIX_FMT_D3D12;
+#endif
 #if CONFIG_VP9_NVDEC_HWACCEL
             *fmtp++ = AV_PIX_FMT_CUDA;
 #endif
@@ -217,6 +211,9 @@ static int update_size(AVCodecContext *avctx, int w, int h)
 #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
             *fmtp++ = AV_PIX_FMT_VIDEOTOOLBOX;
 #endif
+#if CONFIG_VP9_VULKAN_HWACCEL
+            *fmtp++ = AV_PIX_FMT_VULKAN;
+#endif
             break;
         case AV_PIX_FMT_YUV420P12:
 #if CONFIG_VP9_NVDEC_HWACCEL
@@ -228,15 +225,40 @@ static int update_size(AVCodecContext *avctx, int w, int h)
 #if CONFIG_VP9_VDPAU_HWACCEL
             *fmtp++ = AV_PIX_FMT_VDPAU;
 #endif
+#if CONFIG_VP9_VULKAN_HWACCEL
+            *fmtp++ = AV_PIX_FMT_VULKAN;
+#endif
+            break;
+        case AV_PIX_FMT_YUV444P:
+        case AV_PIX_FMT_YUV444P10:
+        case AV_PIX_FMT_YUV444P12:
+#if CONFIG_VP9_VAAPI_HWACCEL
+            *fmtp++ = AV_PIX_FMT_VAAPI;
+#endif
+#if CONFIG_VP9_VULKAN_HWACCEL
+            *fmtp++ = AV_PIX_FMT_VULKAN;
+#endif
+            break;
+        case AV_PIX_FMT_GBRP:
+        case AV_PIX_FMT_GBRP10:
+        case AV_PIX_FMT_GBRP12:
+#if CONFIG_VP9_VAAPI_HWACCEL
+            *fmtp++ = AV_PIX_FMT_VAAPI;
+#endif
+#if CONFIG_VP9_VULKAN_HWACCEL
+            *fmtp++ = AV_PIX_FMT_VULKAN;
+#endif
             break;
         }
 
         *fmtp++ = s->pix_fmt;
         *fmtp = AV_PIX_FMT_NONE;
 
-        ret = ff_thread_get_format(avctx, pix_fmts);
-        if (ret < 0)
+        ret = ff_get_format(avctx, pix_fmts);
+        if (ret < 0) {
+            ff_set_dimensions(avctx, s->w, s->h);
             return ret;
+        }
 
         avctx->pix_fmt = ret;
         s->gf_fmt  = s->pix_fmt;
@@ -248,7 +270,7 @@ static int update_size(AVCodecContext *avctx, int w, int h)
     rows = (h + 7) >> 3;
 
     if (s->intra_pred_data[0] && cols == s->cols && rows == s->rows && s->pix_fmt == s->last_fmt)
-        return 0;
+        return changed;
 
     s->last_fmt  = s->pix_fmt;
     s->sb_cols   = (w + 63) >> 6;
@@ -270,7 +292,7 @@ static int update_size(AVCodecContext *avctx, int w, int h)
     assign(s->intra_pred_data[2],  uint8_t *,             64 * bytesperpixel);
     assign(s->above_y_nnz_ctx,     uint8_t *,             16);
     assign(s->above_mode_ctx,      uint8_t *,             16);
-    assign(s->above_mv_ctx,        VP56mv(*)[2],          16);
+    assign(s->above_mv_ctx,        VP9mv(*)[2],           16);
     assign(s->above_uv_nnz_ctx[0], uint8_t *,             16);
     assign(s->above_uv_nnz_ctx[1], uint8_t *,             16);
     assign(s->above_partition_ctx, uint8_t *,              8);
@@ -293,9 +315,10 @@ static int update_size(AVCodecContext *avctx, int w, int h)
         ff_vp9dsp_init(&s->dsp, s->s.h.bpp, avctx->flags & AV_CODEC_FLAG_BITEXACT);
         ff_videodsp_init(&s->vdsp, s->s.h.bpp);
         s->last_bpp = s->s.h.bpp;
+        changed = 1;
     }
 
-    return 0;
+    return changed;
 }
 
 static int update_block_buffers(AVCodecContext *avctx)
@@ -375,7 +398,7 @@ static av_always_inline int inv_recenter_nonneg(int v, int m)
 }
 
 // differential forward probability updates
-static int update_prob(VP56RangeCoder *c, int p)
+static int update_prob(VPXRangeCoder *c, int p)
 {
     static const uint8_t inv_map_table[255] = {
           7,  20,  33,  46,  59,  72,  85,  98, 111, 124, 137, 150, 163, 176,
@@ -415,16 +438,16 @@ static int update_prob(VP56RangeCoder *c, int p)
      * updates vs. the 'fine, exact' updates further down the range, which
      * adds one extra dimension to this differential update model. */
 
-    if (!vp8_rac_get(c)) {
-        d = vp8_rac_get_uint(c, 4) + 0;
-    } else if (!vp8_rac_get(c)) {
-        d = vp8_rac_get_uint(c, 4) + 16;
-    } else if (!vp8_rac_get(c)) {
-        d = vp8_rac_get_uint(c, 5) + 32;
+    if (!vp89_rac_get(c)) {
+        d = vp89_rac_get_uint(c, 4) + 0;
+    } else if (!vp89_rac_get(c)) {
+        d = vp89_rac_get_uint(c, 4) + 16;
+    } else if (!vp89_rac_get(c)) {
+        d = vp89_rac_get_uint(c, 5) + 32;
     } else {
-        d = vp8_rac_get_uint(c, 7);
+        d = vp89_rac_get_uint(c, 7);
         if (d >= 65)
-            d = (d << 1) - 65 + vp8_rac_get(c);
+            d = (d << 1) - 65 + vp89_rac_get(c);
         d += 64;
         av_assert2(d < FF_ARRAY_ELEMS(inv_map_table));
     }
@@ -502,6 +525,7 @@ static int decode_frame_header(AVCodecContext *avctx,
     int c, i, j, k, l, m, n, w, h, max, size2, ret, sharp;
     int last_invisible;
     const uint8_t *data2;
+    int changed;
 
     /* general header */
     if ((ret = init_get_bits8(&s->gb, data, size)) < 0) {
@@ -579,9 +603,9 @@ static int decode_frame_header(AVCodecContext *avctx,
             s->s.h.signbias[1]    = get_bits1(&s->gb) && !s->s.h.errorres;
             s->s.h.refidx[2]      = get_bits(&s->gb, 3);
             s->s.h.signbias[2]    = get_bits1(&s->gb) && !s->s.h.errorres;
-            if (!s->s.refs[s->s.h.refidx[0]].f->buf[0] ||
-                !s->s.refs[s->s.h.refidx[1]].f->buf[0] ||
-                !s->s.refs[s->s.h.refidx[2]].f->buf[0]) {
+            if (!s->s.refs[s->s.h.refidx[0]].f ||
+                !s->s.refs[s->s.h.refidx[1]].f ||
+                !s->s.refs[s->s.h.refidx[2]].f) {
                 av_log(avctx, AV_LOG_ERROR, "Not all references are available\n");
                 return AVERROR_INVALIDDATA;
             }
@@ -601,7 +625,8 @@ static int decode_frame_header(AVCodecContext *avctx,
             // Note that in this code, "CUR_FRAME" is actually before we
             // have formally allocated a frame, and thus actually represents
             // the _last_ frame
-            s->s.h.use_last_frame_mvs &= s->s.frames[CUR_FRAME].tf.f->width == w &&
+            s->s.h.use_last_frame_mvs &= s->s.frames[CUR_FRAME].tf.f &&
+                                         s->s.frames[CUR_FRAME].tf.f->width == w &&
                                        s->s.frames[CUR_FRAME].tf.f->height == h;
             if (get_bits1(&s->gb)) // display size
                 skip_bits(&s->gb, 32);
@@ -681,8 +706,6 @@ static int decode_frame_header(AVCodecContext *avctx,
     s->s.h.uvac_qdelta = get_bits1(&s->gb) ? get_sbits_inv(&s->gb, 4) : 0;
     s->s.h.lossless    = s->s.h.yac_qi == 0 && s->s.h.ydc_qdelta == 0 &&
                        s->s.h.uvdc_qdelta == 0 && s->s.h.uvac_qdelta == 0;
-    if (s->s.h.lossless)
-        avctx->properties |= FF_CODEC_PROPERTY_LOSSLESS;
 
     /* segmentation header info */
     if ((s->s.h.segmentation.enabled = get_bits1(&s->gb))) {
@@ -708,6 +731,12 @@ static int decode_frame_header(AVCodecContext *avctx,
                 s->s.h.segmentation.feat[i].skip_enabled = get_bits1(&s->gb);
             }
         }
+    } else {
+        // Reset fields under segmentation switch if segmentation is disabled.
+        // This is necessary because some hwaccels don't ignore these fields
+        // if segmentation is disabled.
+        s->s.h.segmentation.temporal = 0;
+        s->s.h.segmentation.update_map = 0;
     }
 
     // set qmul[] based on Y/UV, AC/DC and segmentation Q idx deltas
@@ -760,10 +789,10 @@ static int decode_frame_header(AVCodecContext *avctx,
     }
 
     /* tiling info */
-    if ((ret = update_size(avctx, w, h)) < 0) {
+    if ((changed = update_size(avctx, w, h)) < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to initialize decoder for %dx%d @ %d\n",
                w, h, s->pix_fmt);
-        return ret;
+        return changed;
     }
     for (s->s.h.tiling.log2_tile_cols = 0;
          s->sb_cols > (64 << s->s.h.tiling.log2_tile_cols);
@@ -778,9 +807,9 @@ static int decode_frame_header(AVCodecContext *avctx,
     }
     s->s.h.tiling.log2_tile_rows = decode012(&s->gb);
     s->s.h.tiling.tile_rows = 1 << s->s.h.tiling.log2_tile_rows;
-    if (s->s.h.tiling.tile_cols != (1 << s->s.h.tiling.log2_tile_cols)) {
+    if (s->s.h.tiling.tile_cols != (1 << s->s.h.tiling.log2_tile_cols) || changed) {
         int n_range_coders;
-        VP56RangeCoder *rc;
+        VPXRangeCoder *rc;
 
         if (s->td) {
             for (i = 0; i < s->active_tile_cols; i++)
@@ -798,10 +827,10 @@ static int decode_frame_header(AVCodecContext *avctx,
             n_range_coders = s->s.h.tiling.tile_cols;
         }
         s->td = av_calloc(s->active_tile_cols, sizeof(VP9TileData) +
-                                 n_range_coders * sizeof(VP56RangeCoder));
+                                 n_range_coders * sizeof(VPXRangeCoder));
         if (!s->td)
             return AVERROR(ENOMEM);
-        rc = (VP56RangeCoder *) &s->td[s->active_tile_cols];
+        rc = (VPXRangeCoder *) &s->td[s->active_tile_cols];
         for (i = 0; i < s->active_tile_cols; i++) {
             s->td[i].s = s;
             s->td[i].c_b = rc;
@@ -873,11 +902,11 @@ static int decode_frame_header(AVCodecContext *avctx,
         av_log(avctx, AV_LOG_ERROR, "Invalid compressed header size\n");
         return AVERROR_INVALIDDATA;
     }
-    ret = ff_vp56_init_range_decoder(&s->c, data2, size2);
+    ret = ff_vpx_init_range_decoder(&s->c, data2, size2);
     if (ret < 0)
         return ret;
 
-    if (vp56_rac_get_prob_branchy(&s->c, 128)) { // marker bit
+    if (vpx_rac_get_prob_branchy(&s->c, 128)) { // marker bit
         av_log(avctx, AV_LOG_ERROR, "Marker bit was set\n");
         return AVERROR_INVALIDDATA;
     }
@@ -901,22 +930,22 @@ static int decode_frame_header(AVCodecContext *avctx,
     if (s->s.h.lossless) {
         s->s.h.txfmmode = TX_4X4;
     } else {
-        s->s.h.txfmmode = vp8_rac_get_uint(&s->c, 2);
+        s->s.h.txfmmode = vp89_rac_get_uint(&s->c, 2);
         if (s->s.h.txfmmode == 3)
-            s->s.h.txfmmode += vp8_rac_get(&s->c);
+            s->s.h.txfmmode += vp89_rac_get(&s->c);
 
         if (s->s.h.txfmmode == TX_SWITCHABLE) {
             for (i = 0; i < 2; i++)
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.tx8p[i] = update_prob(&s->c, s->prob.p.tx8p[i]);
             for (i = 0; i < 2; i++)
                 for (j = 0; j < 2; j++)
-                    if (vp56_rac_get_prob_branchy(&s->c, 252))
+                    if (vpx_rac_get_prob_branchy(&s->c, 252))
                         s->prob.p.tx16p[i][j] =
                             update_prob(&s->c, s->prob.p.tx16p[i][j]);
             for (i = 0; i < 2; i++)
                 for (j = 0; j < 3; j++)
-                    if (vp56_rac_get_prob_branchy(&s->c, 252))
+                    if (vpx_rac_get_prob_branchy(&s->c, 252))
                         s->prob.p.tx32p[i][j] =
                             update_prob(&s->c, s->prob.p.tx32p[i][j]);
         }
@@ -925,7 +954,7 @@ static int decode_frame_header(AVCodecContext *avctx,
     // coef updates
     for (i = 0; i < 4; i++) {
         uint8_t (*ref)[2][6][6][3] = s->prob_ctx[c].coef[i];
-        if (vp8_rac_get(&s->c)) {
+        if (vp89_rac_get(&s->c)) {
             for (j = 0; j < 2; j++)
                 for (k = 0; k < 2; k++)
                     for (l = 0; l < 6; l++)
@@ -935,7 +964,7 @@ static int decode_frame_header(AVCodecContext *avctx,
                             if (m >= 3 && l == 0) // dc only has 3 pt
                                 break;
                             for (n = 0; n < 3; n++) {
-                                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                                if (vpx_rac_get_prob_branchy(&s->c, 252))
                                     p[n] = update_prob(&s->c, r[n]);
                                 else
                                     p[n] = r[n];
@@ -961,33 +990,33 @@ static int decode_frame_header(AVCodecContext *avctx,
 
     // mode updates
     for (i = 0; i < 3; i++)
-        if (vp56_rac_get_prob_branchy(&s->c, 252))
+        if (vpx_rac_get_prob_branchy(&s->c, 252))
             s->prob.p.skip[i] = update_prob(&s->c, s->prob.p.skip[i]);
     if (!s->s.h.keyframe && !s->s.h.intraonly) {
         for (i = 0; i < 7; i++)
             for (j = 0; j < 3; j++)
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.mv_mode[i][j] =
                         update_prob(&s->c, s->prob.p.mv_mode[i][j]);
 
         if (s->s.h.filtermode == FILTER_SWITCHABLE)
             for (i = 0; i < 4; i++)
                 for (j = 0; j < 2; j++)
-                    if (vp56_rac_get_prob_branchy(&s->c, 252))
+                    if (vpx_rac_get_prob_branchy(&s->c, 252))
                         s->prob.p.filter[i][j] =
                             update_prob(&s->c, s->prob.p.filter[i][j]);
 
         for (i = 0; i < 4; i++)
-            if (vp56_rac_get_prob_branchy(&s->c, 252))
+            if (vpx_rac_get_prob_branchy(&s->c, 252))
                 s->prob.p.intra[i] = update_prob(&s->c, s->prob.p.intra[i]);
 
         if (s->s.h.allowcompinter) {
-            s->s.h.comppredmode = vp8_rac_get(&s->c);
+            s->s.h.comppredmode = vp89_rac_get(&s->c);
             if (s->s.h.comppredmode)
-                s->s.h.comppredmode += vp8_rac_get(&s->c);
+                s->s.h.comppredmode += vp89_rac_get(&s->c);
             if (s->s.h.comppredmode == PRED_SWITCHABLE)
                 for (i = 0; i < 5; i++)
-                    if (vp56_rac_get_prob_branchy(&s->c, 252))
+                    if (vpx_rac_get_prob_branchy(&s->c, 252))
                         s->prob.p.comp[i] =
                             update_prob(&s->c, s->prob.p.comp[i]);
         } else {
@@ -996,10 +1025,10 @@ static int decode_frame_header(AVCodecContext *avctx,
 
         if (s->s.h.comppredmode != PRED_COMPREF) {
             for (i = 0; i < 5; i++) {
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.single_ref[i][0] =
                         update_prob(&s->c, s->prob.p.single_ref[i][0]);
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.single_ref[i][1] =
                         update_prob(&s->c, s->prob.p.single_ref[i][1]);
             }
@@ -1007,72 +1036,72 @@ static int decode_frame_header(AVCodecContext *avctx,
 
         if (s->s.h.comppredmode != PRED_SINGLEREF) {
             for (i = 0; i < 5; i++)
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.comp_ref[i] =
                         update_prob(&s->c, s->prob.p.comp_ref[i]);
         }
 
         for (i = 0; i < 4; i++)
             for (j = 0; j < 9; j++)
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.y_mode[i][j] =
                         update_prob(&s->c, s->prob.p.y_mode[i][j]);
 
         for (i = 0; i < 4; i++)
             for (j = 0; j < 4; j++)
                 for (k = 0; k < 3; k++)
-                    if (vp56_rac_get_prob_branchy(&s->c, 252))
+                    if (vpx_rac_get_prob_branchy(&s->c, 252))
                         s->prob.p.partition[3 - i][j][k] =
                             update_prob(&s->c,
                                         s->prob.p.partition[3 - i][j][k]);
 
         // mv fields don't use the update_prob subexp model for some reason
         for (i = 0; i < 3; i++)
-            if (vp56_rac_get_prob_branchy(&s->c, 252))
-                s->prob.p.mv_joint[i] = (vp8_rac_get_uint(&s->c, 7) << 1) | 1;
+            if (vpx_rac_get_prob_branchy(&s->c, 252))
+                s->prob.p.mv_joint[i] = (vp89_rac_get_uint(&s->c, 7) << 1) | 1;
 
         for (i = 0; i < 2; i++) {
-            if (vp56_rac_get_prob_branchy(&s->c, 252))
+            if (vpx_rac_get_prob_branchy(&s->c, 252))
                 s->prob.p.mv_comp[i].sign =
-                    (vp8_rac_get_uint(&s->c, 7) << 1) | 1;
+                    (vp89_rac_get_uint(&s->c, 7) << 1) | 1;
 
             for (j = 0; j < 10; j++)
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.mv_comp[i].classes[j] =
-                        (vp8_rac_get_uint(&s->c, 7) << 1) | 1;
+                        (vp89_rac_get_uint(&s->c, 7) << 1) | 1;
 
-            if (vp56_rac_get_prob_branchy(&s->c, 252))
+            if (vpx_rac_get_prob_branchy(&s->c, 252))
                 s->prob.p.mv_comp[i].class0 =
-                    (vp8_rac_get_uint(&s->c, 7) << 1) | 1;
+                    (vp89_rac_get_uint(&s->c, 7) << 1) | 1;
 
             for (j = 0; j < 10; j++)
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.mv_comp[i].bits[j] =
-                        (vp8_rac_get_uint(&s->c, 7) << 1) | 1;
+                        (vp89_rac_get_uint(&s->c, 7) << 1) | 1;
         }
 
         for (i = 0; i < 2; i++) {
             for (j = 0; j < 2; j++)
                 for (k = 0; k < 3; k++)
-                    if (vp56_rac_get_prob_branchy(&s->c, 252))
+                    if (vpx_rac_get_prob_branchy(&s->c, 252))
                         s->prob.p.mv_comp[i].class0_fp[j][k] =
-                            (vp8_rac_get_uint(&s->c, 7) << 1) | 1;
+                            (vp89_rac_get_uint(&s->c, 7) << 1) | 1;
 
             for (j = 0; j < 3; j++)
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.mv_comp[i].fp[j] =
-                        (vp8_rac_get_uint(&s->c, 7) << 1) | 1;
+                        (vp89_rac_get_uint(&s->c, 7) << 1) | 1;
         }
 
         if (s->s.h.highprecisionmvs) {
             for (i = 0; i < 2; i++) {
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.mv_comp[i].class0_hp =
-                        (vp8_rac_get_uint(&s->c, 7) << 1) | 1;
+                        (vp89_rac_get_uint(&s->c, 7) << 1) | 1;
 
-                if (vp56_rac_get_prob_branchy(&s->c, 252))
+                if (vpx_rac_get_prob_branchy(&s->c, 252))
                     s->prob.p.mv_comp[i].hp =
-                        (vp8_rac_get_uint(&s->c, 7) << 1) | 1;
+                        (vp89_rac_get_uint(&s->c, 7) << 1) | 1;
             }
         }
     }
@@ -1095,11 +1124,11 @@ static void decode_sb(VP9TileData *td, int row, int col, VP9Filter *lflvl,
     int bytesperpixel = s->bytesperpixel;
 
     if (bl == BL_8X8) {
-        bp = vp8_rac_get_tree(td->c, ff_vp9_partition_tree, p);
+        bp = vp89_rac_get_tree(td->c, ff_vp9_partition_tree, p);
         ff_vp9_decode_block(td, row, col, lflvl, yoff, uvoff, bl, bp);
     } else if (col + hbs < s->cols) { // FIXME why not <=?
         if (row + hbs < s->rows) { // FIXME why not <=?
-            bp = vp8_rac_get_tree(td->c, ff_vp9_partition_tree, p);
+            bp = vp89_rac_get_tree(td->c, ff_vp9_partition_tree, p);
             switch (bp) {
             case PARTITION_NONE:
                 ff_vp9_decode_block(td, row, col, lflvl, yoff, uvoff, bl, bp);
@@ -1129,9 +1158,10 @@ static void decode_sb(VP9TileData *td, int row, int col, VP9Filter *lflvl,
                           uvoff + (8 * hbs * bytesperpixel >> s->ss_h), bl + 1);
                 break;
             default:
-                av_assert0(0);
+                av_unreachable("ff_vp9_partition_tree only has "
+                               "the four PARTITION_* terminal codes");
             }
-        } else if (vp56_rac_get_prob_branchy(td->c, p[1])) {
+        } else if (vpx_rac_get_prob_branchy(td->c, p[1])) {
             bp = PARTITION_SPLIT;
             decode_sb(td, row, col, lflvl, yoff, uvoff, bl + 1);
             decode_sb(td, row, col + hbs, lflvl,
@@ -1142,7 +1172,7 @@ static void decode_sb(VP9TileData *td, int row, int col, VP9Filter *lflvl,
             ff_vp9_decode_block(td, row, col, lflvl, yoff, uvoff, bl, bp);
         }
     } else if (row + hbs < s->rows) { // FIXME why not <=?
-        if (vp56_rac_get_prob_branchy(td->c, p[2])) {
+        if (vpx_rac_get_prob_branchy(td->c, p[2])) {
             bp = PARTITION_SPLIT;
             decode_sb(td, row, col, lflvl, yoff, uvoff, bl + 1);
             yoff  += hbs * 8 * y_stride;
@@ -1230,16 +1260,13 @@ static av_cold int vp9_decode_free(AVCodecContext *avctx)
     VP9Context *s = avctx->priv_data;
     int i;
 
-    for (i = 0; i < 3; i++) {
-        vp9_frame_unref(avctx, &s->s.frames[i]);
-        av_frame_free(&s->s.frames[i].tf.f);
-    }
-    av_buffer_pool_uninit(&s->frame_extradata_pool);
+    for (int i = 0; i < 3; i++)
+        vp9_frame_unref(&s->s.frames[i]);
+    av_refstruct_pool_uninit(&s->frame_extradata_pool);
     for (i = 0; i < 8; i++) {
-        ff_thread_release_buffer(avctx, &s->s.refs[i]);
-        av_frame_free(&s->s.refs[i].f);
-        ff_thread_release_buffer(avctx, &s->next_refs[i]);
-        av_frame_free(&s->next_refs[i].f);
+        ff_progress_frame_unref(&s->s.refs[i]);
+        ff_progress_frame_unref(&s->next_refs[i]);
+        vp9_frame_unref(&s->s.ref_frames[i]);
     }
 
     free_buffers(s);
@@ -1247,6 +1274,11 @@ static av_cold int vp9_decode_free(AVCodecContext *avctx)
     av_freep(&s->entries);
     ff_pthread_free(s, vp9_context_offsets);
 #endif
+
+    av_refstruct_unref(&s->header_ref);
+    ff_cbs_fragment_free(&s->current_frag);
+    ff_cbs_close(&s->cbc);
+
     av_freep(&s->td);
     return 0;
 }
@@ -1283,17 +1315,13 @@ static int decode_tiles(AVCodecContext *avctx,
                 data += 4;
                 size -= 4;
             }
-            if (tile_size > size) {
-                ff_thread_report_progress(&s->s.frames[CUR_FRAME].tf, INT_MAX, 0);
+            if (tile_size > size)
                 return AVERROR_INVALIDDATA;
-            }
-            ret = ff_vp56_init_range_decoder(&td->c_b[tile_col], data, tile_size);
+            ret = ff_vpx_init_range_decoder(&td->c_b[tile_col], data, tile_size);
             if (ret < 0)
                 return ret;
-            if (vp56_rac_get_prob_branchy(&td->c_b[tile_col], 128)) { // marker bit
-                ff_thread_report_progress(&s->s.frames[CUR_FRAME].tf, INT_MAX, 0);
+            if (vpx_rac_get_prob_branchy(&td->c_b[tile_col], 128)) // marker bit
                 return AVERROR_INVALIDDATA;
-            }
             data += tile_size;
             size -= tile_size;
         }
@@ -1336,7 +1364,7 @@ static int decode_tiles(AVCodecContext *avctx,
                         decode_sb_mem(td, row, col, lflvl_ptr,
                                       yoff2, uvoff2, BL_64X64);
                     } else {
-                        if (vpX_rac_is_end(td->c)) {
+                        if (vpx_rac_is_end(td->c)) {
                             return AVERROR_INVALIDDATA;
                         }
                         decode_sb(td, row, col, lflvl_ptr,
@@ -1378,7 +1406,7 @@ static int decode_tiles(AVCodecContext *avctx,
             // FIXME maybe we can make this more finegrained by running the
             // loopfilter per-block instead of after each sbrow
             // In fact that would also make intra pred left preparation easier?
-            ff_thread_report_progress(&s->s.frames[CUR_FRAME].tf, row >> 3, 0);
+            ff_progress_frame_report(&s->s.frames[CUR_FRAME].tf, row >> 3);
         }
     }
     return 0;
@@ -1546,90 +1574,116 @@ static int vp9_export_enc_params(VP9Context *s, VP9Frame *frame)
     return 0;
 }
 
-static int vp9_decode_frame(AVCodecContext *avctx, void *frame,
+static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                             int *got_frame, AVPacket *pkt)
 {
     const uint8_t *data = pkt->data;
     int size = pkt->size;
     VP9Context *s = avctx->priv_data;
     int ret, i, j, ref;
+    CodedBitstreamUnit *unit;
+    VP9RawFrame *rf;
+
     int retain_segmap_ref = s->s.frames[REF_FRAME_SEGMAP].segmentation_map &&
                             (!s->s.h.segmentation.enabled || !s->s.h.segmentation.update_map);
+    const VP9Frame *src;
     AVFrame *f;
 
+    ret = ff_cbs_read_packet(s->cbc, &s->current_frag, pkt);
+    if (ret < 0) {
+        ff_cbs_fragment_reset(&s->current_frag);
+        av_log(avctx, AV_LOG_ERROR, "Failed to read frame header.\n");
+        return ret;
+    }
+
+    unit = &s->current_frag.units[0];
+    rf = unit->content;
+
+    av_refstruct_replace(&s->header_ref, unit->content_ref);
+    s->frame_header = &rf->header;
+
     if ((ret = decode_frame_header(avctx, data, size, &ref)) < 0) {
+        ff_cbs_fragment_reset(&s->current_frag);
         return ret;
     } else if (ret == 0) {
-        if (!s->s.refs[ref].f->buf[0]) {
+        if (!s->s.refs[ref].f) {
             av_log(avctx, AV_LOG_ERROR, "Requested reference %d not available\n", ref);
+            ff_cbs_fragment_reset(&s->current_frag);
             return AVERROR_INVALIDDATA;
         }
+        for (int i = 0; i < 8; i++)
+            ff_progress_frame_replace(&s->next_refs[i], &s->s.refs[i]);
+        ff_thread_finish_setup(avctx);
+        ff_progress_frame_await(&s->s.refs[ref], INT_MAX);
+        ff_cbs_fragment_reset(&s->current_frag);
+
         if ((ret = av_frame_ref(frame, s->s.refs[ref].f)) < 0)
             return ret;
-        ((AVFrame *)frame)->pts = pkt->pts;
-        ((AVFrame *)frame)->pkt_dts = pkt->dts;
-        for (i = 0; i < 8; i++) {
-            if (s->next_refs[i].f->buf[0])
-                ff_thread_release_buffer(avctx, &s->next_refs[i]);
-            if (s->s.refs[i].f->buf[0] &&
-                (ret = ff_thread_ref_frame(&s->next_refs[i], &s->s.refs[i])) < 0)
-                return ret;
-        }
+        frame->pts     = pkt->pts;
+        frame->pkt_dts = pkt->dts;
         *got_frame = 1;
         return pkt->size;
     }
     data += ret;
     size -= ret;
 
-    if (!retain_segmap_ref || s->s.h.keyframe || s->s.h.intraonly) {
-        if (s->s.frames[REF_FRAME_SEGMAP].tf.f->buf[0])
-            vp9_frame_unref(avctx, &s->s.frames[REF_FRAME_SEGMAP]);
-        if (!s->s.h.keyframe && !s->s.h.intraonly && !s->s.h.errorres && s->s.frames[CUR_FRAME].tf.f->buf[0] &&
-            (ret = vp9_frame_ref(avctx, &s->s.frames[REF_FRAME_SEGMAP], &s->s.frames[CUR_FRAME])) < 0)
-            return ret;
+    src = !s->s.h.keyframe && !s->s.h.intraonly && !s->s.h.errorres ?
+              &s->s.frames[CUR_FRAME] : &s->s.frames[BLANK_FRAME];
+    if (!retain_segmap_ref || s->s.h.keyframe || s->s.h.intraonly)
+        vp9_frame_replace(&s->s.frames[REF_FRAME_SEGMAP], src);
+    vp9_frame_replace(&s->s.frames[REF_FRAME_MVPAIR], src);
+    vp9_frame_unref(&s->s.frames[CUR_FRAME]);
+    if ((ret = vp9_frame_alloc(avctx, &s->s.frames[CUR_FRAME])) < 0) {
+        ff_cbs_fragment_reset(&s->current_frag);
+        return ret;
     }
-    if (s->s.frames[REF_FRAME_MVPAIR].tf.f->buf[0])
-        vp9_frame_unref(avctx, &s->s.frames[REF_FRAME_MVPAIR]);
-    if (!s->s.h.intraonly && !s->s.h.keyframe && !s->s.h.errorres && s->s.frames[CUR_FRAME].tf.f->buf[0] &&
-        (ret = vp9_frame_ref(avctx, &s->s.frames[REF_FRAME_MVPAIR], &s->s.frames[CUR_FRAME])) < 0)
-        return ret;
-    if (s->s.frames[CUR_FRAME].tf.f->buf[0])
-        vp9_frame_unref(avctx, &s->s.frames[CUR_FRAME]);
-    if ((ret = vp9_frame_alloc(avctx, &s->s.frames[CUR_FRAME])) < 0)
-        return ret;
+
+    s->s.frames[CUR_FRAME].header_ref = av_refstruct_ref(s->header_ref);
+    s->s.frames[CUR_FRAME].frame_header = s->frame_header;
+
     f = s->s.frames[CUR_FRAME].tf.f;
-    f->key_frame = s->s.h.keyframe;
+    if (s->s.h.keyframe)
+        f->flags |= AV_FRAME_FLAG_KEY;
+    else
+        f->flags &= ~AV_FRAME_FLAG_KEY;
+    if (s->s.h.lossless)
+        f->flags |= AV_FRAME_FLAG_LOSSLESS;
+    else
+        f->flags &= ~AV_FRAME_FLAG_LOSSLESS;
     f->pict_type = (s->s.h.keyframe || s->s.h.intraonly) ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
 
-    if (s->s.frames[REF_FRAME_SEGMAP].tf.f->buf[0] &&
+    // Non-existent frames have the implicit dimension 0x0 != CUR_FRAME
+    if (!s->s.frames[REF_FRAME_MVPAIR].tf.f ||
         (s->s.frames[REF_FRAME_MVPAIR].tf.f->width  != s->s.frames[CUR_FRAME].tf.f->width ||
          s->s.frames[REF_FRAME_MVPAIR].tf.f->height != s->s.frames[CUR_FRAME].tf.f->height)) {
-        vp9_frame_unref(avctx, &s->s.frames[REF_FRAME_SEGMAP]);
+        vp9_frame_unref(&s->s.frames[REF_FRAME_SEGMAP]);
     }
 
     // ref frame setup
     for (i = 0; i < 8; i++) {
-        if (s->next_refs[i].f->buf[0])
-            ff_thread_release_buffer(avctx, &s->next_refs[i]);
-        if (s->s.h.refreshrefmask & (1 << i)) {
-            ret = ff_thread_ref_frame(&s->next_refs[i], &s->s.frames[CUR_FRAME].tf);
-        } else if (s->s.refs[i].f->buf[0]) {
-            ret = ff_thread_ref_frame(&s->next_refs[i], &s->s.refs[i]);
-        }
-        if (ret < 0)
-            return ret;
+        ff_progress_frame_replace(&s->next_refs[i],
+                                   s->s.h.refreshrefmask & (1 << i) ?
+                                       &s->s.frames[CUR_FRAME].tf : &s->s.refs[i]);
     }
 
     if (avctx->hwaccel) {
-        ret = avctx->hwaccel->start_frame(avctx, NULL, 0);
+        const FFHWAccel *hwaccel = ffhwaccel(avctx->hwaccel);
+        ret = hwaccel->start_frame(avctx, pkt->buf, pkt->data, pkt->size);
         if (ret < 0)
             return ret;
-        ret = avctx->hwaccel->decode_slice(avctx, pkt->data, pkt->size);
+        ret = hwaccel->decode_slice(avctx, pkt->data, pkt->size);
         if (ret < 0)
             return ret;
-        ret = avctx->hwaccel->end_frame(avctx);
+        ret = hwaccel->end_frame(avctx);
         if (ret < 0)
             return ret;
+
+        for (i = 0; i < 8; i++) {
+            vp9_frame_replace(&s->s.ref_frames[i],
+                              s->s.h.refreshrefmask & (1 << i) ?
+                                  &s->s.frames[CUR_FRAME] : &s->s.ref_frames[i]);
+        }
+
         goto finish;
     }
 
@@ -1674,7 +1728,7 @@ static int vp9_decode_frame(AVCodecContext *avctx, void *frame,
 #if HAVE_THREADS
     if (avctx->active_thread_type & FF_THREAD_SLICE) {
         for (i = 0; i < s->sb_rows; i++)
-            atomic_store(&s->entries[i], 0);
+            atomic_init(&s->entries[i], 0);
     }
 #endif
 
@@ -1710,10 +1764,10 @@ static int vp9_decode_frame(AVCodecContext *avctx, void *frame,
                     }
                     if (tile_size > size)
                         return AVERROR_INVALIDDATA;
-                    ret = ff_vp56_init_range_decoder(&s->td[tile_col].c_b[tile_row], data, tile_size);
+                    ret = ff_vpx_init_range_decoder(&s->td[tile_col].c_b[tile_row], data, tile_size);
                     if (ret < 0)
                         return ret;
-                    if (vp56_rac_get_prob_branchy(&s->td[tile_col].c_b[tile_row], 128)) // marker bit
+                    if (vpx_rac_get_prob_branchy(&s->td[tile_col].c_b[tile_row], 128)) // marker bit
                         return AVERROR_INVALIDDATA;
                     data += tile_size;
                     size -= tile_size;
@@ -1725,10 +1779,8 @@ static int vp9_decode_frame(AVCodecContext *avctx, void *frame,
 #endif
         {
             ret = decode_tiles(avctx, data, size);
-            if (ret < 0) {
-                ff_thread_report_progress(&s->s.frames[CUR_FRAME].tf, INT_MAX, 0);
-                return ret;
-            }
+            if (ret < 0)
+                goto fail;
         }
 
         // Sum all counts fields into td[0].counts for tile threading
@@ -1742,28 +1794,26 @@ static int vp9_decode_frame(AVCodecContext *avctx, void *frame,
             ff_thread_finish_setup(avctx);
         }
     } while (s->pass++ == 1);
-    ff_thread_report_progress(&s->s.frames[CUR_FRAME].tf, INT_MAX, 0);
 
     if (s->td->error_info < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to decode tile data\n");
         s->td->error_info = 0;
-        return AVERROR_INVALIDDATA;
+        ret = AVERROR_INVALIDDATA;
+        goto fail;
     }
     if (avctx->export_side_data & AV_CODEC_EXPORT_DATA_VIDEO_ENC_PARAMS) {
         ret = vp9_export_enc_params(s, &s->s.frames[CUR_FRAME]);
         if (ret < 0)
-            return ret;
+            goto fail;
     }
 
 finish:
+    ff_cbs_fragment_reset(&s->current_frag);
+
+    ff_progress_frame_report(&s->s.frames[CUR_FRAME].tf, INT_MAX);
     // ref frame setup
-    for (i = 0; i < 8; i++) {
-        if (s->s.refs[i].f->buf[0])
-            ff_thread_release_buffer(avctx, &s->s.refs[i]);
-        if (s->next_refs[i].f->buf[0] &&
-            (ret = ff_thread_ref_frame(&s->s.refs[i], &s->next_refs[i])) < 0)
-            return ret;
-    }
+    for (int i = 0; i < 8; i++)
+        ff_progress_frame_replace(&s->s.refs[i], &s->next_refs[i]);
 
     if (!s->s.h.invisible) {
         if ((ret = av_frame_ref(frame, s->s.frames[CUR_FRAME].tf.f)) < 0)
@@ -1772,17 +1822,31 @@ finish:
     }
 
     return pkt->size;
+fail:
+    ff_cbs_fragment_reset(&s->current_frag);
+    ff_progress_frame_report(&s->s.frames[CUR_FRAME].tf, INT_MAX);
+    return ret;
 }
 
-static void vp9_decode_flush(AVCodecContext *avctx)
+static av_cold void vp9_decode_flush(AVCodecContext *avctx)
 {
     VP9Context *s = avctx->priv_data;
     int i;
 
     for (i = 0; i < 3; i++)
-        vp9_frame_unref(avctx, &s->s.frames[i]);
-    for (i = 0; i < 8; i++)
-        ff_thread_release_buffer(avctx, &s->s.refs[i]);
+        vp9_frame_unref(&s->s.frames[i]);
+
+    for (i = 0; i < 8; i++) {
+        ff_progress_frame_unref(&s->s.refs[i]);
+        ff_progress_frame_unref(&s->next_refs[i]);
+        vp9_frame_unref(&s->s.ref_frames[i]);
+    }
+
+    ff_cbs_fragment_reset(&s->current_frag);
+    ff_cbs_flush(s->cbc);
+
+    if (FF_HW_HAS_CB(avctx, flush))
+        FF_HW_SIMPLE_CALL(avctx, flush);
 }
 
 static av_cold int vp9_decode_init(AVCodecContext *avctx)
@@ -1793,6 +1857,10 @@ static av_cold int vp9_decode_init(AVCodecContext *avctx)
     s->last_bpp = 0;
     s->s.h.filter.sharpness = -1;
 
+    ret = ff_cbs_init(&s->cbc, AV_CODEC_ID_VP9, avctx);
+    if (ret < 0)
+        return ret;
+
 #if HAVE_THREADS
     if (avctx->active_thread_type & FF_THREAD_SLICE) {
         ret = ff_pthread_init(s, vp9_context_offsets);
@@ -1801,42 +1869,27 @@ static av_cold int vp9_decode_init(AVCodecContext *avctx)
     }
 #endif
 
-    for (int i = 0; i < 3; i++) {
-        s->s.frames[i].tf.f = av_frame_alloc();
-        if (!s->s.frames[i].tf.f)
-            return AVERROR(ENOMEM);
-    }
-    for (int i = 0; i < 8; i++) {
-        s->s.refs[i].f      = av_frame_alloc();
-        s->next_refs[i].f   = av_frame_alloc();
-        if (!s->s.refs[i].f || !s->next_refs[i].f)
-            return AVERROR(ENOMEM);
-    }
     return 0;
 }
 
 #if HAVE_THREADS
 static int vp9_decode_update_thread_context(AVCodecContext *dst, const AVCodecContext *src)
 {
-    int i, ret;
     VP9Context *s = dst->priv_data, *ssrc = src->priv_data;
 
-    for (i = 0; i < 3; i++) {
-        if (s->s.frames[i].tf.f->buf[0])
-            vp9_frame_unref(dst, &s->s.frames[i]);
-        if (ssrc->s.frames[i].tf.f->buf[0]) {
-            if ((ret = vp9_frame_ref(dst, &s->s.frames[i], &ssrc->s.frames[i])) < 0)
-                return ret;
-        }
-    }
-    for (i = 0; i < 8; i++) {
-        if (s->s.refs[i].f->buf[0])
-            ff_thread_release_buffer(dst, &s->s.refs[i]);
-        if (ssrc->next_refs[i].f->buf[0]) {
-            if ((ret = ff_thread_ref_frame(&s->s.refs[i], &ssrc->next_refs[i])) < 0)
-                return ret;
-        }
-    }
+    for (int i = 0; i < 3; i++)
+        vp9_frame_replace(&s->s.frames[i], &ssrc->s.frames[i]);
+    for (int i = 0; i < 8; i++)
+        ff_progress_frame_replace(&s->s.refs[i], &ssrc->next_refs[i]);
+    av_refstruct_replace(&s->frame_extradata_pool, ssrc->frame_extradata_pool);
+    s->frame_extradata_pool_size = ssrc->frame_extradata_pool_size;
+
+    av_refstruct_replace(&s->header_ref, ssrc->header_ref);
+    for (int i = 0; i < 8; i++)
+        vp9_frame_replace(&s->s.ref_frames[i], &ssrc->s.ref_frames[i]);
+
+    s->frame_header = ssrc->frame_header;
+    memcpy(s->cbc->priv_data, ssrc->cbc->priv_data, sizeof(CodedBitstreamVP9Context));
 
     s->s.h.invisible = ssrc->s.h.invisible;
     s->s.h.keyframe = ssrc->s.h.keyframe;
@@ -1862,22 +1915,22 @@ static int vp9_decode_update_thread_context(AVCodecContext *dst, const AVCodecCo
 }
 #endif
 
-const AVCodec ff_vp9_decoder = {
-    .name                  = "vp9",
-    .long_name             = NULL_IF_CONFIG_SMALL("Google VP9"),
-    .type                  = AVMEDIA_TYPE_VIDEO,
-    .id                    = AV_CODEC_ID_VP9,
+const FFCodec ff_vp9_decoder = {
+    .p.name                = "vp9",
+    CODEC_LONG_NAME("Google VP9"),
+    .p.type                = AVMEDIA_TYPE_VIDEO,
+    .p.id                  = AV_CODEC_ID_VP9,
     .priv_data_size        = sizeof(VP9Context),
     .init                  = vp9_decode_init,
     .close                 = vp9_decode_free,
-    .decode                = vp9_decode_frame,
-    .capabilities          = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_SLICE_THREADS,
-    .caps_internal         = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP |
+    FF_CODEC_DECODE_CB(vp9_decode_frame),
+    .p.capabilities        = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_SLICE_THREADS,
+    .caps_internal         = FF_CODEC_CAP_INIT_CLEANUP |
                              FF_CODEC_CAP_SLICE_THREAD_HAS_MF |
-                             FF_CODEC_CAP_ALLOCATE_PROGRESS,
+                             FF_CODEC_CAP_USES_PROGRESSFRAMES,
     .flush                 = vp9_decode_flush,
-    .update_thread_context = ONLY_IF_THREADS_ENABLED(vp9_decode_update_thread_context),
-    .profiles              = NULL_IF_CONFIG_SMALL(ff_vp9_profiles),
+    UPDATE_THREAD_CONTEXT(vp9_decode_update_thread_context),
+    .p.profiles            = NULL_IF_CONFIG_SMALL(ff_vp9_profiles),
     .bsfs                  = "vp9_superframe_split",
     .hw_configs            = (const AVCodecHWConfigInternal *const []) {
 #if CONFIG_VP9_DXVA2_HWACCEL
@@ -1888,6 +1941,9 @@ const AVCodec ff_vp9_decoder = {
 #endif
 #if CONFIG_VP9_D3D11VA2_HWACCEL
                                HWACCEL_D3D11VA2(vp9),
+#endif
+#if CONFIG_VP9_D3D12VA_HWACCEL
+                               HWACCEL_D3D12VA(vp9),
 #endif
 #if CONFIG_VP9_NVDEC_HWACCEL
                                HWACCEL_NVDEC(vp9),
@@ -1900,6 +1956,9 @@ const AVCodec ff_vp9_decoder = {
 #endif
 #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
                                HWACCEL_VIDEOTOOLBOX(vp9),
+#endif
+#if CONFIG_VP9_VULKAN_HWACCEL
+                               HWACCEL_VULKAN(vp9),
 #endif
                                NULL
                            },

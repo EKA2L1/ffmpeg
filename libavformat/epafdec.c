@@ -19,9 +19,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/intreadwrite.h"
 #include "libavcodec/internal.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "pcm.h"
 
@@ -68,7 +70,7 @@ static int epaf_read_header(AVFormatContext *s)
         return AVERROR(ENOMEM);
 
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
-    st->codecpar->channels    = channels;
+    st->codecpar->ch_layout.nb_channels = channels;
     st->codecpar->sample_rate = sample_rate;
     switch (codec) {
     case 0:
@@ -79,12 +81,14 @@ static int epaf_read_header(AVFormatContext *s)
         break;
     case 1:
         avpriv_request_sample(s, "24-bit Paris PCM format");
+        av_fallthrough;
     default:
         return AVERROR_INVALIDDATA;
     }
 
     st->codecpar->bits_per_coded_sample = av_get_bits_per_sample(st->codecpar->codec_id);
-    st->codecpar->block_align = st->codecpar->bits_per_coded_sample * st->codecpar->channels / 8;
+    st->codecpar->block_align = st->codecpar->bits_per_coded_sample *
+                                st->codecpar->ch_layout.nb_channels / 8;
 
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
 
@@ -93,13 +97,13 @@ static int epaf_read_header(AVFormatContext *s)
     return 0;
 }
 
-const AVInputFormat ff_epaf_demuxer = {
-    .name           = "epaf",
-    .long_name      = NULL_IF_CONFIG_SMALL("Ensoniq Paris Audio File"),
+const FFInputFormat ff_epaf_demuxer = {
+    .p.name         = "epaf",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Ensoniq Paris Audio File"),
+    .p.extensions   = "paf,fap",
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe     = epaf_probe,
     .read_header    = epaf_read_header,
     .read_packet    = ff_pcm_read_packet,
     .read_seek      = ff_pcm_read_seek,
-    .extensions     = "paf,fap",
-    .flags          = AVFMT_GENERIC_INDEX,
 };

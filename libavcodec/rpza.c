@@ -35,14 +35,13 @@
  */
 
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/internal.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 typedef struct RpzaContext {
 
@@ -165,6 +164,7 @@ static int rpza_decode_stream(RpzaContext *s)
         /* Fill blocks with 4 colors */
         case 0xc0:
             colorA = bytestream2_get_be16(&s->gb);
+            av_fallthrough;
         case 0x20:
             colorB = bytestream2_get_be16(&s->gb);
 
@@ -255,9 +255,8 @@ static av_cold int rpza_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int rpza_decode_frame(AVCodecContext *avctx,
-                             void *data, int *got_frame,
-                             AVPacket *avpkt)
+static int rpza_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                             int *got_frame, AVPacket *avpkt)
 {
     RpzaContext *s = avctx->priv_data;
     int ret;
@@ -268,7 +267,7 @@ static int rpza_decode_frame(AVCodecContext *avctx,
     if (ret < 0)
         return ret;
 
-    if ((ret = av_frame_ref(data, s->frame)) < 0)
+    if ((ret = av_frame_ref(rframe, s->frame)) < 0)
         return ret;
 
     *got_frame      = 1;
@@ -286,15 +285,14 @@ static av_cold int rpza_decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-const AVCodec ff_rpza_decoder = {
-    .name           = "rpza",
-    .long_name      = NULL_IF_CONFIG_SMALL("QuickTime video (RPZA)"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_RPZA,
+const FFCodec ff_rpza_decoder = {
+    .p.name         = "rpza",
+    CODEC_LONG_NAME("QuickTime video (RPZA)"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_RPZA,
     .priv_data_size = sizeof(RpzaContext),
     .init           = rpza_decode_init,
     .close          = rpza_decode_end,
-    .decode         = rpza_decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    FF_CODEC_DECODE_CB(rpza_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

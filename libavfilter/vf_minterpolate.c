@@ -22,12 +22,11 @@
 #include "motion_estimation.h"
 #include "libavcodec/mathops.h"
 #include "libavutil/common.h"
-#include "libavutil/motion_vector.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 #include "scene_sad.h"
 
@@ -166,7 +165,8 @@ typedef struct MIContext {
     const AVClass *class;
     AVMotionEstContext me_ctx;
     AVRational frame_rate;
-    enum MIMode mi_mode;
+    /* enum MIMode */
+    int mi_mode;
     int mc_mode;
     int me_mode;
     int me_method;
@@ -199,21 +199,21 @@ typedef struct MIContext {
 
 #define OFFSET(x) offsetof(MIContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
-#define CONST(name, help, val, unit) { name, help, 0, AV_OPT_TYPE_CONST, {.i64=val}, 0, 0, FLAGS, unit }
+#define CONST(name, help, val, u) { name, help, 0, AV_OPT_TYPE_CONST, {.i64=val}, 0, 0, FLAGS, .unit = u }
 
 static const AVOption minterpolate_options[] = {
     { "fps", "output's frame rate", OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, {.str = "60"}, 0, INT_MAX, FLAGS },
-    { "mi_mode", "motion interpolation mode", OFFSET(mi_mode), AV_OPT_TYPE_INT, {.i64 = MI_MODE_MCI}, MI_MODE_DUP, MI_MODE_MCI, FLAGS, "mi_mode" },
+    { "mi_mode", "motion interpolation mode", OFFSET(mi_mode), AV_OPT_TYPE_INT, {.i64 = MI_MODE_MCI}, MI_MODE_DUP, MI_MODE_MCI, FLAGS, .unit = "mi_mode" },
         CONST("dup",    "duplicate frames",                     MI_MODE_DUP,            "mi_mode"),
         CONST("blend",  "blend frames",                         MI_MODE_BLEND,          "mi_mode"),
         CONST("mci",    "motion compensated interpolation",     MI_MODE_MCI,            "mi_mode"),
-    { "mc_mode", "motion compensation mode", OFFSET(mc_mode), AV_OPT_TYPE_INT, {.i64 = MC_MODE_OBMC}, MC_MODE_OBMC, MC_MODE_AOBMC, FLAGS, "mc_mode" },
+    { "mc_mode", "motion compensation mode", OFFSET(mc_mode), AV_OPT_TYPE_INT, {.i64 = MC_MODE_OBMC}, MC_MODE_OBMC, MC_MODE_AOBMC, FLAGS, .unit = "mc_mode" },
         CONST("obmc",   "overlapped block motion compensation", MC_MODE_OBMC,           "mc_mode"),
         CONST("aobmc",  "adaptive overlapped block motion compensation", MC_MODE_AOBMC, "mc_mode"),
-    { "me_mode", "motion estimation mode", OFFSET(me_mode), AV_OPT_TYPE_INT, {.i64 = ME_MODE_BILAT}, ME_MODE_BIDIR, ME_MODE_BILAT, FLAGS, "me_mode" },
+    { "me_mode", "motion estimation mode", OFFSET(me_mode), AV_OPT_TYPE_INT, {.i64 = ME_MODE_BILAT}, ME_MODE_BIDIR, ME_MODE_BILAT, FLAGS, .unit = "me_mode" },
         CONST("bidir",  "bidirectional motion estimation",      ME_MODE_BIDIR,          "me_mode"),
         CONST("bilat",  "bilateral motion estimation",          ME_MODE_BILAT,          "me_mode"),
-    { "me", "motion estimation method", OFFSET(me_method), AV_OPT_TYPE_INT, {.i64 = AV_ME_METHOD_EPZS}, AV_ME_METHOD_ESA, AV_ME_METHOD_UMH, FLAGS, "me" },
+    { "me", "motion estimation method", OFFSET(me_method), AV_OPT_TYPE_INT, {.i64 = AV_ME_METHOD_EPZS}, AV_ME_METHOD_ESA, AV_ME_METHOD_UMH, FLAGS, .unit = "me" },
         CONST("esa",    "exhaustive search",                    AV_ME_METHOD_ESA,       "me"),
         CONST("tss",    "three step search",                    AV_ME_METHOD_TSS,       "me"),
         CONST("tdls",   "two dimensional logarithmic search",   AV_ME_METHOD_TDLS,      "me"),
@@ -226,7 +226,7 @@ static const AVOption minterpolate_options[] = {
     { "mb_size", "macroblock size", OFFSET(mb_size), AV_OPT_TYPE_INT, {.i64 = 16}, 4, 16, FLAGS },
     { "search_param", "search parameter", OFFSET(search_param), AV_OPT_TYPE_INT, {.i64 = 32}, 4, INT_MAX, FLAGS },
     { "vsbmc", "variable-size block motion compensation", OFFSET(vsbmc), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, FLAGS },
-    { "scd", "scene change detection method", OFFSET(scd_method), AV_OPT_TYPE_INT, {.i64 = SCD_METHOD_FDIFF}, SCD_METHOD_NONE, SCD_METHOD_FDIFF, FLAGS, "scene" },
+    { "scd", "scene change detection method", OFFSET(scd_method), AV_OPT_TYPE_INT, {.i64 = SCD_METHOD_FDIFF}, SCD_METHOD_NONE, SCD_METHOD_FDIFF, FLAGS, .unit = "scene" },
         CONST("none",   "disable detection",                    SCD_METHOD_NONE,        "scene"),
         CONST("fdiff",  "frame difference",                     SCD_METHOD_FDIFF,       "scene"),
     { "scd_threshold", "scene change threshold", OFFSET(scd_threshold), AV_OPT_TYPE_DOUBLE, {.dbl = 10.}, 0, 100.0, FLAGS },
@@ -388,7 +388,7 @@ static int config_input(AVFilterLink *inlink)
     }
 
     if (mi_ctx->scd_method == SCD_METHOD_FDIFF) {
-        mi_ctx->sad = ff_scene_sad_get_fn(mi_ctx->bitdepth == 8 ? 8 : 16);
+        mi_ctx->sad = ff_scene_sad_get_fn(mi_ctx->bitdepth);
         if (!mi_ctx->sad)
             return AVERROR(EINVAL);
     }
@@ -399,8 +399,9 @@ static int config_input(AVFilterLink *inlink)
 static int config_output(AVFilterLink *outlink)
 {
     MIContext *mi_ctx = outlink->src->priv;
+    FilterLink     *l = ff_filter_link(outlink);
 
-    outlink->frame_rate = mi_ctx->frame_rate;
+    l->frame_rate       = mi_ctx->frame_rate;
     outlink->time_base  = av_inv_q(mi_ctx->frame_rate);
 
     return 0;
@@ -827,7 +828,6 @@ static int detect_scene_change(AVFilterContext *ctx)
         double ret = 0, mafd, diff;
         uint64_t sad;
         mi_ctx->sad(p1, linesize1, p2, linesize2, input->w, input->h, &sad);
-        emms_c();
         mafd = (double) sad * 100.0 / (input->h * input->w) / (1 << mi_ctx->bitdepth);
         diff = fabs(mafd - mi_ctx->prev_mafd);
         ret  = av_clipf(FFMIN(mafd, diff), 0, 100.0);
@@ -919,9 +919,9 @@ static void set_frame_data(MIContext *mi_ctx, int alpha, AVFrame *avf_out)
                 int x_mv, y_mv;
                 int weight_sum = 0;
                 int i, val = 0;
-                PixelMVS *pixel_mvs = &mi_ctx->pixel_mvs[x + y * avf_out->width];
-                PixelWeights *pixel_weights = &mi_ctx->pixel_weights[x + y * avf_out->width];
-                PixelRefs *pixel_refs = &mi_ctx->pixel_refs[x + y * avf_out->width];
+                PixelMVS *pixel_mvs = &mi_ctx->pixel_mvs[x + y * width];
+                PixelWeights *pixel_weights = &mi_ctx->pixel_weights[x + y * width];
+                PixelRefs *pixel_refs = &mi_ctx->pixel_refs[x + y * width];
 
                 for (i = 0; i < pixel_refs->nb; i++)
                     weight_sum += pixel_weights->weights[i];
@@ -940,17 +940,20 @@ static void set_frame_data(MIContext *mi_ctx, int alpha, AVFrame *avf_out)
                     weight_sum = ALPHA_MAX;
                 }
 
-                for (i = 0; i < pixel_refs->nb; i++) {
-                    Frame *frame = &mi_ctx->frames[pixel_refs->refs[i]];
-                    if (chroma) {
+                if (chroma) {
+                    for (i = 0; i < pixel_refs->nb; i++) {
+                        Frame *frame = &mi_ctx->frames[pixel_refs->refs[i]];
                         x_mv = (x >> mi_ctx->log2_chroma_w) + pixel_mvs->mvs[i][0] / (1 << mi_ctx->log2_chroma_w);
                         y_mv = (y >> mi_ctx->log2_chroma_h) + pixel_mvs->mvs[i][1] / (1 << mi_ctx->log2_chroma_h);
-                    } else {
+                        val += pixel_weights->weights[i] * frame->avf->data[plane][x_mv + y_mv * frame->avf->linesize[plane]];
+                    }
+                } else {
+                    for (i = 0; i < pixel_refs->nb; i++) {
+                        Frame *frame = &mi_ctx->frames[pixel_refs->refs[i]];
                         x_mv = x + pixel_mvs->mvs[i][0];
                         y_mv = y + pixel_mvs->mvs[i][1];
+                        val += pixel_weights->weights[i] * frame->avf->data[plane][x_mv + y_mv * frame->avf->linesize[plane]];
                     }
-
-                    val += pixel_weights->weights[i] * frame->avf->data[plane][x_mv + y_mv * frame->avf->linesize[plane]];
                 }
 
                 val = ROUNDED_DIV(val, weight_sum);
@@ -1078,8 +1081,13 @@ static void interpolate(AVFilterLink *inlink, AVFrame *avf_out)
     pts = av_rescale(avf_out->pts, (int64_t) ALPHA_MAX * outlink->time_base.num * inlink->time_base.den,
                                    (int64_t)             outlink->time_base.den * inlink->time_base.num);
 
-    alpha = (pts - mi_ctx->frames[1].avf->pts * ALPHA_MAX) / (mi_ctx->frames[2].avf->pts - mi_ctx->frames[1].avf->pts);
-    alpha = av_clip(alpha, 0, ALPHA_MAX);
+    if (mi_ctx->frames[2].avf->pts > mi_ctx->frames[1].avf->pts) {
+        alpha = (pts - mi_ctx->frames[1].avf->pts * ALPHA_MAX) / (mi_ctx->frames[2].avf->pts - mi_ctx->frames[1].avf->pts);
+        alpha = av_clip(alpha, 0, ALPHA_MAX);
+    } else {
+        av_log(ctx, AV_LOG_DEBUG, "duplicate input PTS detected\n");
+        alpha = 0;
+    }
 
     if (alpha == 0 || alpha == ALPHA_MAX) {
         av_frame_copy(avf_out, alpha ? mi_ctx->frames[2].avf : mi_ctx->frames[1].avf);
@@ -1189,6 +1197,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *avf_in)
 
         av_frame_copy_props(avf_out, mi_ctx->frames[NB_FRAMES - 1].avf);
         avf_out->pts = mi_ctx->out_pts++;
+        avf_out->duration = 1;
 
         interpolate(inlink, avf_out);
 
@@ -1247,11 +1256,11 @@ static const AVFilterPad minterpolate_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_minterpolate = {
-    .name          = "minterpolate",
-    .description   = NULL_IF_CONFIG_SMALL("Frame rate conversion using Motion Interpolation."),
+const FFFilter ff_vf_minterpolate = {
+    .p.name        = "minterpolate",
+    .p.description = NULL_IF_CONFIG_SMALL("Frame rate conversion using Motion Interpolation."),
+    .p.priv_class  = &minterpolate_class,
     .priv_size     = sizeof(MIContext),
-    .priv_class    = &minterpolate_class,
     .uninit        = uninit,
     FILTER_INPUTS(minterpolate_inputs),
     FILTER_OUTPUTS(minterpolate_outputs),

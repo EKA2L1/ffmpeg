@@ -30,7 +30,8 @@
 #include "libavutil/opt.h"
 #include "libavutil/avassert.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
 typedef int (*hqxfunc_t)(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
 
@@ -387,8 +388,8 @@ static av_always_inline void hqx_filter(const ThreadData *td, int jobnr, int nb_
     const uint32_t *r2y = td->rgbtoyuv;
     const int height = in->height;
     const int width  = in->width;
-    const int slice_start = (height *  jobnr   ) / nb_jobs;
-    const int slice_end   = (height * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int slice_end   = ff_slice_pos(height, jobnr + 1, nb_jobs);
     const int dst_linesize = out->linesize[0];
     const int src_linesize =  in->linesize[0];
     uint8_t       *dst = out->data[0] + slice_start * dst_linesize * n;
@@ -543,14 +544,14 @@ static const AVFilterPad hqx_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_hqx = {
-    .name          = "hqx",
-    .description   = NULL_IF_CONFIG_SMALL("Scale the input by 2, 3 or 4 using the hq*x magnification algorithm."),
+const FFFilter ff_vf_hqx = {
+    .p.name        = "hqx",
+    .p.description = NULL_IF_CONFIG_SMALL("Scale the input by 2, 3 or 4 using the hq*x magnification algorithm."),
+    .p.priv_class  = &hqx_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(HQXContext),
     .init          = init,
     FILTER_INPUTS(hqx_inputs),
     FILTER_OUTPUTS(hqx_outputs),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_RGB32),
-    .priv_class    = &hqx_class,
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,
 };

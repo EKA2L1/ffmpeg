@@ -35,7 +35,6 @@ extern const int8_t ff_mpeg4_intra_level[102];
 extern const int8_t ff_mpeg4_intra_run[102];
 
 extern RLTable ff_mpeg4_rl_intra;
-void ff_mpeg4_init_rl_intra(void);
 
 /* Note this is identical to the intra rvlc except that it is reordered. */
 extern RLTable ff_rvlc_rl_inter;
@@ -50,7 +49,6 @@ extern const int16_t ff_mpeg4_default_non_intra_matrix[64];
 
 extern const uint8_t ff_mpeg4_y_dc_scale_table[32];
 extern const uint8_t ff_mpeg4_c_dc_scale_table[32];
-extern const uint16_t ff_mpeg4_resync_prefix[8];
 
 extern const uint8_t ff_mpeg4_dc_threshold[8];
 

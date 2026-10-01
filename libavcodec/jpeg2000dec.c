@@ -32,15 +32,19 @@
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avcodec.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "thread.h"
 #include "jpeg2000.h"
 #include "jpeg2000dsp.h"
 #include "profiles.h"
+#include "jpeg2000dec.h"
+#include "jpeg2000htdec.h"
 
 #define JP2_SIG_TYPE    0x6A502020
 #define JP2_SIG_VALUE   0x0D0A870A
@@ -50,92 +54,14 @@
 #define HAD_COC 0x01
 #define HAD_QCC 0x02
 
-#define MAX_POCS 32
+// Values of flag for placeholder passes
+enum HT_PLHD_STATUS {
+    HT_PLHD_OFF,
+    HT_PLHD_ON
+};
 
-typedef struct Jpeg2000POCEntry {
-    uint16_t LYEpoc;
-    uint16_t CSpoc;
-    uint16_t CEpoc;
-    uint8_t RSpoc;
-    uint8_t REpoc;
-    uint8_t Ppoc;
-} Jpeg2000POCEntry;
+#define HT_MIXED 0x80 // bit 7 of SPcod/SPcoc
 
-typedef struct Jpeg2000POC {
-    Jpeg2000POCEntry poc[MAX_POCS];
-    int nb_poc;
-    int is_default;
-} Jpeg2000POC;
-
-typedef struct Jpeg2000TilePart {
-    uint8_t tile_index;                 // Tile index who refers the tile-part
-    const uint8_t *tp_end;
-    GetByteContext header_tpg;          // bit stream of header if PPM header is used
-    GetByteContext tpg;                 // bit stream in tile-part
-} Jpeg2000TilePart;
-
-/* RMK: For JPEG2000 DCINEMA 3 tile-parts in a tile
- * one per component, so tile_part elements have a size of 3 */
-typedef struct Jpeg2000Tile {
-    Jpeg2000Component   *comp;
-    uint8_t             properties[4];
-    Jpeg2000CodingStyle codsty[4];
-    Jpeg2000QuantStyle  qntsty[4];
-    Jpeg2000POC         poc;
-    Jpeg2000TilePart    tile_part[32];
-    uint8_t             has_ppt;                // whether this tile has a ppt marker
-    uint8_t             *packed_headers;        // contains packed headers. Used only along with PPT marker
-    int                 packed_headers_size;    // size in bytes of the packed headers
-    GetByteContext      packed_headers_stream;  // byte context corresponding to packed headers
-    uint16_t tp_idx;                    // Tile-part index
-    int coord[2][2];                    // border coordinates {{x0, x1}, {y0, y1}}
-} Jpeg2000Tile;
-
-typedef struct Jpeg2000DecoderContext {
-    AVClass         *class;
-    AVCodecContext  *avctx;
-    GetByteContext  g;
-
-    int             width, height;
-    int             image_offset_x, image_offset_y;
-    int             tile_offset_x, tile_offset_y;
-    uint8_t         cbps[4];    // bits per sample in particular components
-    uint8_t         sgnd[4];    // if a component is signed
-    uint8_t         properties[4];
-
-    uint8_t         has_ppm;
-    uint8_t         *packed_headers; // contains packed headers. Used only along with PPM marker
-    int             packed_headers_size;
-    GetByteContext  packed_headers_stream;
-    uint8_t         in_tile_headers;
-
-    int             cdx[4], cdy[4];
-    int             precision;
-    int             ncomponents;
-    int             colour_space;
-    uint32_t        palette[256];
-    int8_t          pal8;
-    int             cdef[4];
-    int             tile_width, tile_height;
-    unsigned        numXtiles, numYtiles;
-    int             maxtilelen;
-    AVRational      sar;
-
-    Jpeg2000CodingStyle codsty[4];
-    Jpeg2000QuantStyle  qntsty[4];
-    Jpeg2000POC         poc;
-    uint8_t             roi_shift[4];
-
-    int             bit_index;
-
-    int             curtileno;
-
-    Jpeg2000Tile    *tile;
-    Jpeg2000DSPContext dsp;
-
-    /*options parameters*/
-    int             reduction_factor;
-} Jpeg2000DecoderContext;
 
 /* get_bits functions for JPEG2000 packet bitstream
  * It is a get_bit function with a bit-stuffing routine. If the value of the
@@ -221,14 +147,17 @@ static int pix_fmt_match(enum AVPixelFormat pix_fmt, int components,
         match = match && desc->comp[3].depth >= bpc &&
                          (log2_chroma_wh >> 14 & 3) == 0 &&
                          (log2_chroma_wh >> 12 & 3) == 0;
+        av_fallthrough;
     case 3:
         match = match && desc->comp[2].depth >= bpc &&
                          (log2_chroma_wh >> 10 & 3) == desc->log2_chroma_w &&
                          (log2_chroma_wh >>  8 & 3) == desc->log2_chroma_h;
+        av_fallthrough;
     case 2:
         match = match && desc->comp[1].depth >= bpc &&
                          (log2_chroma_wh >>  6 & 3) == desc->log2_chroma_w &&
                          (log2_chroma_wh >>  4 & 3) == desc->log2_chroma_h;
+        av_fallthrough;
 
     case 1:
         match = match && desc->comp[0].depth >= bpc &&
@@ -322,6 +251,16 @@ static int get_siz(Jpeg2000DecoderContext *s)
         return AVERROR_INVALIDDATA;
     }
 
+    if (s->image_offset_x >= s->width || s->image_offset_y >= s->height) {
+        av_log(s->avctx, AV_LOG_ERROR, "image offsets outside image");
+        return AVERROR_INVALIDDATA;
+    }
+
+    if (s->reduction_factor && (s->image_offset_x || s->image_offset_y) ){
+        av_log(s->avctx, AV_LOG_ERROR, "reduction factor with image offsets is not fully implemented");
+        return AVERROR_PATCHWELCOME;
+    }
+
     s->ncomponents = ncomponents;
 
     if (s->tile_width <= 0 || s->tile_height <= 0) {
@@ -335,6 +274,25 @@ static int get_siz(Jpeg2000DecoderContext *s)
         return AVERROR_INVALIDDATA;
     }
 
+    for (i = 0; i < s->ncomponents; i++) {
+        if (s->cdef[i] < 0) {
+            for (i = 0; i < s->ncomponents; i++) {
+                s->cdef[i] = i + 1;
+            }
+            if ((s->ncomponents & 1) == 0)
+                s->cdef[s->ncomponents-1] = 0;
+        }
+    }
+    // after here we no longer have to consider negative cdef
+
+    int cdef_used = 0;
+    for (i = 0; i < s->ncomponents; i++)
+        cdef_used |= 1<<s->cdef[i];
+
+    // Check that the channels we have are what we expect for the number of components
+    if (cdef_used != ((int[]){0,2,3,14,15})[s->ncomponents])
+        return AVERROR_INVALIDDATA;
+
     for (i = 0; i < s->ncomponents; i++) { // Ssiz_i XRsiz_i, YRsiz_i
         uint8_t x    = bytestream2_get_byteu(&s->g);
         s->cbps[i]   = (x & 0x7f) + 1;
@@ -347,7 +305,9 @@ static int get_siz(Jpeg2000DecoderContext *s)
             av_log(s->avctx, AV_LOG_ERROR, "Invalid sample separation %d/%d\n", s->cdx[i], s->cdy[i]);
             return AVERROR_INVALIDDATA;
         }
-        log2_chroma_wh |= s->cdy[i] >> 1 << i * 4 | s->cdx[i] >> 1 << i * 4 + 2;
+        int i_remapped = s->cdef[i] ? s->cdef[i]-1 : (s->ncomponents-1);
+
+        log2_chroma_wh |= s->cdy[i] >> 1 << i_remapped * 4 | s->cdx[i] >> 1 << i_remapped * 4 + 2;
     }
 
     s->numXtiles = ff_jpeg2000_ceildiv(s->width  - s->tile_offset_x, s->tile_width);
@@ -387,12 +347,12 @@ static int get_siz(Jpeg2000DecoderContext *s)
         dimy = FFMAX(dimy, ff_jpeg2000_ceildiv(o_dimy, s->cdy[i]));
     }
 
-    ret = ff_set_dimensions(s->avctx, dimx, dimy);
+    ret = ff_set_dimensions(s->avctx, dimx << s->avctx->lowres, dimy << s->avctx->lowres);
     if (ret < 0)
         return ret;
 
-    if (s->avctx->profile == FF_PROFILE_JPEG2000_DCINEMA_2K ||
-        s->avctx->profile == FF_PROFILE_JPEG2000_DCINEMA_4K) {
+    if (s->avctx->profile == AV_PROFILE_JPEG2000_DCINEMA_2K ||
+        s->avctx->profile == AV_PROFILE_JPEG2000_DCINEMA_4K) {
         possible_fmts = xyz_pix_fmts;
         possible_fmts_nb = FF_ARRAY_ELEMS(xyz_pix_fmts);
     } else {
@@ -448,8 +408,15 @@ static int get_siz(Jpeg2000DecoderContext *s)
                    s->cdx[0] == s->cdx[1] && s->cdy[0] == s->cdy[1]) {
             s->avctx->pix_fmt = AV_PIX_FMT_YA8;
             i = 0;
+        } else if (ncomponents == 2 && s->precision == 16 &&
+                   s->cdx[0] == s->cdx[1] && s->cdy[0] == s->cdy[1]) {
+            s->avctx->pix_fmt = AV_PIX_FMT_YA16;
+            i = 0;
         } else if (ncomponents == 1 && s->precision == 8) {
             s->avctx->pix_fmt = AV_PIX_FMT_GRAY8;
+            i = 0;
+        } else if (ncomponents == 1 && s->precision == 12) {
+            s->avctx->pix_fmt = AV_PIX_FMT_GRAY16LE;
             i = 0;
         }
     }
@@ -475,6 +442,73 @@ static int get_siz(Jpeg2000DecoderContext *s)
         return AVERROR_PATCHWELCOME;
     }
     s->avctx->bits_per_raw_sample = s->precision;
+    return 0;
+}
+/* get extended capabilities (CAP) marker segment */
+static int get_cap(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *c)
+{
+    uint32_t Pcap;
+    uint16_t Ccap_i[32] = { 0 };
+    uint16_t Ccap_15;
+    uint8_t P;
+
+    if (bytestream2_get_bytes_left(&s->g) < 6) {
+        av_log(s->avctx, AV_LOG_ERROR, "Underflow while parsing the CAP marker\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    Pcap = bytestream2_get_be32u(&s->g);
+    s->isHT = (Pcap >> (31 - (15 - 1))) & 1;
+    for (int i = 0; i < 32; i++) {
+        if ((Pcap >> (31 - i)) & 1)
+            Ccap_i[i] = bytestream2_get_be16u(&s->g);
+    }
+    Ccap_15 = Ccap_i[14];
+    if (s->isHT == 1) {
+        av_log(s->avctx, AV_LOG_INFO, "This codestream uses the HT block coder.\n");
+        // Bits 14-15
+        switch ((Ccap_15 >> 14) & 0x3) {
+            case 0x3:
+                s->Ccap15_b14_15 = HTJ2K_MIXED;
+                break;
+            case 0x1:
+                s->Ccap15_b14_15 = HTJ2K_HTDECLARED;
+                break;
+            case 0x0:
+                s->Ccap15_b14_15 = HTJ2K_HTONLY;
+                break;
+            default:
+                av_log(s->avctx, AV_LOG_ERROR, "Unknown CCap value.\n");
+                return AVERROR(EINVAL);
+                break;
+        }
+        // Bit 13
+        if ((Ccap_15 >> 13) & 1) {
+            av_log(s->avctx, AV_LOG_ERROR, "MULTIHT set is not supported.\n");
+            return AVERROR_PATCHWELCOME;
+        }
+        // Bit 12
+        s->Ccap15_b12 = (Ccap_15 >> 12) & 1;
+        // Bit 11
+        s->Ccap15_b11 = (Ccap_15 >> 11) & 1;
+        // Bit 5
+        s->Ccap15_b05 = (Ccap_15 >> 5) & 1;
+        // Bit 0-4
+        P = Ccap_15 & 0x1F;
+        if (!P)
+            s->HT_B = 8;
+        else if (P < 20)
+            s->HT_B = P + 8;
+        else if (P < 31)
+            s->HT_B = 4 * (P - 19) + 27;
+        else
+            s->HT_B = 74;
+
+        if (s->HT_B > 31) {
+            av_log(s->avctx, AV_LOG_ERROR, "Codestream exceeds available precision (B > 31).\n");
+            return AVERROR_PATCHWELCOME;
+        }
+    }
     return 0;
 }
 
@@ -520,17 +554,18 @@ static int get_cox(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *c)
 
     c->cblk_style = bytestream2_get_byteu(&s->g);
     if (c->cblk_style != 0) { // cblk style
-        av_log(s->avctx, AV_LOG_WARNING, "extra cblk styles %X\n", c->cblk_style);
-        if (c->cblk_style & JPEG2000_CBLK_BYPASS)
-            av_log(s->avctx, AV_LOG_WARNING, "Selective arithmetic coding bypass\n");
+        if (c->cblk_style & JPEG2000_CTSY_HTJ2K_M || c->cblk_style & JPEG2000_CTSY_HTJ2K_F) {
+            av_log(s->avctx,AV_LOG_TRACE,"High Throughput jpeg 2000 codestream.\n");
+        } else {
+            av_log(s->avctx, AV_LOG_WARNING, "extra cblk styles %X\n", c->cblk_style);
+            if (c->cblk_style & JPEG2000_CBLK_BYPASS)
+                av_log(s->avctx, AV_LOG_WARNING, "Selective arithmetic coding bypass\n");
+        }
     }
     c->transform = bytestream2_get_byteu(&s->g); // DWT transformation type
     /* set integer 9/7 DWT in case of BITEXACT flag */
     if ((s->avctx->flags & AV_CODEC_FLAG_BITEXACT) && (c->transform == FF_DWT97))
         c->transform = FF_DWT97_INT;
-    else if (c->transform == FF_DWT53) {
-        s->avctx->properties |= FF_CODEC_PROPERTY_LOSSLESS;
-    }
 
     if (c->csty & JPEG2000_CSTY_PREC) {
         int i;
@@ -555,7 +590,7 @@ static int get_cox(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *c)
 
 /* get coding parameters for a particular tile or whole image*/
 static int get_cod(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *c,
-                   uint8_t *properties)
+                   const uint8_t *properties)
 {
     Jpeg2000CodingStyle tmp;
     int compno, ret;
@@ -705,7 +740,7 @@ static int get_qcx(Jpeg2000DecoderContext *s, int n, Jpeg2000QuantStyle *q)
 
 /* Get quantization parameters for a particular tile or a whole image. */
 static int get_qcd(Jpeg2000DecoderContext *s, int n, Jpeg2000QuantStyle *q,
-                   uint8_t *properties)
+                   const uint8_t *properties)
 {
     Jpeg2000QuantStyle tmp;
     int compno, ret;
@@ -867,6 +902,15 @@ static int read_crg(Jpeg2000DecoderContext *s, int n)
     bytestream2_skip(&s->g, n - 2);
     return 0;
 }
+
+static int read_cpf(Jpeg2000DecoderContext *s, int n)
+{
+    if (bytestream2_get_bytes_left(&s->g) < (n - 2))
+        return AVERROR_INVALIDDATA;
+    bytestream2_skip(&s->g, n - 2);
+    return 0;
+}
+
 /* Tile-part lengths: see ISO 15444-1:2002, section A.7.1
  * Used to know the number of tile parts and lengths.
  * There may be multiple TLMs in the header.
@@ -899,9 +943,6 @@ static int get_tlm(Jpeg2000DecoderContext *s, int n)
             break;
         case 2:
             bytestream2_get_be16(&s->g);
-            break;
-        case 3:
-            bytestream2_get_be32(&s->g);
             break;
         }
         if (SP == 0) {
@@ -952,8 +993,8 @@ static int get_ppm(Jpeg2000DecoderContext *s, int n)
         return AVERROR(ENOMEM);
     s->has_ppm = 1;
     memset(&s->packed_headers_stream, 0, sizeof(s->packed_headers_stream));
-    bytestream_get_buffer(&s->g.buffer, s->packed_headers + s->packed_headers_size,
-                          n - 3);
+    bytestream2_get_bufferu(&s->g, s->packed_headers + s->packed_headers_size,
+                            n - 3);
     s->packed_headers_size += n - 3;
 
     return 0;
@@ -987,10 +1028,8 @@ static int get_ppt(Jpeg2000DecoderContext *s, int n)
     } else
         return AVERROR(ENOMEM);
     memset(&tile->packed_headers_stream, 0, sizeof(tile->packed_headers_stream));
-    memcpy(tile->packed_headers + tile->packed_headers_size,
-           s->g.buffer, n - 3);
+    bytestream2_get_bufferu(&s->g, tile->packed_headers + tile->packed_headers_size, n - 3);
     tile->packed_headers_size += n - 3;
-    bytestream2_skip(&s->g, n - 3);
 
     return 0;
 }
@@ -1035,6 +1074,14 @@ static int init_tile(Jpeg2000DecoderContext *s, int tileno)
             comp->roi_shift = s->roi_shift[compno];
         if (!codsty->init)
             return AVERROR_INVALIDDATA;
+        if (s->isHT && (!s->Ccap15_b05) && (!codsty->transform)) {
+            av_log(s->avctx, AV_LOG_ERROR, "Transformation = 0 (lossy DWT) is found in HTREV HT set\n");
+            return AVERROR_INVALIDDATA;
+        }
+        if (s->isHT && s->Ccap15_b14_15 != (codsty->cblk_style >> 6) && s->Ccap15_b14_15 != HTJ2K_HTONLY) {
+            av_log(s->avctx, AV_LOG_ERROR, "SPcod/SPcoc value does not match bit 14-15 values of Ccap15\n");
+            return AVERROR_INVALIDDATA;
+        }
         if (ret = ff_jpeg2000_init_component(comp, codsty, qntsty,
                                              s->cbps[compno], s->cdx[compno],
                                              s->cdy[compno], s->avctx))
@@ -1070,24 +1117,33 @@ static int getlblockinc(Jpeg2000DecoderContext *s)
     return res;
 }
 
-static inline void select_header(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile,
+static inline void select_header(Jpeg2000DecoderContext *s, const Jpeg2000Tile *tile,
                                  int *tp_index)
 {
     s->g = tile->tile_part[*tp_index].header_tpg;
     if (bytestream2_get_bytes_left(&s->g) == 0 && s->bit_index == 8) {
+        av_log(s->avctx, AV_LOG_WARNING, "Packet header bytes in PPM marker segment is too short.\n");
         if (*tp_index < FF_ARRAY_ELEMS(tile->tile_part) - 1) {
             s->g = tile->tile_part[++(*tp_index)].tpg;
         }
     }
 }
 
-static inline void select_stream(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile,
-                                 int *tp_index, Jpeg2000CodingStyle *codsty)
+static inline void select_stream(Jpeg2000DecoderContext *s, const Jpeg2000Tile *tile,
+                                 int *tp_index, const Jpeg2000CodingStyle *codsty)
 {
+    int32_t is_endof_tp;
+
     s->g = tile->tile_part[*tp_index].tpg;
-    if (bytestream2_get_bytes_left(&s->g) == 0 && s->bit_index == 8) {
+    is_endof_tp = bytestream2_get_bytes_left(&s->g) == 0 && s->bit_index == 8;
+    // Following while loop is necessary because a tilepart may include only SOD marker.
+    // Such a tilepart has neither packet header nor compressed data.
+    while (is_endof_tp) {
         if (*tp_index < FF_ARRAY_ELEMS(tile->tile_part) - 1) {
             s->g = tile->tile_part[++(*tp_index)].tpg;
+            is_endof_tp = bytestream2_get_bytes_left(&s->g) == 0 && s->bit_index == 8;
+        } else {
+            is_endof_tp = 0;
         }
     }
     if (codsty->csty & JPEG2000_CSTY_SOP) {
@@ -1099,9 +1155,9 @@ static inline void select_stream(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile,
 }
 
 static int jpeg2000_decode_packet(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile, int *tp_index,
-                                  Jpeg2000CodingStyle *codsty,
+                                  const Jpeg2000CodingStyle *codsty,
                                   Jpeg2000ResLevel *rlevel, int precno,
-                                  int layno, uint8_t *expn, int numgbits)
+                                  int layno, const uint8_t *expn, int numgbits)
 {
     int bandno, cblkno, ret, nb_code_blocks;
     int cwsno;
@@ -1137,83 +1193,293 @@ static int jpeg2000_decode_packet(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile,
             int incl, newpasses, llen;
             void *tmp;
 
-            if (cblk->npasses)
-                incl = get_bits(s, 1);
-            else
+            if (!cblk->incl) {
+                incl = 0;
+                cblk->modes = codsty->cblk_style;
+                if (cblk->modes >= JPEG2000_CTSY_HTJ2K_F)
+                    cblk->ht_plhd = HT_PLHD_ON;
+                if (layno > 0)
+                    incl = tag_tree_decode(s, prec->cblkincl + cblkno, 0 + 1) == 0;
                 incl = tag_tree_decode(s, prec->cblkincl + cblkno, layno + 1) == layno;
-            if (!incl)
-                continue;
-            else if (incl < 0)
-                return incl;
 
-            if (!cblk->npasses) {
-                int v = expn[bandno] + numgbits - 1 -
-                        tag_tree_decode(s, prec->zerobits + cblkno, 100);
-                if (v < 0 || v > 30) {
-                    av_log(s->avctx, AV_LOG_ERROR,
-                           "nonzerobits %d invalid or unsupported\n", v);
-                    return AVERROR_INVALIDDATA;
+                if (incl) {
+                    int zbp = tag_tree_decode(s, prec->zerobits + cblkno, 100);
+                    int v = expn[bandno] + numgbits - 1 - (zbp - tile->comp->roi_shift);
+                    if (v < 0 || v > 30) {
+                        av_log(s->avctx, AV_LOG_ERROR,
+                               "nonzerobits %d invalid or unsupported\n", v);
+                        return AVERROR_INVALIDDATA;
+                    }
+                    cblk->incl = 1;
+                    cblk->nonzerobits = v;
+                    cblk->zbp = zbp;
+                    cblk->lblock = 3;
                 }
-                cblk->nonzerobits = v;
-            }
-            if ((newpasses = getnpasses(s)) < 0)
-                return newpasses;
-            av_assert2(newpasses > 0);
-            if (cblk->npasses + newpasses >= JPEG2000_MAX_PASSES) {
-                avpriv_request_sample(s->avctx, "Too many passes");
-                return AVERROR_PATCHWELCOME;
-            }
-            if ((llen = getlblockinc(s)) < 0)
-                return llen;
-            if (cblk->lblock + llen + av_log2(newpasses) > 16) {
-                avpriv_request_sample(s->avctx,
-                                      "Block with length beyond 16 bits");
-                return AVERROR_PATCHWELCOME;
+            } else {
+                incl = get_bits(s, 1);
             }
 
-            cblk->lblock += llen;
+            if (incl) {
+                uint8_t bypass_term_threshold = 0;
+                uint8_t bits_to_read = 0;
+                uint32_t segment_bytes = 0;
+                int32_t segment_passes = 0;
+                uint8_t next_segment_passes = 0;
+                int32_t href_passes, pass_bound;
+                uint32_t tmp_length = 0;
+                int32_t newpasses_copy, npasses_copy;
 
-            cblk->nb_lengthinc = 0;
-            cblk->nb_terminationsinc = 0;
-            av_free(cblk->lengthinc);
-            cblk->lengthinc = av_calloc(newpasses, sizeof(*cblk->lengthinc));
-            if (!cblk->lengthinc)
-                return AVERROR(ENOMEM);
-            tmp = av_realloc_array(cblk->data_start, cblk->nb_terminations + newpasses + 1, sizeof(*cblk->data_start));
-            if (!tmp)
-                return AVERROR(ENOMEM);
-            cblk->data_start = tmp;
-            do {
-                int newpasses1 = 0;
+                if ((newpasses = getnpasses(s)) <= 0)
+                    return newpasses;
+                if (cblk->npasses + newpasses >= JPEG2000_MAX_PASSES) {
+                    avpriv_request_sample(s->avctx, "Too many passes");
+                    return AVERROR_PATCHWELCOME;
+                }
+                if ((llen = getlblockinc(s)) < 0)
+                    return llen;
+                if (cblk->lblock + llen + av_log2(newpasses) > 16) {
+                    avpriv_request_sample(s->avctx,
+                                          "Block with length beyond 16 bits");
+                    return AVERROR_PATCHWELCOME;
+                }
+                cblk->nb_lengthinc = 0;
+                cblk->nb_terminationsinc = 0;
+                av_free(cblk->lengthinc);
+                cblk->lengthinc = av_calloc(newpasses, sizeof(*cblk->lengthinc));
+                if (!cblk->lengthinc)
+                    return AVERROR(ENOMEM);
+                tmp = av_realloc_array(cblk->data_start, cblk->nb_terminations + newpasses + 1,
+                                       sizeof(*cblk->data_start));
+                if (!tmp)
+                    return AVERROR(ENOMEM);
+                cblk->data_start = tmp;
+                cblk->lblock += llen;
 
-                while (newpasses1 < newpasses) {
-                    newpasses1 ++;
-                    if (needs_termination(codsty->cblk_style, cblk->npasses + newpasses1 - 1)) {
-                        cblk->nb_terminationsinc ++;
-                        break;
+                // Count number of necessary terminations for non HT code block
+                newpasses_copy = newpasses;
+                npasses_copy = cblk->npasses;
+                if (!(cblk->modes & JPEG2000_CTSY_HTJ2K_F)) {
+                    do {
+                        int newpasses1 = 0;
+
+                        while (newpasses1 < newpasses_copy) {
+                            newpasses1++;
+                            if (needs_termination(codsty->cblk_style, npasses_copy + newpasses1 - 1)) {
+                                cblk->nb_terminationsinc++;
+                                break;
+                            }
+                        }
+                        npasses_copy += newpasses1;
+                        newpasses_copy -= newpasses1;
+                    } while (newpasses_copy);
+                }
+
+                if (cblk->ht_plhd) {
+                    href_passes = (cblk->npasses + newpasses - 1) % 3;
+                    segment_passes = newpasses - href_passes;
+                    pass_bound = 2;
+                    bits_to_read = cblk->lblock;
+                    if (segment_passes < 1) {
+                        // No possible HT Cleanup pass here; may have placeholder passes
+                        // or an original J2K block bit-stream (in MIXED mode).
+                        segment_passes = newpasses;
+                        while (pass_bound <= segment_passes) {
+                            bits_to_read++;
+                            pass_bound += pass_bound;
+                        }
+                        segment_bytes = get_bits(s, bits_to_read);
+                        if (segment_bytes) {
+                            if (cblk->modes & HT_MIXED) {
+                                cblk->ht_plhd = HT_PLHD_OFF;
+                                cblk->modes &= (uint8_t) (~(JPEG2000_CTSY_HTJ2K_F));
+                            }
+                            else {
+                                av_log(s->avctx, AV_LOG_WARNING, "Length information for a HT-codeblock is invalid\n");
+                            }
+                        }
+                    } else {
+                        while (pass_bound <= segment_passes) {
+                            bits_to_read++;
+                            pass_bound += pass_bound;
+                        }
+                        segment_bytes = get_bits(s, bits_to_read);
+                        if (segment_bytes) {
+                            // No more placeholder passes
+                            if (!(cblk->modes & HT_MIXED)) {
+                                // Must be the first HT Cleanup pass
+                                if (segment_bytes < 2)
+                                    av_log(s->avctx, AV_LOG_WARNING, "Length information for a HT-codeblock is invalid\n");
+                                next_segment_passes = 2;
+                                cblk->ht_plhd = HT_PLHD_OFF;
+                                // Write length information for HT CleanUp segment
+                                cblk->pass_lengths[0] = segment_bytes;
+                            } else if (cblk->lblock > 3 && segment_bytes > 1
+                                       && (segment_bytes >> (bits_to_read - 1)) == 0) {
+                                // Must be the first HT Cleanup pass, since length MSB is 0
+                                next_segment_passes = 2;
+                                cblk->ht_plhd = HT_PLHD_OFF;
+                                // Write length information for HT CleanUp segment
+                                cblk->pass_lengths[0] = segment_bytes;
+                            } else {
+                                // Must have an original (non-HT) block coding pass
+                                cblk->modes &= (uint8_t) (~(JPEG2000_CTSY_HTJ2K_F));
+                                cblk->ht_plhd = HT_PLHD_OFF;
+                                segment_passes = newpasses;
+                                while (pass_bound <= segment_passes) {
+                                    bits_to_read++;
+                                    pass_bound += pass_bound;
+                                    segment_bytes <<= 1;
+                                    segment_bytes += get_bits(s, 1);
+                                }
+                            }
+                        } else {
+                            // Probably parsing placeholder passes, but we need to read an
+                            // extra length bit to verify this, since prior to the first
+                            // HT Cleanup pass, the number of length bits read for a
+                            // contributing code-block is dependent on the number of passes
+                            // being included, as if it were a non-HT code-block.
+                            segment_passes = newpasses;
+                            if (pass_bound <= segment_passes) {
+                                while (1) {
+                                    bits_to_read++;
+                                    pass_bound += pass_bound;
+                                    segment_bytes <<= 1;
+                                    segment_bytes += get_bits(s, 1);
+                                    if (pass_bound > segment_passes)
+                                        break;
+                                }
+                                if (segment_bytes) {
+                                    if (cblk->modes & HT_MIXED) {
+                                        cblk->modes &= (uint8_t) (~(JPEG2000_CTSY_HTJ2K_F));
+                                        cblk->ht_plhd = HT_PLHD_OFF;
+                                    } else {
+                                        av_log(s->avctx, AV_LOG_WARNING, "Length information for a HT-codeblock is invalid\n");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if (cblk->modes & JPEG2000_CTSY_HTJ2K_F) {
+                    // Quality layer commences with a non-initial HT coding pass
+                    if(bits_to_read != 0)
+                        av_log(s->avctx, AV_LOG_WARNING, "Length information for a HT-codeblock is invalid\n");
+                    segment_passes = cblk->npasses % 3;
+                    if (segment_passes == 0) {
+                        // newpasses is a HT Cleanup pass; next segment has refinement passes
+                        segment_passes = 1;
+                        next_segment_passes = 2;
+                        if (segment_bytes == 1)
+                            av_log(s->avctx, AV_LOG_WARNING, "Length information for a HT-codeblock is invalid\n");
+                    } else {
+                        // newpasses = 1 means npasses is HT SigProp; 2 means newpasses is
+                        // HT MagRef pass
+                        segment_passes = newpasses > 1 ? 3 - segment_passes : 1;
+                        next_segment_passes = 1;
+                        bits_to_read = av_log2(segment_passes);
+                    }
+                    bits_to_read = (uint8_t) (bits_to_read + cblk->lblock);
+                    segment_bytes = get_bits(s, bits_to_read);
+                    // Write length information for HT Refinement segment
+                    cblk->pass_lengths[1] += segment_bytes;
+                } else if (!(cblk->modes & (JPEG2000_CBLK_TERMALL | JPEG2000_CBLK_BYPASS))) {
+                    // Common case for non-HT code-blocks; we have only one segment
+                    bits_to_read = (uint8_t) cblk->lblock + av_log2((uint8_t) newpasses);
+                    segment_bytes = get_bits(s, bits_to_read);
+                    segment_passes = newpasses;
+                } else if (cblk->modes & JPEG2000_CBLK_TERMALL) {
+                    // RESTART MODE
+                    bits_to_read = cblk->lblock;
+                    segment_bytes = get_bits(s, bits_to_read);
+                    segment_passes = 1;
+                    next_segment_passes = 1;
+                } else {
+                    // BYPASS MODE
+                    bypass_term_threshold = 10;
+                    if(bits_to_read != 0)
+                        av_log(s->avctx, AV_LOG_WARNING, "Length information for a codeblock is invalid\n");
+                    if (cblk->npasses < bypass_term_threshold) {
+                        // May have from 1 to 10 uninterrupted passes before 1st RAW SigProp
+                        segment_passes = bypass_term_threshold - cblk->npasses;
+                        if (segment_passes > newpasses)
+                            segment_passes = newpasses;
+                        while ((2 << bits_to_read) <= segment_passes)
+                            bits_to_read++;
+                        next_segment_passes = 2;
+                    } else if ((cblk->npasses - bypass_term_threshold) % 3 < 2) {
+                        // 0 means newpasses is a RAW SigProp; 1 means newpasses is a RAW MagRef pass
+                        segment_passes = newpasses > 1 ? 2 - (cblk->npasses - bypass_term_threshold) % 3 : 1;
+                        bits_to_read = av_log2(segment_passes);
+                        next_segment_passes = 1;
+                    } else {
+                        // newpasses is an isolated Cleanup pass that precedes a RAW SigProp pass
+                        segment_passes = 1;
+                        next_segment_passes = 2;
+                    }
+                    bits_to_read = (uint8_t) (bits_to_read + cblk->lblock);
+                    segment_bytes = get_bits(s, bits_to_read);
+                }
+                // Update cblk->npasses and write length information
+                cblk->npasses = (uint8_t) (cblk->npasses + segment_passes);
+                cblk->lengthinc[cblk->nb_lengthinc++] = segment_bytes;
+
+                if ((cblk->modes & JPEG2000_CTSY_HTJ2K_F) && cblk->ht_plhd == HT_PLHD_OFF) {
+                    newpasses -= (uint8_t) segment_passes;
+                    while (newpasses > 0) {
+                        segment_passes = newpasses > 1 ? next_segment_passes : 1;
+                        next_segment_passes = (uint8_t) (3 - next_segment_passes);
+                        bits_to_read = (uint8_t) (cblk->lblock + av_log2(segment_passes));
+                        segment_bytes = get_bits(s, bits_to_read);
+                        newpasses -= (uint8_t) (segment_passes);
+                        // This is a FAST Refinement pass
+                        // Write length information for HT Refinement segment
+                        cblk->pass_lengths[1] += segment_bytes;
+                        // Update cblk->npasses and write length information
+                        cblk->npasses = (uint8_t) (cblk->npasses + segment_passes);
+                        cblk->lengthinc[cblk->nb_lengthinc++] = segment_bytes;
+                    }
+                } else {
+                    newpasses -= (uint8_t) (segment_passes);
+                    while (newpasses > 0) {
+                        if (bypass_term_threshold != 0) {
+                            segment_passes = newpasses > 1 ? next_segment_passes : 1;
+                            next_segment_passes = (uint8_t) (3 - next_segment_passes);
+                            bits_to_read = (uint8_t) (cblk->lblock + av_log2(segment_passes));
+                        } else {
+                            if ((cblk->modes & JPEG2000_CBLK_TERMALL) == 0)
+                                av_log(s->avctx, AV_LOG_WARNING, "Corrupted packet header is found.\n");
+                            segment_passes = 1;
+                            bits_to_read = cblk->lblock;
+                        }
+                        segment_bytes = get_bits(s, bits_to_read);
+                        newpasses -= (uint8_t) (segment_passes);
+
+                        // Update cblk->npasses and write length information
+                        cblk->npasses = (uint8_t) (cblk->npasses + segment_passes);
+                        cblk->lengthinc[cblk->nb_lengthinc++] = segment_bytes;
                     }
                 }
 
-                if ((ret = get_bits(s, av_log2(newpasses1) + cblk->lblock)) < 0)
-                    return ret;
-                if (ret > cblk->data_allocated) {
-                    size_t new_size = FFMAX(2*cblk->data_allocated, ret);
+                for (int i = 0; i < cblk->nb_lengthinc; ++i)
+                    tmp_length = (tmp_length < cblk->lengthinc[i]) ? cblk->lengthinc[i] : tmp_length;
+
+                if (tmp_length > cblk->data_allocated) {
+                    size_t new_size = FFMAX(2 * cblk->data_allocated, tmp_length);
                     void *new = av_realloc(cblk->data, new_size);
                     if (new) {
                         cblk->data = new;
                         cblk->data_allocated = new_size;
                     }
                 }
-                if (ret > cblk->data_allocated) {
+                if (tmp_length > cblk->data_allocated) {
                     avpriv_request_sample(s->avctx,
-                                        "Block with lengthinc greater than %"SIZE_SPECIFIER"",
+                                        "Block with lengthinc greater than %zu",
                                         cblk->data_allocated);
                     return AVERROR_PATCHWELCOME;
                 }
-                cblk->lengthinc[cblk->nb_lengthinc++] = ret;
-                cblk->npasses  += newpasses1;
-                newpasses -= newpasses1;
-            } while(newpasses);
+            } else {
+                // This codeblock has no contribution to the current packet
+                continue;
+            }
         }
     }
     jpeg2000_flush(s);
@@ -1262,6 +1528,7 @@ static int jpeg2000_decode_packet(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile,
 
                 bytestream2_get_bufferu(&s->g, cblk->data + cblk->length, cblk->lengthinc[cwsno]);
                 cblk->length   += cblk->lengthinc[cwsno];
+                memset(cblk->data + cblk->length, 0, 4);
                 cblk->lengthinc[cwsno] = 0;
                 if (cblk->nb_terminationsinc) {
                     cblk->nb_terminationsinc--;
@@ -1272,6 +1539,7 @@ static int jpeg2000_decode_packet(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile,
                 }
             }
             av_freep(&cblk->lengthinc);
+            cblk->nb_lengthinc = 0;
         }
     }
     // Save state of stream
@@ -1628,7 +1896,7 @@ static void decode_sigpass(Jpeg2000T1Context *t1, int width, int height,
                            int bpno, int bandno,
                            int vert_causal_ctx_csty_symbol)
 {
-    int mask = 3 << (bpno - 1), y0, x, y;
+    int mask = (3u << bpno)>>1, y0, x, y;
 
     for (y0 = 0; y0 < height; y0 += 4)
         for (x = 0; x < width; x++)
@@ -1640,14 +1908,15 @@ static void decode_sigpass(Jpeg2000T1Context *t1, int width, int height,
                 && !(t1->flags[(y+1) * t1->stride + x+1] & (JPEG2000_T1_SIG | JPEG2000_T1_VIS))) {
                     if (ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ff_jpeg2000_getsigctxno(t1->flags[(y+1) * t1->stride + x+1] & flags_mask, bandno))) {
                         int xorbit, ctxno = ff_jpeg2000_getsgnctxno(t1->flags[(y+1) * t1->stride + x+1] & flags_mask, &xorbit);
-                        if (t1->mqc.raw)
-                             t1->data[(y) * t1->stride + x] = ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno) ? -mask : mask;
-                        else
-                             t1->data[(y) * t1->stride + x] = (ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno) ^ xorbit) ?
-                                               -mask : mask;
-
+                        if (t1->mqc.raw) {
+                            t1->data[(y) * t1->stride + x] |= (uint32_t)(ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno)) << 31;
+                            t1->data[(y) * t1->stride + x] |= mask;
+                        } else {
+                            t1->data[(y) * t1->stride + x] |= (uint32_t)(ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno) ^ xorbit) << 31;
+                            t1->data[(y) * t1->stride + x] |= mask;
+                        }
                         ff_jpeg2000_set_significance(t1, x, y,
-                                                     t1->data[(y) * t1->stride + x] < 0);
+                                                     t1->data[(y) * t1->stride + x] & INT32_MIN);
                     }
                     t1->flags[(y + 1) * t1->stride + x + 1] |= JPEG2000_T1_VIS;
                 }
@@ -1657,11 +1926,10 @@ static void decode_sigpass(Jpeg2000T1Context *t1, int width, int height,
 static void decode_refpass(Jpeg2000T1Context *t1, int width, int height,
                            int bpno, int vert_causal_ctx_csty_symbol)
 {
-    int phalf, nhalf;
+    int phalf;
     int y0, x, y;
 
-    phalf = 1 << (bpno - 1);
-    nhalf = -phalf;
+    phalf = 1 << bpno;
 
     for (y0 = 0; y0 < height; y0 += 4)
         for (x = 0; x < width; x++)
@@ -1670,19 +1938,22 @@ static void decode_refpass(Jpeg2000T1Context *t1, int width, int height,
                     int flags_mask = (vert_causal_ctx_csty_symbol && y == y0 + 3) ?
                         ~(JPEG2000_T1_SIG_S | JPEG2000_T1_SIG_SW | JPEG2000_T1_SIG_SE | JPEG2000_T1_SGN_S) : -1;
                     int ctxno = ff_jpeg2000_getrefctxno(t1->flags[(y + 1) * t1->stride + x + 1] & flags_mask);
-                    int r     = ff_mqc_decode(&t1->mqc,
-                                              t1->mqc.cx_states + ctxno)
-                                ? phalf : nhalf;
-                    t1->data[(y) * t1->stride + x]          += t1->data[(y) * t1->stride + x] < 0 ? -r : r;
+                    t1->data[(y) * t1->stride + x] |= phalf >> 1;
+                    if (ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno))
+                        t1->data[(y) * t1->stride + x] |= phalf;
+                    else {
+                        t1->data[(y) * t1->stride + x] &= ~(phalf);
+
+                    }
                     t1->flags[(y + 1) * t1->stride + x + 1] |= JPEG2000_T1_REF;
                 }
 }
 
-static void decode_clnpass(Jpeg2000DecoderContext *s, Jpeg2000T1Context *t1,
+static void decode_clnpass(const Jpeg2000DecoderContext *s, Jpeg2000T1Context *t1,
                            int width, int height, int bpno, int bandno,
                            int seg_symbols, int vert_causal_ctx_csty_symbol)
 {
-    int mask = 3 << (bpno - 1), y0, x, y, runlen, dec;
+    int mask = (3u << bpno)>>1, y0, x, y, runlen, dec;
 
     for (y0 = 0; y0 < height; y0 += 4) {
         for (x = 0; x < width; x++) {
@@ -1721,11 +1992,9 @@ static void decode_clnpass(Jpeg2000DecoderContext *s, Jpeg2000T1Context *t1,
                     int xorbit;
                     int ctxno = ff_jpeg2000_getsgnctxno(t1->flags[(y + 1) * t1->stride + x + 1] & flags_mask,
                                                         &xorbit);
-                    t1->data[(y) * t1->stride + x] = (ff_mqc_decode(&t1->mqc,
-                                                    t1->mqc.cx_states + ctxno) ^
-                                      xorbit)
-                                     ? -mask : mask;
-                    ff_jpeg2000_set_significance(t1, x, y, t1->data[(y) * t1->stride + x] < 0);
+                    t1->data[(y) * t1->stride + x] |= (uint32_t)(ff_mqc_decode(&t1->mqc, t1->mqc.cx_states + ctxno) ^ xorbit) << 31;
+                    t1->data[(y) * t1->stride + x] |= mask;
+                    ff_jpeg2000_set_significance(t1, x, y, t1->data[(y) * t1->stride + x] & INT32_MIN);
                 }
                 dec = 0;
                 t1->flags[(y + 1) * t1->stride + x + 1] &= ~JPEG2000_T1_VIS;
@@ -1744,11 +2013,11 @@ static void decode_clnpass(Jpeg2000DecoderContext *s, Jpeg2000T1Context *t1,
     }
 }
 
-static int decode_cblk(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *codsty,
+static int decode_cblk(const Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *codsty,
                        Jpeg2000T1Context *t1, Jpeg2000Cblk *cblk,
-                       int width, int height, int bandpos, uint8_t roi_shift)
+                       int width, int height, int bandpos, uint8_t roi_shift, const int M_b)
 {
-    int passno = cblk->npasses, pass_t = 2, bpno = cblk->nonzerobits - 1 + roi_shift;
+    int passno = cblk->npasses, pass_t = 2, bpno = cblk->nonzerobits - 1 + 31 - M_b - 1 - roi_shift;
     int pass_cnt = 0;
     int vert_causal_ctx_csty_symbol = codsty->cblk_style & JPEG2000_CBLK_VSC;
     int term_cnt = 0;
@@ -1770,8 +2039,8 @@ static int decode_cblk(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *codsty,
     ff_mqc_initdec(&t1->mqc, cblk->data, 0, 1);
 
     while (passno--) {
-        if (bpno < 0 || bpno > 29) {
-            av_log(s->avctx, AV_LOG_ERROR, "bpno became invalid\n");
+        if (bpno < -1 || bpno > 29) {
+            av_log(s->avctx, AV_LOG_ERROR, "bpno (%d) became invalid\n", bpno);
             return AVERROR_INVALIDDATA;
         }
         switch(pass_t) {
@@ -1798,7 +2067,7 @@ static int decode_cblk(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *codsty,
                 return AVERROR_INVALIDDATA;
             }
             if (FFABS(cblk->data + cblk->data_start[term_cnt + 1] - 2 - t1->mqc.bp) > 0) {
-                av_log(s->avctx, AV_LOG_WARNING, "Mid mismatch %"PTRDIFF_SPECIFIER" in pass %d of %d\n",
+                av_log(s->avctx, AV_LOG_WARNING, "Mid mismatch %td in pass %d of %d\n",
                     cblk->data + cblk->data_start[term_cnt + 1] - 2 - t1->mqc.bp,
                     pass_cnt, cblk->npasses);
             }
@@ -1815,7 +2084,7 @@ static int decode_cblk(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *codsty,
     }
 
     if (cblk->data + cblk->length - 2 > t1->mqc.bp) {
-        av_log(s->avctx, AV_LOG_WARNING, "End mismatch %"PTRDIFF_SPECIFIER"\n",
+        av_log(s->avctx, AV_LOG_WARNING, "End mismatch %td\n",
                cblk->data + cblk->length - 2 - t1->mqc.bp);
     }
 
@@ -1823,20 +2092,23 @@ static int decode_cblk(Jpeg2000DecoderContext *s, Jpeg2000CodingStyle *codsty,
         av_log(s->avctx, AV_LOG_WARNING, "Synthetic End of Stream Marker Read.\n");
     }
 
+    /* Reconstruct the sample values */
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int32_t sign, n, val;
+            const uint32_t mask  = (int64_t)UINT32_MAX >> (M_b + 1); // bit mask for ROI detection
+
+            n = x + (y * t1->stride);
+            val = t1->data[n];
+            sign = val & INT32_MIN;
+            val &= INT32_MAX;
+            /* ROI shift, if necessary */
+            if (roi_shift && (((uint32_t)val & ~mask) == 0))
+                val = (uint32_t)val << roi_shift;
+            t1->data[n] = val | sign; /* NOTE: Binary point for reconstruction value is located in 31 - M_b */
+        }
+    }
     return 1;
-}
-
-static inline int roi_shift_param(Jpeg2000Component *comp,
-                                   int quan_parameter)
-{
-    uint8_t roi_shift;
-    int val;
-    roi_shift = comp->roi_shift;
-    val = (quan_parameter < 0)?-quan_parameter:quan_parameter;
-
-    if (val > (1 << roi_shift))
-        return (quan_parameter < 0)?-(val >> roi_shift):(val >> roi_shift);
-    return quan_parameter;
 }
 
 /* TODO: Verify dequantization for lossless case
@@ -1848,54 +2120,90 @@ static inline int roi_shift_param(Jpeg2000Component *comp,
 /* Float dequantization of a codeblock.*/
 static void dequantization_float(int x, int y, Jpeg2000Cblk *cblk,
                                  Jpeg2000Component *comp,
-                                 Jpeg2000T1Context *t1, Jpeg2000Band *band)
+                                 Jpeg2000T1Context *t1, Jpeg2000Band *band, const int M_b)
 {
     int i, j;
     int w = cblk->coord[0][1] - cblk->coord[0][0];
+    const int downshift = 31 - M_b;
+    float fscale = band->f_stepsize;
+    fscale /= (float)(1LL << downshift);
     for (j = 0; j < (cblk->coord[1][1] - cblk->coord[1][0]); ++j) {
         float *datap = &comp->f_data[(comp->coord[0][1] - comp->coord[0][0]) * (y + j) + x];
         int *src = t1->data + j*t1->stride;
-        for (i = 0; i < w; ++i)
-            datap[i] = src[i] * band->f_stepsize;
+        for (i = 0; i < w; ++i) {
+            int val = src[i];
+            if (val < 0) // Convert sign-magnitude to two's complement
+                val = -(val & INT32_MAX);
+            datap[i] = (float)val * fscale;
+        }
     }
 }
 
 /* Integer dequantization of a codeblock.*/
 static void dequantization_int(int x, int y, Jpeg2000Cblk *cblk,
                                Jpeg2000Component *comp,
-                               Jpeg2000T1Context *t1, Jpeg2000Band *band)
+                               Jpeg2000T1Context *t1, Jpeg2000Band *band, const int M_b)
 {
     int i, j;
+    const int downshift = FFMIN(31 - M_b, 31);
     int w = cblk->coord[0][1] - cblk->coord[0][0];
     for (j = 0; j < (cblk->coord[1][1] - cblk->coord[1][0]); ++j) {
         int32_t *datap = &comp->i_data[(comp->coord[0][1] - comp->coord[0][0]) * (y + j) + x];
         int *src = t1->data + j*t1->stride;
         if (band->i_stepsize == 32768) {
-            for (i = 0; i < w; ++i)
-                datap[i] = src[i] / 2;
+            for (i = 0; i < w; ++i) {
+                int val = src[i];
+                if (val < 0)  // Convert sign-magnitude to two's complement
+                    val = -((val & INT32_MAX) >> downshift);
+                else
+                    val >>= downshift;
+                datap[i] = val;
+            }
         } else {
             // This should be VERY uncommon
-            for (i = 0; i < w; ++i)
-                datap[i] = (src[i] * (int64_t)band->i_stepsize) / 65536;
+            for (i = 0; i < w; ++i) {
+                int val = src[i];
+                if (val < 0)  // Convert sign-magnitude to two's complement
+                    val = -((val & INT32_MAX) >> downshift);
+                else
+                    val >>= downshift;
+                datap[i] = (val * (int64_t)band->i_stepsize) / 65536;
+            }
         }
     }
 }
 
 static void dequantization_int_97(int x, int y, Jpeg2000Cblk *cblk,
                                Jpeg2000Component *comp,
-                               Jpeg2000T1Context *t1, Jpeg2000Band *band)
+                               Jpeg2000T1Context *t1, Jpeg2000Band *band, const int M_b)
 {
     int i, j;
     int w = cblk->coord[0][1] - cblk->coord[0][0];
+    float fscale = band->f_stepsize;
+    const int downshift = 31 - M_b;
+    const int PRESCALE = 6; // At least 6 is required to pass the conformance tests in ISO/IEC 15444-4
+    int scale;
+
+    fscale /= (float)(1LL << downshift);
+    fscale *= (float)(1 << PRESCALE);
+    fscale *= (float)(1 << (16 + I_PRESHIFT));
+    scale = (int)(fscale + 0.5);
+    band->i_stepsize = scale;
     for (j = 0; j < (cblk->coord[1][1] - cblk->coord[1][0]); ++j) {
         int32_t *datap = &comp->i_data[(comp->coord[0][1] - comp->coord[0][0]) * (y + j) + x];
         int *src = t1->data + j*t1->stride;
-        for (i = 0; i < w; ++i)
-            datap[i] = (src[i] * (int64_t)band->i_stepsize + (1<<15)) >> 16;
+        for (i = 0; i < w; ++i) {
+            int val = src[i];
+            if (val < 0) // Convert sign-magnitude to two's complement
+                val = -(val & INT32_MAX);
+            // Shifting down to prevent overflow in dequantization
+            val = (val + (1LL << (PRESCALE - 1))) >> PRESCALE;
+            datap[i] = RSHIFT(val * (int64_t)band->i_stepsize, 16);
+        }
     }
 }
 
-static inline void mct_decode(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile)
+static inline void mct_decode(const Jpeg2000DecoderContext *s, Jpeg2000Tile *tile)
 {
     int i, csize = 1;
     void *src[3];
@@ -1923,20 +2231,8 @@ static inline void mct_decode(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile)
     s->dsp.mct_decode[tile->codsty[0].transform](src[0], src[1], src[2], csize);
 }
 
-static inline void roi_scale_cblk(Jpeg2000Cblk *cblk,
-                                  Jpeg2000Component *comp,
-                                  Jpeg2000T1Context *t1)
-{
-    int i, j;
-    int w = cblk->coord[0][1] - cblk->coord[0][0];
-    for (j = 0; j < (cblk->coord[1][1] - cblk->coord[1][0]); ++j) {
-        int *src = t1->data + j*t1->stride;
-        for (i = 0; i < w; ++i)
-            src[i] = roi_shift_param(comp, src[i]);
-    }
-}
 
-static inline void tile_codeblocks(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile)
+static inline int tile_codeblocks(const Jpeg2000DecoderContext *s, Jpeg2000Tile *tile)
 {
     Jpeg2000T1Context t1;
 
@@ -1944,9 +2240,12 @@ static inline void tile_codeblocks(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile
 
     /* Loop on tile components */
     for (compno = 0; compno < s->ncomponents; compno++) {
-        Jpeg2000Component *comp     = tile->comp + compno;
-        Jpeg2000CodingStyle *codsty = tile->codsty + compno;
+        Jpeg2000Component *comp      = tile->comp   + compno;
+        Jpeg2000CodingStyle *codsty  = tile->codsty + compno;
+        Jpeg2000QuantStyle *quantsty = tile->qntsty + compno;
+
         int coded = 0;
+        int subbandno = 0;
 
         t1.stride = (1<<codsty->log2_cblk_width) + 2;
 
@@ -1954,16 +2253,23 @@ static inline void tile_codeblocks(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile
         for (reslevelno = 0; reslevelno < codsty->nreslevels2decode; reslevelno++) {
             Jpeg2000ResLevel *rlevel = comp->reslevel + reslevelno;
             /* Loop on bands */
-            for (bandno = 0; bandno < rlevel->nbands; bandno++) {
+            for (bandno = 0; bandno < rlevel->nbands; bandno++, subbandno++) {
                 int nb_precincts, precno;
                 Jpeg2000Band *band = rlevel->band + bandno;
                 int cblkno = 0, bandpos;
+                /* See Rec. ITU-T T.800, Equation E-2 */
+                int M_b = quantsty->expn[subbandno] + quantsty->nguardbits - 1;
 
                 bandpos = bandno + (reslevelno > 0);
 
                 if (band->coord[0][0] == band->coord[0][1] ||
                     band->coord[1][0] == band->coord[1][1])
                     continue;
+
+                if (M_b > 31) {
+                    avpriv_request_sample(s->avctx, "M_b (%d) > 31", M_b);
+                    return AVERROR_PATCHWELCOME;
+                }
 
                 nb_precincts = rlevel->num_precincts_x * rlevel->num_precincts_y;
                 /* Loop on precincts */
@@ -1974,12 +2280,21 @@ static inline void tile_codeblocks(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile
                     for (cblkno = 0;
                          cblkno < prec->nb_codeblocks_width * prec->nb_codeblocks_height;
                          cblkno++) {
-                        int x, y;
+                        int x, y, ret;
+
                         Jpeg2000Cblk *cblk = prec->cblk + cblkno;
-                        int ret = decode_cblk(s, codsty, &t1, cblk,
-                                    cblk->coord[0][1] - cblk->coord[0][0],
-                                    cblk->coord[1][1] - cblk->coord[1][0],
-                                    bandpos, comp->roi_shift);
+
+                        if (cblk->modes & JPEG2000_CTSY_HTJ2K_F)
+                            ret = ff_jpeg2000_decode_htj2k(s, codsty, &t1, cblk,
+                                                           cblk->coord[0][1] - cblk->coord[0][0],
+                                                           cblk->coord[1][1] - cblk->coord[1][0],
+                                                           M_b, comp->roi_shift);
+                        else
+                            ret = decode_cblk(s, codsty, &t1, cblk,
+                                              cblk->coord[0][1] - cblk->coord[0][0],
+                                              cblk->coord[1][1] - cblk->coord[1][0],
+                                              bandpos, comp->roi_shift, M_b);
+
                         if (ret)
                             coded = 1;
                         else
@@ -1987,14 +2302,12 @@ static inline void tile_codeblocks(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile
                         x = cblk->coord[0][0] - band->coord[0][0];
                         y = cblk->coord[1][0] - band->coord[1][0];
 
-                        if (comp->roi_shift)
-                            roi_scale_cblk(cblk, comp, &t1);
                         if (codsty->transform == FF_DWT97)
-                            dequantization_float(x, y, cblk, comp, &t1, band);
+                            dequantization_float(x, y, cblk, comp, &t1, band, M_b);
                         else if (codsty->transform == FF_DWT97_INT)
-                            dequantization_int_97(x, y, cblk, comp, &t1, band);
+                            dequantization_int_97(x, y, cblk, comp, &t1, band, M_b);
                         else
-                            dequantization_int(x, y, cblk, comp, &t1, band);
+                            dequantization_int(x, y, cblk, comp, &t1, band, M_b);
                    } /* end cblk */
                 } /*end prec */
             } /* end band */
@@ -2005,10 +2318,11 @@ static inline void tile_codeblocks(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile
             ff_dwt_decode(&comp->dwt, codsty->transform == FF_DWT97 ? (void*)comp->f_data : (void*)comp->i_data);
 
     } /*end comp */
+    return 0;
 }
 
 #define WRITE_FRAME(D, PIXEL)                                                                     \
-    static inline void write_frame_ ## D(Jpeg2000DecoderContext * s, Jpeg2000Tile * tile,         \
+    static inline void write_frame_ ## D(const Jpeg2000DecoderContext * s, Jpeg2000Tile * tile,   \
                                          AVFrame * picture, int precision)                        \
     {                                                                                             \
         const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(s->avctx->pix_fmt);               \
@@ -2030,9 +2344,12 @@ static inline void tile_codeblocks(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile
             int h            = tile->comp[compno].coord[1][1] -                                   \
                                ff_jpeg2000_ceildiv(s->image_offset_y, s->cdy[compno]);            \
             int plane        = 0;                                                                 \
+            ptrdiff_t dstoffset = 0;                                                              \
                                                                                                   \
             if (planar)                                                                           \
                 plane = s->cdef[compno] ? s->cdef[compno]-1 : (s->ncomponents-1);                 \
+            else                                                                                  \
+                dstoffset = s->cdef[compno] ? s->cdef[compno] - 1 : compno;                       \
                                                                                                   \
             y    = tile->comp[compno].coord[1][0] -                                               \
                    ff_jpeg2000_ceildiv(s->image_offset_y, s->cdy[compno]);                        \
@@ -2042,7 +2359,7 @@ static inline void tile_codeblocks(Jpeg2000DecoderContext *s, Jpeg2000Tile *tile
                                                                                                   \
                 x   = tile->comp[compno].coord[0][0] -                                            \
                       ff_jpeg2000_ceildiv(s->image_offset_x, s->cdx[compno]);                     \
-                dst = line + x * pixelsize + compno*!planar;                                      \
+                dst = line + x * pixelsize + dstoffset;                                           \
                                                                                                   \
                 if (codsty->transform == FF_DWT97) {                                              \
                     for (; x < w; x++) {                                                          \
@@ -2077,27 +2394,17 @@ WRITE_FRAME(16, uint16_t)
 static int jpeg2000_decode_tile(AVCodecContext *avctx, void *td,
                                 int jobnr, int threadnr)
 {
-    Jpeg2000DecoderContext *s = avctx->priv_data;
+    const Jpeg2000DecoderContext *s = avctx->priv_data;
     AVFrame *picture = td;
     Jpeg2000Tile *tile = s->tile + jobnr;
-    int x;
 
-    tile_codeblocks(s, tile);
+    int ret = tile_codeblocks(s, tile);
+    if (ret < 0)
+        return ret;
 
     /* inverse MCT transformation */
     if (tile->codsty[0].mct)
         mct_decode(s, tile);
-
-    for (x = 0; x < s->ncomponents; x++) {
-        if (s->cdef[x] < 0) {
-            for (x = 0; x < s->ncomponents; x++) {
-                s->cdef[x] = x + 1;
-            }
-            if ((s->ncomponents & 1) == 0)
-                s->cdef[s->ncomponents-1] = 0;
-            break;
-        }
-    }
 
     if (s->precision <= 8) {
         write_frame_8(s, tile, picture, 8);
@@ -2137,8 +2444,14 @@ static void jpeg2000_dec_cleanup(Jpeg2000DecoderContext *s)
     memset(s->qntsty, 0, sizeof(s->qntsty));
     memset(s->properties, 0, sizeof(s->properties));
     memset(&s->poc  , 0, sizeof(s->poc));
+    memset(s->roi_shift, 0, sizeof(s->roi_shift));
     s->numXtiles = s->numYtiles = 0;
     s->ncomponents = 0;
+    s->has_ppm = 0;
+    s->isHT = 0;
+    s->precision = 0;
+    s->colour_space = 0;
+    s->pal8 = 0;
 }
 
 static int jpeg2000_read_main_headers(Jpeg2000DecoderContext *s)
@@ -2147,6 +2460,7 @@ static int jpeg2000_read_main_headers(Jpeg2000DecoderContext *s)
     Jpeg2000QuantStyle *qntsty  = s->qntsty;
     Jpeg2000POC         *poc    = &s->poc;
     uint8_t *properties         = s->properties;
+    uint8_t in_tile_headers     = 0;
 
     for (;;) {
         int len, ret = 0;
@@ -2221,27 +2535,68 @@ static int jpeg2000_read_main_headers(Jpeg2000DecoderContext *s)
             if (!s->tile)
                 s->numXtiles = s->numYtiles = 0;
             break;
+        case JPEG2000_CAP:
+            if (!s->ncomponents) {
+                av_log(s->avctx, AV_LOG_ERROR, "CAP marker segment shall come after SIZ\n");
+                return AVERROR_INVALIDDATA;
+            }
+            ret = get_cap(s, codsty);
+            break;
         case JPEG2000_COC:
+            if (in_tile_headers == 1 && s->isHT && (!s->Ccap15_b11)) {
+                av_log(s->avctx, AV_LOG_ERROR,
+                    "COC marker found in a tile header but the codestream belongs to the HOMOGENEOUS set\n");
+                return AVERROR_INVALIDDATA;
+            }
             ret = get_coc(s, codsty, properties);
             break;
         case JPEG2000_COD:
+            if (in_tile_headers == 1 && s->isHT && (!s->Ccap15_b11)) {
+                av_log(s->avctx, AV_LOG_ERROR,
+                    "COD marker found in a tile header but the codestream belongs to the HOMOGENEOUS set\n");
+                return AVERROR_INVALIDDATA;
+            }
             ret = get_cod(s, codsty, properties);
             break;
         case JPEG2000_RGN:
+            if (in_tile_headers == 1 && s->isHT && (!s->Ccap15_b11)) {
+                av_log(s->avctx, AV_LOG_ERROR,
+                    "RGN marker found in a tile header but the codestream belongs to the HOMOGENEOUS set\n");
+                return AVERROR_INVALIDDATA;
+            }
             ret = get_rgn(s, len);
+            if ((!s->Ccap15_b12) && s->isHT) {
+                av_log(s->avctx, AV_LOG_ERROR, "RGN marker found but the codestream belongs to the RGNFREE set\n");
+                return AVERROR_INVALIDDATA;
+            }
             break;
         case JPEG2000_QCC:
+            if (in_tile_headers == 1 && s->isHT && (!s->Ccap15_b11)) {
+                av_log(s->avctx, AV_LOG_ERROR,
+                    "QCC marker found in a tile header but the codestream belongs to the HOMOGENEOUS set\n");
+                return AVERROR_INVALIDDATA;
+            }
             ret = get_qcc(s, len, qntsty, properties);
             break;
         case JPEG2000_QCD:
+            if (in_tile_headers == 1 && s->isHT && (!s->Ccap15_b11)) {
+                av_log(s->avctx, AV_LOG_ERROR,
+                    "QCD marker found in a tile header but the codestream belongs to the HOMOGENEOUS set\n");
+                return AVERROR_INVALIDDATA;
+            }
             ret = get_qcd(s, len, qntsty, properties);
             break;
         case JPEG2000_POC:
+            if (in_tile_headers == 1 && s->isHT && (!s->Ccap15_b11)) {
+                av_log(s->avctx, AV_LOG_ERROR,
+                    "POC marker found in a tile header but the codestream belongs to the HOMOGENEOUS set\n");
+                return AVERROR_INVALIDDATA;
+            }
             ret = get_poc(s, len, poc);
             break;
         case JPEG2000_SOT:
-            if (!s->in_tile_headers) {
-                s->in_tile_headers = 1;
+            if (!in_tile_headers) {
+                in_tile_headers = 1;
                 if (s->has_ppm) {
                     bytestream2_init(&s->packed_headers_stream, s->packed_headers, s->packed_headers_size);
                 }
@@ -2273,7 +2628,7 @@ static int jpeg2000_read_main_headers(Jpeg2000DecoderContext *s)
             break;
         case JPEG2000_PPM:
             // Packed headers, main header
-            if (s->in_tile_headers) {
+            if (in_tile_headers) {
                 av_log(s->avctx, AV_LOG_ERROR, "PPM Marker can only be in Main header\n");
                 return AVERROR_INVALIDDATA;
             }
@@ -2286,8 +2641,15 @@ static int jpeg2000_read_main_headers(Jpeg2000DecoderContext *s)
                        "Cannot have both PPT and PPM marker.\n");
                 return AVERROR_INVALIDDATA;
             }
-
+            if ((!s->Ccap15_b11) && s->isHT) {
+                av_log(s->avctx, AV_LOG_ERROR, "PPT marker found but the codestream belongs to the HOMOGENEOUS set\n");
+                return AVERROR_INVALIDDATA;
+            }
             ret = get_ppt(s, len);
+            break;
+        case JPEG2000_CPF:
+            // Corresponding profile marker
+            ret = read_cpf(s, len);
             break;
         default:
             av_log(s->avctx, AV_LOG_ERROR,
@@ -2424,7 +2786,7 @@ static int jp2_find_codestream(Jpeg2000DecoderContext *s)
                     int n = bytestream2_get_be16u(&s->g);
                     for (; n>0; n--) {
                         int cn   = bytestream2_get_be16(&s->g);
-                        int av_unused typ  = bytestream2_get_be16(&s->g);
+                        av_unused int typ  = bytestream2_get_be16(&s->g);
                         int asoc = bytestream2_get_be16(&s->g);
                         if (cn < 4 && asoc < 4)
                             s->cdef[cn] = asoc;
@@ -2478,18 +2840,24 @@ static av_cold int jpeg2000_decode_init(AVCodecContext *avctx)
 {
     Jpeg2000DecoderContext *s = avctx->priv_data;
 
+    if (avctx->lowres)
+        av_log(avctx, AV_LOG_WARNING, "lowres is overridden by reduction_factor but set anyway\n");
+    if (!s->reduction_factor && avctx->lowres < JPEG2000_MAX_RESLEVELS) {
+        s->reduction_factor = avctx->lowres;
+    }
+    if (avctx->lowres != s->reduction_factor && avctx->lowres)
+        return AVERROR(EINVAL);
+
     ff_jpeg2000dsp_init(&s->dsp);
     ff_jpeg2000_init_tier1_luts();
 
     return 0;
 }
 
-static int jpeg2000_decode_frame(AVCodecContext *avctx, void *data,
+static int jpeg2000_decode_frame(AVCodecContext *avctx, AVFrame *picture,
                                  int *got_frame, AVPacket *avpkt)
 {
     Jpeg2000DecoderContext *s = avctx->priv_data;
-    ThreadFrame frame = { .f = data };
-    AVFrame *picture = data;
     int ret;
 
     s->avctx     = avctx;
@@ -2528,14 +2896,25 @@ static int jpeg2000_decode_frame(AVCodecContext *avctx, void *data,
     if (ret = jpeg2000_read_main_headers(s))
         goto end;
 
+    if (s->sar.num && s->sar.den)
+        avctx->sample_aspect_ratio = s->sar;
+    s->sar.num = s->sar.den = 0;
+
+    if (avctx->skip_frame >= AVDISCARD_ALL) {
+        jpeg2000_dec_cleanup(s);
+        return avpkt->size;
+    }
+
     /* get picture buffer */
-    if ((ret = ff_thread_get_buffer(avctx, &frame, 0)) < 0)
+    if ((ret = ff_thread_get_buffer(avctx, picture, 0)) < 0)
         goto end;
-    picture->pict_type = AV_PICTURE_TYPE_I;
-    picture->key_frame = 1;
 
     if (ret = jpeg2000_read_bitstream_packets(s))
         goto end;
+
+    for (int x = 0; x < s->ncomponents && s->codsty[x].transform == FF_DWT53;)
+        if (++x == s->ncomponents)
+            picture->flags |= AV_FRAME_FLAG_LOSSLESS;
 
     avctx->execute2(avctx, jpeg2000_decode_tile, picture, NULL, s->numXtiles * s->numYtiles);
 
@@ -2545,9 +2924,6 @@ static int jpeg2000_decode_frame(AVCodecContext *avctx, void *data,
 
     if (s->avctx->pix_fmt == AV_PIX_FMT_PAL8)
         memcpy(picture->data[1], s->palette, 256 * sizeof(uint32_t));
-    if (s->sar.num && s->sar.den)
-        avctx->sample_aspect_ratio = s->sar;
-    s->sar.num = s->sar.den = 0;
 
     return bytestream2_tell(&s->g);
 
@@ -2572,17 +2948,17 @@ static const AVClass jpeg2000_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_jpeg2000_decoder = {
-    .name             = "jpeg2000",
-    .long_name        = NULL_IF_CONFIG_SMALL("JPEG 2000"),
-    .type             = AVMEDIA_TYPE_VIDEO,
-    .id               = AV_CODEC_ID_JPEG2000,
-    .capabilities     = AV_CODEC_CAP_SLICE_THREADS | AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_DR1,
+const FFCodec ff_jpeg2000_decoder = {
+    .p.name           = "jpeg2000",
+    CODEC_LONG_NAME("JPEG 2000"),
+    .p.type           = AVMEDIA_TYPE_VIDEO,
+    .p.id             = AV_CODEC_ID_JPEG2000,
+    .p.capabilities   = AV_CODEC_CAP_SLICE_THREADS | AV_CODEC_CAP_FRAME_THREADS | AV_CODEC_CAP_DR1,
     .priv_data_size   = sizeof(Jpeg2000DecoderContext),
     .init             = jpeg2000_decode_init,
-    .decode           = jpeg2000_decode_frame,
-    .priv_class       = &jpeg2000_class,
-    .max_lowres       = 5,
-    .profiles         = NULL_IF_CONFIG_SMALL(ff_jpeg2000_profiles),
-    .caps_internal    = FF_CODEC_CAP_INIT_THREADSAFE,
+    FF_CODEC_DECODE_CB(jpeg2000_decode_frame),
+    .p.priv_class     = &jpeg2000_class,
+    .p.max_lowres     = 5,
+    .p.profiles       = NULL_IF_CONFIG_SMALL(ff_jpeg2000_profiles),
+    .caps_internal    = FF_CODEC_CAP_SKIP_FRAME_FILL_PARAM,
 };

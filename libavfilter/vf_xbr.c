@@ -30,7 +30,9 @@
 
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
-#include "internal.h"
+
+#include "filters.h"
+#include "video.h"
 
 #define LB_MASK       0x00FEFEFE
 #define RED_BLUE_MASK 0x00FF00FF
@@ -217,8 +219,8 @@ static av_always_inline void xbr_filter(const ThreadData *td, int jobnr, int nb_
     const AVFrame *input = td->in;
     AVFrame *output = td->out;
     const uint32_t *r2y = td->rgbtoyuv;
-    const int slice_start = (input->height *  jobnr   ) / nb_jobs;
-    const int slice_end   = (input->height * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(input->height, jobnr, nb_jobs);
+    const int slice_end   = ff_slice_pos(input->height, jobnr + 1, nb_jobs);
     const int nl = output->linesize[0] >> 2;
     const int nl1 = nl + nl;
     const int nl2 = nl1 + nl;
@@ -411,14 +413,14 @@ static const AVFilterPad xbr_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_xbr = {
-    .name          = "xbr",
-    .description   = NULL_IF_CONFIG_SMALL("Scale the input using xBR algorithm."),
+const FFFilter ff_vf_xbr = {
+    .p.name        = "xbr",
+    .p.description = NULL_IF_CONFIG_SMALL("Scale the input using xBR algorithm."),
+    .p.priv_class  = &xbr_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     FILTER_INPUTS(xbr_inputs),
     FILTER_OUTPUTS(xbr_outputs),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_0RGB32),
     .priv_size     = sizeof(XBRContext),
-    .priv_class    = &xbr_class,
     .init          = init,
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,
 };

@@ -21,8 +21,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "rawdec.h"
 #include "libavutil/intreadwrite.h"
@@ -32,12 +35,11 @@
 static int av_always_inline mlp_thd_probe(const AVProbeData *p, uint32_t sync)
 {
     const uint8_t *buf, *last_buf = p->buf, *end = p->buf + p->buf_size;
-    int frames = 0, valid = 0, size = 0;
+    int valid = 0, size = 0;
     int nsubframes = 0;
 
     for (buf = p->buf; buf + 8 <= end; buf++) {
         if (AV_RB32(buf + 4) == sync) {
-            frames++;
             if (last_buf + size == buf) {
                 valid += 1 + nsubframes / 8;
             }
@@ -94,17 +96,17 @@ static int mlp_probe(const AVProbeData *p)
     return mlp_thd_probe(p, 0xf8726fbb);
 }
 
-const AVInputFormat ff_mlp_demuxer = {
-    .name           = "mlp",
-    .long_name      = NULL_IF_CONFIG_SMALL("raw MLP"),
+const FFInputFormat ff_mlp_demuxer = {
+    .p.name         = "mlp",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw MLP"),
+    .p.flags        = AVFMT_GENERIC_INDEX | AVFMT_NOTIMESTAMPS,
+    .p.extensions   = "mlp",
+    .p.priv_class   = &ff_raw_demuxer_class,
     .read_probe     = mlp_probe,
     .read_header    = mlp_read_header,
     .read_packet    = ff_raw_read_partial_packet,
-    .flags          = AVFMT_GENERIC_INDEX | AVFMT_NOTIMESTAMPS,
-    .extensions     = "mlp",
     .raw_codec_id   = AV_CODEC_ID_MLP,
     .priv_data_size = sizeof(FFRawDemuxerContext),
-    .priv_class     = &ff_raw_demuxer_class,
 };
 #endif
 
@@ -114,16 +116,16 @@ static int thd_probe(const AVProbeData *p)
     return mlp_thd_probe(p, 0xf8726fba);
 }
 
-const AVInputFormat ff_truehd_demuxer = {
-    .name           = "truehd",
-    .long_name      = NULL_IF_CONFIG_SMALL("raw TrueHD"),
+const FFInputFormat ff_truehd_demuxer = {
+    .p.name         = "truehd",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("raw TrueHD"),
+    .p.flags        = AVFMT_GENERIC_INDEX | AVFMT_NOTIMESTAMPS,
+    .p.extensions   = "thd",
+    .p.priv_class   = &ff_raw_demuxer_class,
     .read_probe     = thd_probe,
     .read_header    = mlp_read_header,
     .read_packet    = ff_raw_read_partial_packet,
-    .flags          = AVFMT_GENERIC_INDEX | AVFMT_NOTIMESTAMPS,
-    .extensions     = "thd",
     .raw_codec_id   = AV_CODEC_ID_TRUEHD,
     .priv_data_size = sizeof(FFRawDemuxerContext),
-    .priv_class     = &ff_raw_demuxer_class,
 };
 #endif

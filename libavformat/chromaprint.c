@@ -20,14 +20,16 @@
  */
 
 #include "avformat.h"
-#include "internal.h"
+#include "mux.h"
 #include "libavutil/opt.h"
-#include "libavcodec/internal.h"
+#include "libavutil/thread.h"
 #include <chromaprint.h>
 
 #define CPR_VERSION_INT AV_VERSION_INT(CHROMAPRINT_VERSION_MAJOR, \
                                        CHROMAPRINT_VERSION_MINOR, \
                                        CHROMAPRINT_VERSION_PATCH)
+
+static AVMutex chromaprint_mutex = AV_MUTEX_INITIALIZER;
 
 typedef enum FingerprintFormat {
     FINGERPRINT_RAW,
@@ -39,7 +41,8 @@ typedef struct ChromaprintMuxContext {
     const AVClass *class;
     int silence_threshold;
     int algorithm;
-    FingerprintFormat fp_format;
+    /* FingerprintFormat, use int for AVOption */
+    int fp_format;
 #if CPR_VERSION_INT >= AV_VERSION_INT(1, 4, 0)
     ChromaprintContext *ctx;
 #else
@@ -52,20 +55,20 @@ static void deinit(AVFormatContext *s)
     ChromaprintMuxContext *const cpr = s->priv_data;
 
     if (cpr->ctx) {
-        ff_lock_avformat();
+        ff_mutex_lock(&chromaprint_mutex);
         chromaprint_free(cpr->ctx);
-        ff_unlock_avformat();
+        ff_mutex_unlock(&chromaprint_mutex);
     }
 }
 
-static int write_header(AVFormatContext *s)
+static av_cold int init(AVFormatContext *s)
 {
     ChromaprintMuxContext *cpr = s->priv_data;
     AVStream *st;
 
-    ff_lock_avformat();
+    ff_mutex_lock(&chromaprint_mutex);
     cpr->ctx = chromaprint_new(cpr->algorithm);
-    ff_unlock_avformat();
+    ff_mutex_unlock(&chromaprint_mutex);
 
     if (!cpr->ctx) {
         av_log(s, AV_LOG_ERROR, "Failed to create chromaprint context.\n");
@@ -85,14 +88,9 @@ static int write_header(AVFormatContext *s)
 #endif
     }
 
-    if (s->nb_streams != 1) {
-        av_log(s, AV_LOG_ERROR, "Only one stream is supported\n");
-        return AVERROR(EINVAL);
-    }
-
     st = s->streams[0];
 
-    if (st->codecpar->channels > 2) {
+    if (st->codecpar->ch_layout.nb_channels > 2) {
         av_log(s, AV_LOG_ERROR, "Only up to 2 channels are supported\n");
         return AVERROR(EINVAL);
     }
@@ -102,7 +100,7 @@ static int write_header(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
-    if (!chromaprint_start(cpr->ctx, st->codecpar->sample_rate, st->codecpar->channels)) {
+    if (!chromaprint_start(cpr->ctx, st->codecpar->sample_rate, st->codecpar->ch_layout.nb_channels)) {
         av_log(s, AV_LOG_ERROR, "Failed to start chromaprint\n");
         return AVERROR_EXTERNAL;
     }
@@ -163,10 +161,10 @@ fail:
 static const AVOption options[] = {
     { "silence_threshold", "threshold for detecting silence", OFFSET(silence_threshold), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, 32767, FLAGS },
     { "algorithm", "version of the fingerprint algorithm", OFFSET(algorithm), AV_OPT_TYPE_INT, { .i64 = CHROMAPRINT_ALGORITHM_DEFAULT }, CHROMAPRINT_ALGORITHM_TEST1, INT_MAX, FLAGS },
-    { "fp_format", "fingerprint format to write", OFFSET(fp_format), AV_OPT_TYPE_INT, { .i64 = FINGERPRINT_BASE64 }, FINGERPRINT_RAW, FINGERPRINT_BASE64, FLAGS, "fp_format" },
-    { "raw", "binary raw fingerprint", 0, AV_OPT_TYPE_CONST, {.i64 = FINGERPRINT_RAW }, INT_MIN, INT_MAX, FLAGS, "fp_format"},
-    { "compressed", "binary compressed fingerprint", 0, AV_OPT_TYPE_CONST, {.i64 = FINGERPRINT_COMPRESSED }, INT_MIN, INT_MAX, FLAGS, "fp_format"},
-    { "base64", "Base64 compressed fingerprint", 0, AV_OPT_TYPE_CONST, {.i64 = FINGERPRINT_BASE64 }, INT_MIN, INT_MAX, FLAGS, "fp_format"},
+    { "fp_format", "fingerprint format to write", OFFSET(fp_format), AV_OPT_TYPE_INT, { .i64 = FINGERPRINT_BASE64 }, FINGERPRINT_RAW, FINGERPRINT_BASE64, FLAGS, .unit = "fp_format" },
+    { "raw", "binary raw fingerprint", 0, AV_OPT_TYPE_CONST, {.i64 = FINGERPRINT_RAW }, INT_MIN, INT_MAX, FLAGS, .unit = "fp_format"},
+    { "compressed", "binary compressed fingerprint", 0, AV_OPT_TYPE_CONST, {.i64 = FINGERPRINT_COMPRESSED }, INT_MIN, INT_MAX, FLAGS, .unit = "fp_format"},
+    { "base64", "Base64 compressed fingerprint", 0, AV_OPT_TYPE_CONST, {.i64 = FINGERPRINT_BASE64 }, INT_MIN, INT_MAX, FLAGS, .unit = "fp_format"},
     { NULL },
 };
 
@@ -177,15 +175,19 @@ static const AVClass chromaprint_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVOutputFormat ff_chromaprint_muxer = {
-    .name              = "chromaprint",
-    .long_name         = NULL_IF_CONFIG_SMALL("Chromaprint"),
+const FFOutputFormat ff_chromaprint_muxer = {
+    .p.name            = "chromaprint",
+    .p.long_name       = NULL_IF_CONFIG_SMALL("Chromaprint"),
     .priv_data_size    = sizeof(ChromaprintMuxContext),
-    .audio_codec       = AV_NE(AV_CODEC_ID_PCM_S16BE, AV_CODEC_ID_PCM_S16LE),
-    .write_header      = write_header,
+    .p.audio_codec     = AV_NE(AV_CODEC_ID_PCM_S16BE, AV_CODEC_ID_PCM_S16LE),
+    .p.video_codec     = AV_CODEC_ID_NONE,
+    .p.subtitle_codec  = AV_CODEC_ID_NONE,
+    .flags_internal    = FF_OFMT_FLAG_MAX_ONE_OF_EACH |
+                         FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
+    .init              = init,
     .write_packet      = write_packet,
     .write_trailer     = write_trailer,
     .deinit            = deinit,
-    .flags             = AVFMT_NOTIMESTAMPS,
-    .priv_class        = &chromaprint_class,
+    .p.flags           = AVFMT_NOTIMESTAMPS,
+    .p.priv_class      = &chromaprint_class,
 };

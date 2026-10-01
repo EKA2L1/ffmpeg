@@ -28,13 +28,17 @@
 #include <fcntl.h>
 #include <poll.h>
 #include "libavcodec/avcodec.h"
-#include "libavcodec/internal.h"
+#include "libavutil/attributes.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/refstruct.h"
 #include "v4l2_context.h"
 #include "v4l2_buffers.h"
 #include "v4l2_m2m.h"
 
+#ifndef USEC_PER_SEC
 #define USEC_PER_SEC 1000000
+#endif
+
 static AVRational v4l2_timebase = { 1, USEC_PER_SEC };
 
 static inline V4L2m2mContext *buf_to_m2mctx(V4L2Buffer *buf)
@@ -187,6 +191,9 @@ static enum AVColorTransferCharacteristic v4l2_get_color_trc(V4L2Buffer *buf)
     switch (xfer) {
     case V4L2_XFER_FUNC_709: return AVCOL_TRC_BT709;
     case V4L2_XFER_FUNC_SRGB: return AVCOL_TRC_IEC61966_2_1;
+    case V4L2_XFER_FUNC_SMPTE240M: return AVCOL_TRC_SMPTE240M;
+    case V4L2_XFER_FUNC_NONE: return AVCOL_TRC_LINEAR;
+    case V4L2_XFER_FUNC_SMPTE2084: return AVCOL_TRC_SMPTE2084;
     default:
         break;
     }
@@ -210,6 +217,23 @@ static enum AVColorTransferCharacteristic v4l2_get_color_trc(V4L2Buffer *buf)
     return AVCOL_TRC_UNSPECIFIED;
 }
 
+static void v4l2_get_interlacing(AVFrame *frame, V4L2Buffer *buf)
+{
+    enum v4l2_field field = V4L2_TYPE_IS_MULTIPLANAR(buf->buf.type) ?
+        buf->context->format.fmt.pix_mp.field :
+        buf->context->format.fmt.pix.field;
+
+    switch (field) {
+    case V4L2_FIELD_INTERLACED:
+    case V4L2_FIELD_INTERLACED_TB:
+        frame->flags |=  AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        av_fallthrough;
+    case V4L2_FIELD_INTERLACED_BT:
+        frame->flags |=  AV_FRAME_FLAG_INTERLACED;
+        break;
+    }
+}
+
 static void v4l2_free_buffer(void *opaque, uint8_t *unused)
 {
     V4L2Buffer* avbuf = opaque;
@@ -230,7 +254,7 @@ static void v4l2_free_buffer(void *opaque, uint8_t *unused)
                 ff_v4l2_buffer_enqueue(avbuf);
         }
 
-        av_buffer_unref(&avbuf->context_ref);
+        av_refstruct_unref(&avbuf->context_ref);
     }
 }
 
@@ -241,9 +265,7 @@ static int v4l2_buf_increase_ref(V4L2Buffer *in)
     if (in->context_ref)
         atomic_fetch_add(&in->context_refcount, 1);
     else {
-        in->context_ref = av_buffer_ref(s->self_ref);
-        if (!in->context_ref)
-            return AVERROR(ENOMEM);
+        in->context_ref = av_refstruct_ref(s->self_ref);
 
         in->context_refcount = 1;
     }
@@ -428,13 +450,15 @@ int ff_v4l2_buffer_buf_to_avframe(AVFrame *frame, V4L2Buffer *avbuf)
         return ret;
 
     /* 2. get frame information */
-    frame->key_frame = !!(avbuf->buf.flags & V4L2_BUF_FLAG_KEYFRAME);
+    if (avbuf->buf.flags & V4L2_BUF_FLAG_KEYFRAME)
+        frame->flags |= AV_FRAME_FLAG_KEY;
     frame->color_primaries = v4l2_get_color_primaries(avbuf);
     frame->colorspace = v4l2_get_color_space(avbuf);
     frame->color_range = v4l2_get_color_range(avbuf);
     frame->color_trc = v4l2_get_color_trc(avbuf);
     frame->pts = v4l2_get_pts(avbuf);
     frame->pkt_dts = AV_NOPTS_VALUE;
+    v4l2_get_interlacing(frame, avbuf);
 
     /* these values are updated also during re-init in v4l2_process_driver_event */
     frame->height = avbuf->context->height;

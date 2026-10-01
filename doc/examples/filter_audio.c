@@ -19,13 +19,11 @@
  */
 
 /**
- * @file
- * libavfilter API usage example.
- *
+ * @file libavfilter audio filtering API usage example
  * @example filter_audio.c
- * This example will generate a sine wave audio,
- * pass it through a simple filter chain, and then compute the MD5 checksum of
- * the output data.
+ *
+ * This example will generate a sine wave audio, pass it through a simple filter
+ * chain, and then compute the MD5 checksum of the output data.
  *
  * The filter chain it uses is:
  * (input) -> abuffer -> volume -> aformat -> abuffersink -> (output)
@@ -43,19 +41,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "libavutil/channel_layout.h"
-#include "libavutil/md5.h"
-#include "libavutil/mem.h"
-#include "libavutil/opt.h"
-#include "libavutil/samplefmt.h"
+#include <libavutil/channel_layout.h>
+#include <libavutil/md5.h>
+#include <libavutil/mem.h>
+#include <libavutil/opt.h>
+#include <libavutil/samplefmt.h>
 
-#include "libavfilter/avfilter.h"
-#include "libavfilter/buffersink.h"
-#include "libavfilter/buffersrc.h"
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersink.h>
+#include <libavfilter/buffersrc.h>
 
 #define INPUT_SAMPLERATE     48000
 #define INPUT_FORMAT         AV_SAMPLE_FMT_FLTP
-#define INPUT_CHANNEL_LAYOUT AV_CH_LAYOUT_5POINT0
+#define INPUT_CHANNEL_LAYOUT (AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT0
 
 #define VOLUME_VAL 0.90
 
@@ -100,7 +98,7 @@ static int init_filter_graph(AVFilterGraph **graph, AVFilterContext **src,
     }
 
     /* Set the filter options through the AVOptions API. */
-    av_get_channel_layout_string(ch_layout, sizeof(ch_layout), 0, INPUT_CHANNEL_LAYOUT);
+    av_channel_layout_describe(&INPUT_CHANNEL_LAYOUT, ch_layout, sizeof(ch_layout));
     av_opt_set    (abuffer_ctx, "channel_layout", ch_layout,                            AV_OPT_SEARCH_CHILDREN);
     av_opt_set    (abuffer_ctx, "sample_fmt",     av_get_sample_fmt_name(INPUT_FORMAT), AV_OPT_SEARCH_CHILDREN);
     av_opt_set_q  (abuffer_ctx, "time_base",      (AVRational){ 1, INPUT_SAMPLERATE },  AV_OPT_SEARCH_CHILDREN);
@@ -154,9 +152,8 @@ static int init_filter_graph(AVFilterGraph **graph, AVFilterContext **src,
     /* A third way of passing the options is in a string of the form
      * key1=value1:key2=value2.... */
     snprintf(options_str, sizeof(options_str),
-             "sample_fmts=%s:sample_rates=%d:channel_layouts=0x%"PRIx64,
-             av_get_sample_fmt_name(AV_SAMPLE_FMT_S16), 44100,
-             (uint64_t)AV_CH_LAYOUT_STEREO);
+             "sample_fmts=%s:sample_rates=%d:channel_layouts=stereo",
+             av_get_sample_fmt_name(AV_SAMPLE_FMT_S16), 44100);
     err = avfilter_init_str(aformat_ctx, options_str);
     if (err < 0) {
         av_log(NULL, AV_LOG_ERROR, "Could not initialize the aformat filter.\n");
@@ -215,7 +212,7 @@ static int init_filter_graph(AVFilterGraph **graph, AVFilterContext **src,
 static int process_output(struct AVMD5 *md5, AVFrame *frame)
 {
     int planar     = av_sample_fmt_is_planar(frame->format);
-    int channels   = av_get_channel_layout_nb_channels(frame->channel_layout);
+    int channels   = frame->ch_layout.nb_channels;
     int planes     = planar ? channels : 1;
     int bps        = av_get_bytes_per_sample(frame->format);
     int plane_size = bps * frame->nb_samples * (planar ? 1 : channels);
@@ -248,7 +245,7 @@ static int get_input(AVFrame *frame, int frame_num)
     /* Set up the frame properties and allocate the buffer for the data. */
     frame->sample_rate    = INPUT_SAMPLERATE;
     frame->format         = INPUT_FORMAT;
-    frame->channel_layout = INPUT_CHANNEL_LAYOUT;
+    av_channel_layout_copy(&frame->ch_layout, &INPUT_CHANNEL_LAYOUT);
     frame->nb_samples     = FRAME_SIZE;
     frame->pts            = frame_num * FRAME_SIZE;
 
@@ -273,7 +270,6 @@ int main(int argc, char *argv[])
     AVFilterGraph *graph;
     AVFilterContext *src, *sink;
     AVFrame *frame;
-    uint8_t errstr[1024];
     float duration;
     int err, nb_frames, i;
 
@@ -298,6 +294,7 @@ int main(int argc, char *argv[])
 
     md5 = av_md5_alloc();
     if (!md5) {
+        av_frame_free(&frame);
         fprintf(stderr, "Error allocating the MD5 context\n");
         return 1;
     }
@@ -305,8 +302,10 @@ int main(int argc, char *argv[])
     /* Set up the filtergraph. */
     err = init_filter_graph(&graph, &src, &sink);
     if (err < 0) {
+        av_frame_free(&frame);
+        av_freep(&md5);
         fprintf(stderr, "Unable to init filter graph:");
-        goto fail;
+        return 1;
     }
 
     /* the main filtering loop */
@@ -357,7 +356,10 @@ int main(int argc, char *argv[])
     return 0;
 
 fail:
-    av_strerror(err, errstr, sizeof(errstr));
-    fprintf(stderr, "%s\n", errstr);
+    avfilter_graph_free(&graph);
+    av_frame_free(&frame);
+    av_freep(&md5);
+
+    fprintf(stderr, "%s\n", av_err2str(err));
     return 1;
 }

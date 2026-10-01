@@ -34,7 +34,8 @@
 #include "h264dec.h"
 #include "h264_ps.h"
 #include "qpeldsp.h"
-#include "thread.h"
+#include "rectangle.h"
+#include "threadframe.h"
 
 static inline int get_lowest_part_list_y(H264SliceContext *sl,
                                          int n, int height, int y_offset, int list)
@@ -65,7 +66,7 @@ static inline void get_lowest_part_y(const H264Context *h, H264SliceContext *sl,
         // Error resilience puts the current picture in the ref list.
         // Don't try to wait on these as it will cause a deadlock.
         // Fields can wait on each other, though.
-        if (ref->parent->tf.progress->data != h->cur_pic.tf.progress->data ||
+        if (ref->parent->tf.progress != h->cur_pic.tf.progress ||
             (ref->reference & 3) != h->picture_structure) {
             my = get_lowest_part_list_y(sl, n, height, y_offset, 0);
             if (refs[0][ref_n] < 0)
@@ -78,7 +79,7 @@ static inline void get_lowest_part_y(const H264Context *h, H264SliceContext *sl,
         int ref_n    = sl->ref_cache[1][scan8[n]];
         H264Ref *ref = &sl->ref_list[1][ref_n];
 
-        if (ref->parent->tf.progress->data != h->cur_pic.tf.progress->data ||
+        if (ref->parent->tf.progress != h->cur_pic.tf.progress ||
             (ref->reference & 3) != h->picture_structure) {
             my = get_lowest_part_list_y(sl, n, height, y_offset, 1);
             if (refs[1][ref_n] < 0)
@@ -406,7 +407,7 @@ static av_always_inline void mc_part_weighted(const H264Context *h, H264SliceCon
         /* don't optimize for luma-only case, since B-frames usually
          * use implicit weights => chroma too. */
         uint8_t *tmp_cb = sl->bipred_scratchpad;
-        uint8_t *tmp_cr = sl->bipred_scratchpad + (16 << pixel_shift);
+        uint8_t *tmp_cr = sl->bipred_scratchpad + (8 << pixel_shift + (chroma_idc == 3));
         uint8_t *tmp_y  = sl->bipred_scratchpad + 16 * sl->mb_uvlinesize;
         int refn0       = sl->ref_cache[0][scan8[n]];
         int refn1       = sl->ref_cache[1][scan8[n]];
@@ -528,7 +529,7 @@ static av_always_inline void xchg_mb_border(const H264Context *h, H264SliceConte
     }
 
     if (sl->deblocking_filter == 2) {
-        deblock_topleft = h->slice_table[sl->mb_xy - 1 - h->mb_stride] == sl->slice_num;
+        deblock_topleft = h->slice_table[sl->mb_xy - 1 - (h->mb_stride << MB_FIELD(sl))] == sl->slice_num;
         deblock_top     = sl->top_type;
     } else {
         deblock_topleft = (sl->mb_x > 0);
@@ -628,10 +629,10 @@ static av_always_inline void hl_decode_mb_predict_luma(const H264Context *h,
         if (IS_8x8DCT(mb_type)) {
             if (transform_bypass) {
                 idct_dc_add =
-                idct_add    = h->h264dsp.h264_add_pixels8_clear;
+                idct_add    = h->h264dsp.add_pixels8_clear;
             } else {
-                idct_dc_add = h->h264dsp.h264_idct8_dc_add;
-                idct_add    = h->h264dsp.h264_idct8_add;
+                idct_dc_add = h->h264dsp.idct8_dc_add;
+                idct_add    = h->h264dsp.idct8_add;
             }
             for (i = 0; i < 16; i += 4) {
                 uint8_t *const ptr = dest_y + block_offset[i];
@@ -657,11 +658,11 @@ static av_always_inline void hl_decode_mb_predict_luma(const H264Context *h,
             }
         } else {
             if (transform_bypass) {
-                idct_dc_add  =
-                idct_add     = h->h264dsp.h264_add_pixels4_clear;
+                idct_dc_add =
+                idct_add    = h->h264dsp.add_pixels4_clear;
             } else {
-                idct_dc_add = h->h264dsp.h264_idct_dc_add;
-                idct_add    = h->h264dsp.h264_idct_add;
+                idct_dc_add = h->h264dsp.idct_dc_add;
+                idct_add    = h->h264dsp.idct_add;
             }
             for (i = 0; i < 16; i++) {
                 uint8_t *const ptr = dest_y + block_offset[i];
@@ -704,9 +705,9 @@ static av_always_inline void hl_decode_mb_predict_luma(const H264Context *h,
         h->hpc.pred16x16[sl->intra16x16_pred_mode](dest_y, linesize);
         if (sl->non_zero_count_cache[scan8[LUMA_DC_BLOCK_INDEX + p]]) {
             if (!transform_bypass)
-                h->h264dsp.h264_luma_dc_dequant_idct(sl->mb + (p * 256 << pixel_shift),
-                                                     sl->mb_luma_dc[p],
-                                                     h->ps.pps->dequant4_coeff[p][qscale][0]);
+                h->h264dsp.luma_dc_dequant_idct(sl->mb + (p * 256 << pixel_shift),
+                                                sl->mb_luma_dc[p],
+                                                h->ps.pps->dequant4_coeff[p][qscale][0]);
             else {
                 static const uint8_t dc_mapping[16] = {
                      0 * 16,  1 * 16,  4 * 16,  5 * 16,
@@ -748,21 +749,21 @@ static av_always_inline void hl_decode_mb_idct_luma(const H264Context *h, H264Sl
                     for (i = 0; i < 16; i++)
                         if (sl->non_zero_count_cache[scan8[i + p * 16]] ||
                             dctcoef_get(sl->mb, pixel_shift, i * 16 + p * 256))
-                            h->h264dsp.h264_add_pixels4_clear(dest_y + block_offset[i],
-                                                              sl->mb + (i * 16 + p * 256 << pixel_shift),
-                                                              linesize);
+                            h->h264dsp.add_pixels4_clear(dest_y + block_offset[i],
+                                                         sl->mb + (i * 16 + p * 256 << pixel_shift),
+                                                         linesize);
                 }
             } else {
-                h->h264dsp.h264_idct_add16intra(dest_y, block_offset,
-                                                sl->mb + (p * 256 << pixel_shift),
-                                                linesize,
-                                                sl->non_zero_count_cache + p * 5 * 8);
+                h->h264dsp.idct_add16intra(dest_y, block_offset,
+                                           sl->mb + (p * 256 << pixel_shift),
+                                           linesize,
+                                           sl->non_zero_count_cache + p * 5 * 8);
             }
         } else if (sl->cbp & 15) {
             if (transform_bypass) {
                 const int di = IS_8x8DCT(mb_type) ? 4 : 1;
-                idct_add = IS_8x8DCT(mb_type) ? h->h264dsp.h264_add_pixels8_clear
-                    : h->h264dsp.h264_add_pixels4_clear;
+                idct_add = IS_8x8DCT(mb_type) ? h->h264dsp.add_pixels8_clear
+                    : h->h264dsp.add_pixels4_clear;
                 for (i = 0; i < 16; i += di)
                     if (sl->non_zero_count_cache[scan8[i + p * 16]])
                         idct_add(dest_y + block_offset[i],
@@ -770,15 +771,15 @@ static av_always_inline void hl_decode_mb_idct_luma(const H264Context *h, H264Sl
                                  linesize);
             } else {
                 if (IS_8x8DCT(mb_type))
-                    h->h264dsp.h264_idct8_add4(dest_y, block_offset,
-                                               sl->mb + (p * 256 << pixel_shift),
-                                               linesize,
-                                               sl->non_zero_count_cache + p * 5 * 8);
+                    h->h264dsp.idct8_add4(dest_y, block_offset,
+                                          sl->mb + (p * 256 << pixel_shift),
+                                          linesize,
+                                          sl->non_zero_count_cache + p * 5 * 8);
                 else
-                    h->h264dsp.h264_idct_add16(dest_y, block_offset,
-                                               sl->mb + (p * 256 << pixel_shift),
-                                               linesize,
-                                               sl->non_zero_count_cache + p * 5 * 8);
+                    h->h264dsp.idct_add16(dest_y, block_offset,
+                                          sl->mb + (p * 256 << pixel_shift),
+                                          linesize,
+                                          sl->non_zero_count_cache + p * 5 * 8);
             }
         }
     }

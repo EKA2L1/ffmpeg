@@ -23,6 +23,7 @@
 #include "libavutil/intfloat.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct ThpDemuxContext {
@@ -142,7 +143,7 @@ static int thp_read_header(AVFormatContext *s)
             st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
             st->codecpar->codec_id = AV_CODEC_ID_ADPCM_THP;
             st->codecpar->codec_tag = 0;  /* no fourcc */
-            st->codecpar->channels    = avio_rb32(pb); /* numChannels.  */
+            st->codecpar->ch_layout.nb_channels = avio_rb32(pb);
             st->codecpar->sample_rate = avio_rb32(pb); /* Frequency.  */
             st->duration           = avio_rb32(pb);
 
@@ -192,7 +193,7 @@ static int thp_read_packet(AVFormatContext *s,
         if (ret < 0)
             return ret;
         if (ret != size) {
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         }
 
         pkt->stream_index = thp->video_stream_index;
@@ -201,7 +202,7 @@ static int thp_read_packet(AVFormatContext *s,
         if (ret < 0)
             return ret;
         if (ret != thp->audiosize) {
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         }
 
         pkt->stream_index = thp->audio_stream_index;
@@ -215,9 +216,9 @@ static int thp_read_packet(AVFormatContext *s,
     return 0;
 }
 
-const AVInputFormat ff_thp_demuxer = {
-    .name           = "thp",
-    .long_name      = NULL_IF_CONFIG_SMALL("THP"),
+const FFInputFormat ff_thp_demuxer = {
+    .p.name         = "thp",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("THP"),
     .priv_data_size = sizeof(ThpDemuxContext),
     .read_probe     = thp_probe,
     .read_header    = thp_read_header,

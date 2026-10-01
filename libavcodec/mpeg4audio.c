@@ -21,7 +21,6 @@
  */
 
 #include "get_bits.h"
-#include "put_bits.h"
 #include "mpeg4audio.h"
 
 /**
@@ -57,7 +56,7 @@ static int parse_config_ALS(GetBitContext *gb, MPEG4AudioConfig *c, void *logctx
     return 0;
 }
 
-const uint8_t ff_mpeg4audio_channels[14] = {
+const uint8_t ff_mpeg4audio_channels[15] = {
     0,
     1, // mono (1/0)
     2, // stereo (2/0)
@@ -71,7 +70,8 @@ const uint8_t ff_mpeg4audio_channels[14] = {
     0,
     7, // 3/3.1
     8, // 3/2/2.1
-    24 // 3/3/3 - 5/2/3 - 3/0/0.2
+    24, // 3/3/3 - 5/2/3 - 3/0/0.2
+    8, // 3/2.1 - 2/0
 };
 
 static inline int get_object_type(GetBitContext *gb)
@@ -132,6 +132,53 @@ int ff_mpeg4audio_get_config_gb(MPEG4AudioConfig *c, GetBitContext *gb,
         ret = parse_config_ALS(gb, c, logctx);
         if (ret < 0)
             return ret;
+    }
+    switch (c->object_type) {
+    case AOT_AAC_MAIN:
+    case AOT_AAC_LC:
+    case AOT_AAC_SSR:
+    case AOT_AAC_LTP:
+    case AOT_ER_AAC_LC:
+        c->frame_length_short = get_bits1(gb);
+        c->frame_length = c->frame_length_short ? 960 : 1024;
+        break;
+    case AOT_ER_AAC_LD:
+    case AOT_ER_AAC_ELD:
+        c->frame_length_short = get_bits1(gb);
+        c->frame_length = c->frame_length_short ? 480 : 512;
+        break;
+    case AOT_USAC: {
+        int core_sbr_frame_len_idx, sbr_ratio;
+        int ratio_mult, ratio_dec, frame_length;
+        if (get_bits(gb, 5) == 0x1f) /* usacSamplingFrequencyIndex */ {
+            skip_bits(gb, 24); /* usacSamplingFrequency */
+        }
+        core_sbr_frame_len_idx = get_bits(gb, 3);
+        c->frame_length_short = core_sbr_frame_len_idx == 0 ||
+                                core_sbr_frame_len_idx == 2;
+        sbr_ratio = core_sbr_frame_len_idx == 2 ? 2 :
+                    core_sbr_frame_len_idx == 3 ? 3 :
+                    core_sbr_frame_len_idx == 4 ? 1 :
+                    0;
+
+        if (sbr_ratio == 2) {
+            ratio_mult = 8;
+            ratio_dec = 3;
+        } else if (sbr_ratio == 3) {
+            ratio_mult = 2;
+            ratio_dec = 1;
+        } else if (sbr_ratio == 4) {
+            ratio_mult = 4;
+            ratio_dec = 1;
+        } else {
+            ratio_mult = 1;
+            ratio_dec = 1;
+        }
+
+        frame_length = c->frame_length_short ? 768 : 1024;
+        c->frame_length = (frame_length * ratio_mult) / ratio_dec;
+        break;
+    }
     }
 
     if (c->ext_object_type != AOT_SBR && sync_extension) {

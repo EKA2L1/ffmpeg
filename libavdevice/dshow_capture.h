@@ -27,14 +27,13 @@
 #include "avdevice.h"
 
 #define COBJMACROS
-#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #define NO_DSHOW_STRSAFE
 #include <dshow.h>
 #include <dvdmedia.h>
 
 #include "libavcodec/internal.h"
-#include "libavcodec/packet_internal.h"
+#include "libavformat/packet_internal.h"
 
 /* EC_DEVICE_LOST is not defined in MinGW dshow headers. */
 #ifndef EC_DEVICE_LOST
@@ -125,14 +124,15 @@ void ff_dshow_##prefix##_Destroy(class *this)                                \
 class *ff_dshow_##prefix##_Create(__VA_ARGS__)                               \
 {                                                                            \
     class *this = CoTaskMemAlloc(sizeof(class));                             \
-    void  *vtbl = CoTaskMemAlloc(sizeof(*this->vtbl));                       \
     dshowdebug("ff_dshow_"AV_STRINGIFY(prefix)"_Create(%p)\n", this);        \
-    if (!this || !vtbl)                                                      \
+    if (!this)                                                               \
         goto fail;                                                           \
     ZeroMemory(this, sizeof(class));                                         \
-    ZeroMemory(vtbl, sizeof(*this->vtbl));                                   \
+    this->vtbl = CoTaskMemAlloc(sizeof(*this->vtbl));                        \
+    if (!this->vtbl)                                                         \
+        goto fail;                                                           \
+    ZeroMemory(this->vtbl, sizeof(*this->vtbl));                             \
     this->ref  = 1;                                                          \
-    this->vtbl = vtbl;                                                       \
     if (!setup)                                                              \
         goto fail;                                                           \
     dshowdebug("created ff_dshow_"AV_STRINGIFY(prefix)" %p\n", this);        \

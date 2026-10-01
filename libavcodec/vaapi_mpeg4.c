@@ -20,11 +20,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "h263.h"
-#include "hwconfig.h"
-#include "internal.h"
-#include "mpeg4video.h"
+#include "hwaccel_internal.h"
+#include "mpeg4videodec.h"
 #include "mpegvideo.h"
+#include "mpegvideodec.h"
 #include "vaapi_decode.h"
 
 /** Reconstruct bitstream intra_dc_vlc_thr */
@@ -43,15 +45,18 @@ static int mpeg4_get_intra_dc_vlc_thr(Mpeg4DecContext *s)
     return 0;
 }
 
-static int vaapi_mpeg4_start_frame(AVCodecContext *avctx, av_unused const uint8_t *buffer, av_unused uint32_t size)
+static int vaapi_mpeg4_start_frame(AVCodecContext *avctx,
+                                   av_unused const AVBufferRef *buffer_ref,
+                                   av_unused const uint8_t *buffer,
+                                   av_unused uint32_t size)
 {
     Mpeg4DecContext *ctx = avctx->priv_data;
-    MpegEncContext *s = &ctx->m;
-    VAAPIDecodePicture *pic = s->current_picture_ptr->hwaccel_picture_private;
+    MPVContext *const s = &ctx->h.c;
+    VAAPIDecodePicture *pic = s->cur_pic.ptr->hwaccel_picture_private;
     VAPictureParameterBufferMPEG4 pic_param;
     int i, err;
 
-    pic->output_surface = ff_vaapi_get_surface_id(s->current_picture_ptr->f);
+    pic->output_surface = ff_vaapi_get_surface_id(s->cur_pic.ptr->f);
 
     pic_param = (VAPictureParameterBufferMPEG4) {
         .vop_width                        = s->width,
@@ -64,26 +69,26 @@ static int vaapi_mpeg4_start_frame(AVCodecContext *avctx, av_unused const uint8_
             .interlaced                   = !s->progressive_sequence,
             .obmc_disable                 = 1,
             .sprite_enable                = ctx->vol_sprite_usage,
-            .sprite_warping_accuracy      = s->sprite_warping_accuracy,
-            .quant_type                   = s->mpeg_quant,
+            .sprite_warping_accuracy      = ctx->sprite_warping_accuracy,
+            .quant_type                   = ctx->mpeg_quant,
             .quarter_sample               = s->quarter_sample,
-            .data_partitioned             = s->data_partitioning,
+            .data_partitioned             = ctx->h.data_partitioning,
             .reversible_vlc               = ctx->rvlc,
             .resync_marker_disable        = !ctx->resync_marker,
         },
         .no_of_sprite_warping_points      = ctx->num_sprite_warping_points,
-        .quant_precision                  = s->quant_precision,
+        .quant_precision                  = ctx->quant_precision,
         .vop_fields.bits = {
             .vop_coding_type              = s->pict_type - AV_PICTURE_TYPE_I,
             .backward_reference_vop_coding_type =
-                s->pict_type == AV_PICTURE_TYPE_B ? s->next_picture.f->pict_type - AV_PICTURE_TYPE_I : 0,
+                s->pict_type == AV_PICTURE_TYPE_B ? s->next_pic.ptr->f->pict_type - AV_PICTURE_TYPE_I : 0,
             .vop_rounding_type            = s->no_rounding,
             .intra_dc_vlc_thr             = mpeg4_get_intra_dc_vlc_thr(ctx),
             .top_field_first              = s->top_field_first,
             .alternate_vertical_scan_flag = s->alternate_scan,
         },
-        .vop_fcode_forward                = s->f_code,
-        .vop_fcode_backward               = s->b_code,
+        .vop_fcode_forward                = ctx->f_code,
+        .vop_fcode_backward               = ctx->b_code,
         .vop_time_increment_resolution    = avctx->framerate.num,
         .num_macroblocks_in_gob           = s->mb_width * H263_GOB_HEIGHT(s->height),
         .num_gobs_in_vop                  =
@@ -98,9 +103,9 @@ static int vaapi_mpeg4_start_frame(AVCodecContext *avctx, av_unused const uint8_
     }
 
     if (s->pict_type == AV_PICTURE_TYPE_B)
-        pic_param.backward_reference_picture = ff_vaapi_get_surface_id(s->next_picture.f);
+        pic_param.backward_reference_picture = ff_vaapi_get_surface_id(s->next_pic.ptr->f);
     if (s->pict_type != AV_PICTURE_TYPE_I)
-        pic_param.forward_reference_picture  = ff_vaapi_get_surface_id(s->last_picture.f);
+        pic_param.forward_reference_picture  = ff_vaapi_get_surface_id(s->last_pic.ptr->f);
 
     err = ff_vaapi_decode_make_param_buffer(avctx, pic,
                                             VAPictureParameterBufferType,
@@ -137,7 +142,7 @@ fail:
 static int vaapi_mpeg4_end_frame(AVCodecContext *avctx)
 {
     MpegEncContext *s = avctx->priv_data;
-    VAAPIDecodePicture *pic = s->current_picture_ptr->hwaccel_picture_private;
+    VAAPIDecodePicture *pic = s->cur_pic.ptr->hwaccel_picture_private;
     int ret;
 
     ret = ff_vaapi_decode_issue(avctx, pic);
@@ -152,8 +157,8 @@ fail:
 
 static int vaapi_mpeg4_decode_slice(AVCodecContext *avctx, const uint8_t *buffer, uint32_t size)
 {
-    MpegEncContext *s = avctx->priv_data;
-    VAAPIDecodePicture *pic = s->current_picture_ptr->hwaccel_picture_private;
+    H263DecContext *const h = avctx->priv_data;
+    VAAPIDecodePicture *pic = h->c.cur_pic.ptr->hwaccel_picture_private;
     VASliceParameterBufferMPEG4 slice_param;
     int err;
 
@@ -161,13 +166,13 @@ static int vaapi_mpeg4_decode_slice(AVCodecContext *avctx, const uint8_t *buffer
         .slice_data_size   = size,
         .slice_data_offset = 0,
         .slice_data_flag   = VA_SLICE_DATA_FLAG_ALL,
-        .macroblock_offset = get_bits_count(&s->gb) % 8,
+        .macroblock_offset = get_bits_count(&h->gb) % 8,
         .macroblock_number = 0,
-        .quant_scale       = s->qscale,
+        .quant_scale       = h->c.qscale,
     };
 
     err = ff_vaapi_decode_make_slice_buffer(avctx, pic,
-                                            &slice_param, sizeof(slice_param),
+                                            &slice_param, 1, sizeof(slice_param),
                                             buffer, size);
     if (err < 0) {
         ff_vaapi_decode_cancel(avctx, pic);
@@ -178,11 +183,11 @@ static int vaapi_mpeg4_decode_slice(AVCodecContext *avctx, const uint8_t *buffer
 }
 
 #if CONFIG_MPEG4_VAAPI_HWACCEL
-const AVHWAccel ff_mpeg4_vaapi_hwaccel = {
-    .name                 = "mpeg4_vaapi",
-    .type                 = AVMEDIA_TYPE_VIDEO,
-    .id                   = AV_CODEC_ID_MPEG4,
-    .pix_fmt              = AV_PIX_FMT_VAAPI,
+const FFHWAccel ff_mpeg4_vaapi_hwaccel = {
+    .p.name               = "mpeg4_vaapi",
+    .p.type               = AVMEDIA_TYPE_VIDEO,
+    .p.id                 = AV_CODEC_ID_MPEG4,
+    .p.pix_fmt            = AV_PIX_FMT_VAAPI,
     .start_frame          = &vaapi_mpeg4_start_frame,
     .end_frame            = &vaapi_mpeg4_end_frame,
     .decode_slice         = &vaapi_mpeg4_decode_slice,
@@ -196,11 +201,11 @@ const AVHWAccel ff_mpeg4_vaapi_hwaccel = {
 #endif
 
 #if CONFIG_H263_VAAPI_HWACCEL
-const AVHWAccel ff_h263_vaapi_hwaccel = {
-    .name                 = "h263_vaapi",
-    .type                 = AVMEDIA_TYPE_VIDEO,
-    .id                   = AV_CODEC_ID_H263,
-    .pix_fmt              = AV_PIX_FMT_VAAPI,
+const FFHWAccel ff_h263_vaapi_hwaccel = {
+    .p.name               = "h263_vaapi",
+    .p.type               = AVMEDIA_TYPE_VIDEO,
+    .p.id                 = AV_CODEC_ID_H263,
+    .p.pix_fmt            = AV_PIX_FMT_VAAPI,
     .start_frame          = &vaapi_mpeg4_start_frame,
     .end_frame            = &vaapi_mpeg4_end_frame,
     .decode_slice         = &vaapi_mpeg4_decode_slice,

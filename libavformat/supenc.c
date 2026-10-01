@@ -21,13 +21,14 @@
 
 #include "avformat.h"
 #include "internal.h"
+#include "mux.h"
 #include "libavutil/intreadwrite.h"
 
 #define SUP_PGS_MAGIC 0x5047 /* "PG", big endian */
 
 static int sup_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
-    uint8_t *data = pkt->data;
+    const uint8_t *data = pkt->data;
     size_t size = pkt->size;
     uint32_t pts = 0, dts = 0;
 
@@ -46,7 +47,7 @@ static int sup_write_packet(AVFormatContext *s, AVPacket *pkt)
         size_t len = AV_RB16(data + 1) + 3;
 
         if (len > size) {
-            av_log(s, AV_LOG_ERROR, "Not enough data, skipping %"SIZE_SPECIFIER" bytes\n",
+            av_log(s, AV_LOG_ERROR, "Not enough data, skipping %zu bytes\n",
                    size);
             return AVERROR_INVALIDDATA;
         }
@@ -63,7 +64,7 @@ static int sup_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     if (size > 0) {
-        av_log(s, AV_LOG_ERROR, "Skipping %"SIZE_SPECIFIER" bytes after last segment in frame\n",
+        av_log(s, AV_LOG_ERROR, "Skipping %zu bytes after last segment in frame\n",
                size);
         return AVERROR_INVALIDDATA;
     }
@@ -71,26 +72,24 @@ static int sup_write_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-static int sup_write_header(AVFormatContext *s)
+static av_cold int sup_init(AVFormatContext *s)
 {
-    if (s->nb_streams != 1) {
-        av_log(s, AV_LOG_ERROR, "%s files have exactly one stream\n",
-               s->oformat->name);
-        return AVERROR(EINVAL);
-    }
-
     avpriv_set_pts_info(s->streams[0], 32, 1, 90000);
 
     return 0;
 }
 
-const AVOutputFormat ff_sup_muxer = {
-    .name           = "sup",
-    .long_name      = NULL_IF_CONFIG_SMALL("raw HDMV Presentation Graphic Stream subtitles"),
-    .extensions     = "sup",
-    .mime_type      = "application/x-pgs",
-    .subtitle_codec = AV_CODEC_ID_HDMV_PGS_SUBTITLE,
-    .write_header   = sup_write_header,
+const FFOutputFormat ff_sup_muxer = {
+    .p.name           = "sup",
+    .p.long_name      = NULL_IF_CONFIG_SMALL("raw HDMV Presentation Graphic Stream subtitles"),
+    .p.extensions     = "sup",
+    .p.mime_type      = "application/x-pgs",
+    .p.video_codec    = AV_CODEC_ID_NONE,
+    .p.audio_codec    = AV_CODEC_ID_NONE,
+    .p.subtitle_codec = AV_CODEC_ID_HDMV_PGS_SUBTITLE,
+    .p.flags          = AVFMT_VARIABLE_FPS | AVFMT_TS_NONSTRICT,
+    .flags_internal   = FF_OFMT_FLAG_MAX_ONE_OF_EACH |
+                        FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
+    .init             = sup_init,
     .write_packet   = sup_write_packet,
-    .flags          = AVFMT_VARIABLE_FPS | AVFMT_TS_NONSTRICT,
 };

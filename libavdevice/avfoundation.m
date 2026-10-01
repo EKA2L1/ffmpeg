@@ -29,9 +29,11 @@
 #include <pthread.h>
 
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/opt.h"
 #include "libavutil/avstring.h"
+#include "libavformat/demux.h"
 #include "libavformat/internal.h"
 #include "libavutil/internal.h"
 #include "libavutil/parseutils.h"
@@ -106,6 +108,7 @@ typedef struct
     int             audio_device_index;
     int             audio_stream_index;
 
+    char            *url;
     char            *video_filename;
     char            *audio_filename;
 
@@ -147,7 +150,7 @@ static void unlock_frames(AVFContext* ctx)
     pthread_mutex_unlock(&ctx->frame_lock);
 }
 
-/** FrameReciever class - delegate for AVCaptureSession
+/** FrameReceiver class - delegate for AVCaptureSession
  */
 @interface AVFFrameReceiver : NSObject
 {
@@ -239,7 +242,7 @@ static void unlock_frames(AVFContext* ctx)
 
 @end
 
-/** AudioReciever class - delegate for AVCaptureSession
+/** AudioReceiver class - delegate for AVCaptureSession
  */
 @interface AVFAudioReceiver : NSObject
 {
@@ -299,6 +302,7 @@ static void destroy_context(AVFContext* ctx)
     ctx->avf_delegate    = NULL;
     ctx->avf_audio_delegate = NULL;
 
+    av_freep(&ctx->url);
     av_freep(&ctx->audio_buffer);
 
     pthread_mutex_destroy(&ctx->frame_lock);
@@ -308,18 +312,22 @@ static void destroy_context(AVFContext* ctx)
     }
 }
 
-static void parse_device_name(AVFormatContext *s)
+static int parse_device_name(AVFormatContext *s)
 {
     AVFContext *ctx = (AVFContext*)s->priv_data;
-    char *tmp = av_strdup(s->url);
     char *save;
 
-    if (tmp[0] != ':') {
-        ctx->video_filename = av_strtok(tmp,  ":", &save);
+    ctx->url = av_strdup(s->url);
+
+    if (!ctx->url)
+        return AVERROR(ENOMEM);
+    if (ctx->url[0] != ':') {
+        ctx->video_filename = av_strtok(ctx->url,  ":", &save);
         ctx->audio_filename = av_strtok(NULL, ":", &save);
     } else {
-        ctx->audio_filename = av_strtok(tmp,  ":", &save);
+        ctx->audio_filename = av_strtok(ctx->url,  ":", &save);
     }
+    return 0;
 }
 
 /**
@@ -624,7 +632,6 @@ static int get_video_config(AVFormatContext *s)
 {
     AVFContext *ctx = (AVFContext*)s->priv_data;
     CVImageBufferRef image_buffer;
-    CMBlockBufferRef block_buffer;
     CGSize image_buffer_size;
     AVStream* stream = avformat_new_stream(s, NULL);
 
@@ -644,7 +651,6 @@ static int get_video_config(AVFormatContext *s)
     avpriv_set_pts_info(stream, 64, 1, avf_time_base);
 
     image_buffer = CMSampleBufferGetImageBuffer(ctx->current_frame);
-    block_buffer = CMSampleBufferGetDataBuffer(ctx->current_frame);
 
     if (image_buffer) {
         image_buffer_size = CVImageBufferGetEncodedSize(image_buffer);
@@ -700,8 +706,7 @@ static int get_audio_config(AVFormatContext *s)
 
     stream->codecpar->codec_type     = AVMEDIA_TYPE_AUDIO;
     stream->codecpar->sample_rate    = basic_desc->mSampleRate;
-    stream->codecpar->channels       = basic_desc->mChannelsPerFrame;
-    stream->codecpar->channel_layout = av_get_default_channel_layout(stream->codecpar->channels);
+    av_channel_layout_default(&stream->codecpar->ch_layout, basic_desc->mChannelsPerFrame);
 
     ctx->audio_channels        = basic_desc->mChannelsPerFrame;
     ctx->audio_bits_per_sample = basic_desc->mBitsPerChannel;
@@ -756,16 +761,77 @@ static int get_audio_config(AVFormatContext *s)
     return 0;
 }
 
+static NSArray* getDevicesWithMediaType(AVMediaType mediaType) {
+#if ((TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 100000) || (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED >= 101500))
+    NSMutableArray *deviceTypes = nil;
+    if (mediaType == AVMediaTypeVideo) {
+        deviceTypes = [NSMutableArray arrayWithArray:@[AVCaptureDeviceTypeBuiltInWideAngleCamera]];
+        #if (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 100000)
+            [deviceTypes addObject: AVCaptureDeviceTypeBuiltInDualCamera];
+            [deviceTypes addObject: AVCaptureDeviceTypeBuiltInTelephotoCamera];
+        #endif
+        #if (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 110100)
+            [deviceTypes addObject: AVCaptureDeviceTypeBuiltInTrueDepthCamera];
+        #endif
+        #if (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 130000)
+            [deviceTypes addObject: AVCaptureDeviceTypeBuiltInTripleCamera];
+            [deviceTypes addObject: AVCaptureDeviceTypeBuiltInDualWideCamera];
+            [deviceTypes addObject: AVCaptureDeviceTypeBuiltInUltraWideCamera];
+        #endif
+        #if (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED >= 130000)
+            [deviceTypes addObject: AVCaptureDeviceTypeDeskViewCamera];
+        #endif
+        #if (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 150400)
+            [deviceTypes addObject: AVCaptureDeviceTypeBuiltInLiDARDepthCamera];
+        #endif
+        #if (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 170000 || (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED >= 140000))
+            [deviceTypes addObject: AVCaptureDeviceTypeContinuityCamera];
+            [deviceTypes addObject: AVCaptureDeviceTypeExternal];
+        #elif (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED < 140000)
+            [deviceTypes addObject: AVCaptureDeviceTypeExternalUnknown];
+        #endif
+    } else if (mediaType == AVMediaTypeAudio) {
+        #if (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 170000 || (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED >= 140000))
+            deviceTypes = [NSMutableArray arrayWithArray:@[AVCaptureDeviceTypeMicrophone]];
+        #else
+            deviceTypes = [NSMutableArray arrayWithArray:@[AVCaptureDeviceTypeBuiltInMicrophone]];
+        #endif
+    } else if (mediaType == AVMediaTypeMuxed) {
+        #if (TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MIN_REQUIRED >= 170000 || (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED >= 140000))
+            deviceTypes = [NSMutableArray arrayWithArray:@[AVCaptureDeviceTypeExternal]];
+        #elif (TARGET_OS_OSX && __MAC_OS_X_VERSION_MIN_REQUIRED < 140000)
+            deviceTypes = [NSMutableArray arrayWithArray:@[AVCaptureDeviceTypeExternalUnknown]];
+        #else
+            return nil;
+        #endif
+    } else {
+        return nil;
+    }
+
+    AVCaptureDeviceDiscoverySession *captureDeviceDiscoverySession =
+        [AVCaptureDeviceDiscoverySession
+        discoverySessionWithDeviceTypes:deviceTypes
+                              mediaType:mediaType
+                               position:AVCaptureDevicePositionUnspecified];
+    return [captureDeviceDiscoverySession devices];
+#elif TARGET_OS_OSX
+    return [AVCaptureDevice devicesWithMediaType:mediaType];
+#else
+    return nil;
+#endif
+}
+
 static int avf_read_header(AVFormatContext *s)
 {
+    int ret = 0;
     NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
     uint32_t num_screens    = 0;
     AVFContext *ctx         = (AVFContext*)s->priv_data;
     AVCaptureDevice *video_device = nil;
     AVCaptureDevice *audio_device = nil;
     // Find capture device
-    NSArray *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
-    NSArray *devices_muxed = [AVCaptureDevice devicesWithMediaType:AVMediaTypeMuxed];
+    NSArray *devices       = getDevicesWithMediaType(AVMediaTypeVideo);
+    NSArray *devices_muxed = getDevicesWithMediaType(AVMediaTypeMuxed);
 
     ctx->num_video_devices = [devices count] + [devices_muxed count];
 
@@ -800,7 +866,7 @@ static int avf_read_header(AVFormatContext *s)
 #endif
 
         av_log(ctx, AV_LOG_INFO, "AVFoundation audio devices:\n");
-        devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeAudio];
+        devices = getDevicesWithMediaType(AVMediaTypeAudio);
         for (AVCaptureDevice *device in devices) {
             const char *name = [[device localizedName] UTF8String];
             int index  = [devices indexOfObject:device];
@@ -810,7 +876,9 @@ static int avf_read_header(AVFormatContext *s)
     }
 
     // parse input filename for video and audio device
-    parse_device_name(s);
+    ret = parse_device_name(s);
+    if (ret)
+        goto fail;
 
     // check for device index given in filename
     if (ctx->video_device_index == -1 && ctx->video_filename) {
@@ -922,7 +990,7 @@ static int avf_read_header(AVFormatContext *s)
 
     // get audio device
     if (ctx->audio_device_index >= 0) {
-        NSArray *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeAudio];
+        NSArray *devices = getDevicesWithMediaType(AVMediaTypeAudio);
 
         if (ctx->audio_device_index >= [devices count]) {
             av_log(ctx, AV_LOG_ERROR, "Invalid audio device index\n");
@@ -935,7 +1003,7 @@ static int avf_read_header(AVFormatContext *s)
         if (!strncmp(ctx->audio_filename, "default", 7)) {
             audio_device = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
         } else {
-        NSArray *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeAudio];
+        NSArray *devices = getDevicesWithMediaType(AVMediaTypeAudio);
 
         for (AVCaptureDevice *device in devices) {
             if (!strncmp(ctx->audio_filename, [[device localizedName] UTF8String], strlen(ctx->audio_filename))) {
@@ -1000,6 +1068,8 @@ static int avf_read_header(AVFormatContext *s)
 fail:
     [pool release];
     destroy_context(ctx);
+    if (ret)
+        return ret;
     return AVERROR(EIO);
 }
 
@@ -1227,13 +1297,13 @@ static const AVClass avf_class = {
     .category   = AV_CLASS_CATEGORY_DEVICE_VIDEO_INPUT,
 };
 
-const AVInputFormat ff_avfoundation_demuxer = {
-    .name           = "avfoundation",
-    .long_name      = NULL_IF_CONFIG_SMALL("AVFoundation input device"),
+const FFInputFormat ff_avfoundation_demuxer = {
+    .p.name         = "avfoundation",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("AVFoundation input device"),
+    .p.flags        = AVFMT_NOFILE,
+    .p.priv_class   = &avf_class,
     .priv_data_size = sizeof(AVFContext),
     .read_header    = avf_read_header,
     .read_packet    = avf_read_packet,
     .read_close     = avf_close,
-    .flags          = AVFMT_NOFILE,
-    .priv_class     = &avf_class,
 };

@@ -21,18 +21,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include <limits.h>
+#include "config_components.h"
 
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "decode.h"
+#include "hwaccel_internal.h"
 #include "internal.h"
-#include "h264dec.h"
-#include "vc1.h"
 #include "vdpau.h"
 #include "vdpau_internal.h"
-
-// XXX: at the time of adding this ifdefery, av_assert* wasn't use outside.
-// When dropping it, make sure other av_assert* were not added since then.
 
 /**
  * @addtogroup VDPAU_Decoding
@@ -63,16 +60,6 @@ static int vdpau_error(VdpStatus status)
         return AVERROR(EINVAL);
     }
 }
-
-AVVDPAUContext *av_alloc_vdpaucontext(void)
-{
-    return av_vdpau_alloc_context();
-}
-
-#define MAKE_ACCESSORS(str, name, type, field) \
-    type av_##name##_get_##field(const str *s) { return s->field; } \
-    void av_##name##_set_##field(str *s, type v) { s->field = v; }
-MAKE_ACCESSORS(AVVDPAUContext, vdpau_hwaccel, AVVDPAU_Render2, render2)
 
 int av_vdpau_get_surface_parameters(AVCodecContext *avctx,
                                     VdpChromaType *type,
@@ -137,8 +124,8 @@ int ff_vdpau_common_frame_params(AVCodecContext *avctx,
     return 0;
 }
 
-int ff_vdpau_common_init(AVCodecContext *avctx, VdpDecoderProfile profile,
-                         int level)
+av_cold int ff_vdpau_common_init(AVCodecContext *avctx,
+                                 VdpDecoderProfile profile, int level)
 {
     VDPAUHWContext *hwctx = avctx->hwaccel_context;
     VDPAUContext *vdctx = avctx->internal->hwaccel_priv_data;
@@ -288,7 +275,7 @@ int ff_vdpau_common_init(AVCodecContext *avctx, VdpDecoderProfile profile,
     return vdpau_error(status);
 }
 
-int ff_vdpau_common_uninit(AVCodecContext *avctx)
+av_cold int ff_vdpau_common_uninit(AVCodecContext *avctx)
 {
     VDPAUContext *vdctx = avctx->internal->hwaccel_priv_data;
     VdpDecoderDestroy *destroy;
@@ -322,8 +309,8 @@ static int ff_vdpau_common_reinit(AVCodecContext *avctx)
         avctx->coded_height == vdctx->height && (!hwctx || !hwctx->reset))
         return 0;
 
-    avctx->hwaccel->uninit(avctx);
-    return avctx->hwaccel->init(avctx);
+    FF_HW_SIMPLE_CALL(avctx, uninit);
+    return FF_HW_SIMPLE_CALL(avctx, init);
 }
 
 int ff_vdpau_common_start_frame(struct vdpau_picture_context *pic_ctx,
@@ -365,10 +352,12 @@ int ff_vdpau_common_end_frame(AVCodecContext *avctx, AVFrame *frame,
 #if CONFIG_MPEG1_VDPAU_HWACCEL || \
     CONFIG_MPEG2_VDPAU_HWACCEL || CONFIG_MPEG4_VDPAU_HWACCEL || \
     CONFIG_VC1_VDPAU_HWACCEL   || CONFIG_WMV3_VDPAU_HWACCEL
+#include "mpegvideodec.h"
+
 int ff_vdpau_mpeg_end_frame(AVCodecContext *avctx)
 {
     MpegEncContext *s = avctx->priv_data;
-    Picture *pic = s->current_picture_ptr;
+    MPVPicture *pic = s->cur_pic.ptr;
     struct vdpau_picture_context *pic_ctx = pic->hwaccel_picture_private;
     int val;
 
@@ -398,11 +387,6 @@ int ff_vdpau_add_buffer(struct vdpau_picture_context *pic_ctx,
     buffers->bitstream       = buf;
     buffers->bitstream_bytes = size;
     return 0;
-}
-
-AVVDPAUContext *av_vdpau_alloc_context(void)
-{
-    return av_mallocz(sizeof(VDPAUHWContext));
 }
 
 int av_vdpau_bind_context(AVCodecContext *avctx, VdpDevice device,

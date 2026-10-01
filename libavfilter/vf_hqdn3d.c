@@ -31,13 +31,13 @@
 #include "config.h"
 #include "libavutil/attributes.h"
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/opt.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 #include "vf_hqdn3d.h"
 
@@ -149,7 +149,6 @@ static int denoise_depth(HQDN3DContext *s,
     else
         denoise_temporal(src, dst, frame_ant,
                          w, h, sstride, dstride, temporal, depth);
-    emms_c();
     return 0;
 }
 
@@ -164,12 +163,8 @@ static int denoise_depth(HQDN3DContext *s,
             case 14: ret = denoise_depth(__VA_ARGS__, 14); break;             \
             case 16: ret = denoise_depth(__VA_ARGS__, 16); break;             \
         }                                                                     \
-        if (ret < 0) {                                                        \
-            av_frame_free(&out);                                              \
-            if (!direct)                                                      \
-                av_frame_free(&in);                                           \
+        if (ret < 0)                                                          \
             return ret;                                                       \
-        }                                                                     \
     } while (0)
 
 static void precalc_coefs(double dist25, int depth, int16_t *ct)
@@ -180,7 +175,7 @@ static void precalc_coefs(double dist25, int depth, int16_t *ct)
     gamma = log(0.25) / log(1.0 - FFMIN(dist25,252.0)/255.0 - 0.00001);
 
     for (i = -(256<<LUT_BITS); i < 256<<LUT_BITS; i++) {
-        double f = ((i<<(9-LUT_BITS)) + (1<<(8-LUT_BITS)) - 1) / 512.0; // midpoint of the bin
+        double f = (i * (1 << (9-LUT_BITS)) + (1<<(8-LUT_BITS)) - 1) / 512.0; // midpoint of the bin
         simil = FFMAX(0, 1.0 - fabs(f) / 255.0);
         C = pow(simil, gamma) * 256.0 * f;
         ct[(256<<LUT_BITS)+i] = lrint(C);
@@ -278,15 +273,19 @@ static int config_input(AVFilterLink *inlink)
 
     calc_coefs(ctx);
 
-    if (ARCH_X86)
-        ff_hqdn3d_init_x86(s);
+#if ARCH_X86 && HAVE_X86ASM
+    ff_hqdn3d_init_x86(s);
+#endif
+
+    s->format = inlink->format;
+    s->width  = inlink->w;
+    s->height = inlink->h;
 
     return 0;
 }
 
 typedef struct ThreadData {
     AVFrame *in, *out;
-    int direct;
 } ThreadData;
 
 static int do_denoise(AVFilterContext *ctx, void *data, int job_nr, int n_jobs)
@@ -295,7 +294,6 @@ static int do_denoise(AVFilterContext *ctx, void *data, int job_nr, int n_jobs)
     const ThreadData *td = data;
     AVFrame *out = td->out;
     AVFrame *in = td->in;
-    int direct = td->direct;
 
     denoise(s, in->data[job_nr], out->data[job_nr],
                 s->line[job_nr], &s->frame_prev[job_nr],
@@ -312,15 +310,33 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *ctx  = inlink->dst;
     AVFilterLink *outlink = ctx->outputs[0];
+    HQDN3DContext *s = ctx->priv;
 
     AVFrame *out;
     int direct = av_frame_is_writable(in) && !ctx->is_disabled;
     ThreadData td;
+    int err, ret[3];
+
+    if (in->format != s->format) {
+        av_frame_free(&in);
+        return AVERROR(EINVAL);
+    }
+
+    if (in->width != s->width || in->height != s->height) {
+        inlink->w = in->width;
+        inlink->h = in->height;
+        if ((err = config_input(inlink)) < 0) {
+            av_frame_free(&in);
+            return err;
+        }
+        outlink->w = in->width;
+        outlink->h = in->height;
+    }
 
     if (direct) {
         out = in;
     } else {
-        out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+        out = ff_get_video_buffer(outlink, in->width, in->height);
         if (!out) {
             av_frame_free(&in);
             return AVERROR(ENOMEM);
@@ -331,9 +347,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     td.in = in;
     td.out = out;
-    td.direct = direct;
     /* one thread per plane */
-    ff_filter_execute(ctx, do_denoise, &td, NULL, 3);
+    ff_filter_execute(ctx, do_denoise, &td, ret, 3);
+    for (int i = 0; i < FF_ARRAY_ELEMS(ret); i++) {
+        if (ret[i] < 0) {
+            av_frame_free(&out);
+            if (!direct)
+                av_frame_free(&in);
+            return ret[i];
+        }
+    }
 
     if (ctx->is_disabled) {
         av_frame_free(&out);
@@ -382,23 +405,16 @@ static const AVFilterPad avfilter_vf_hqdn3d_inputs[] = {
 };
 
 
-static const AVFilterPad avfilter_vf_hqdn3d_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO
-    },
-};
-
-const AVFilter ff_vf_hqdn3d = {
-    .name          = "hqdn3d",
-    .description   = NULL_IF_CONFIG_SMALL("Apply a High Quality 3D Denoiser."),
+const FFFilter ff_vf_hqdn3d = {
+    .p.name        = "hqdn3d",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply a High Quality 3D Denoiser."),
+    .p.priv_class  = &hqdn3d_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(HQDN3DContext),
-    .priv_class    = &hqdn3d_class,
     .init          = init,
     .uninit        = uninit,
     FILTER_INPUTS(avfilter_vf_hqdn3d_inputs),
-    FILTER_OUTPUTS(avfilter_vf_hqdn3d_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = process_command,
 };

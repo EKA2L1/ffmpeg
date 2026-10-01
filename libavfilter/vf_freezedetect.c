@@ -29,6 +29,7 @@
 #include "avfilter.h"
 #include "filters.h"
 #include "scene_sad.h"
+#include "video.h"
 
 typedef struct FreezeDetectContext {
     const AVClass *class;
@@ -102,7 +103,7 @@ static int config_input(AVFilterLink *inlink)
         s->height[plane] = inlink->h >> ((plane == 1 || plane == 2) ? pix_desc->log2_chroma_h : 0);
     }
 
-    s->sad = ff_scene_sad_get_fn(s->bitdepth == 8 ? 8 : 16);
+    s->sad = ff_scene_sad_get_fn(s->bitdepth);
     if (!s->sad)
         return AVERROR(EINVAL);
 
@@ -130,14 +131,13 @@ static int is_frozen(FreezeDetectContext *s, AVFrame *reference, AVFrame *frame)
             count += s->width[plane] * s->height[plane];
         }
     }
-    emms_c();
     mafd = (double)sad / count / (1ULL << s->bitdepth);
     return (mafd <= s->noise);
 }
 
-static int set_meta(FreezeDetectContext *s, AVFrame *frame, const char *key, const char *value)
+static int set_meta(void *log_ctx, AVFrame *frame, const char *key, const char *value)
 {
-    av_log(s, AV_LOG_INFO, "%s: %s\n", key, value);
+    av_log(log_ctx, AV_LOG_INFO, "%s: %s\n", key, value);
     return av_dict_set(&frame->metadata, key, value, 0);
 }
 
@@ -146,6 +146,7 @@ static int activate(AVFilterContext *ctx)
     int ret;
     AVFilterLink *inlink = ctx->inputs[0];
     AVFilterLink *outlink = ctx->outputs[0];
+    FilterLink         *l = ff_filter_link(inlink);
     FreezeDetectContext *s = ctx->priv;
     AVFrame *frame;
 
@@ -162,17 +163,17 @@ static int activate(AVFilterContext *ctx)
         if (s->reference_frame) {
             int64_t duration;
             if (s->reference_frame->pts == AV_NOPTS_VALUE || frame->pts == AV_NOPTS_VALUE || frame->pts < s->reference_frame->pts)     // Discontinuity?
-                duration = inlink->frame_rate.num > 0 ? av_rescale_q(s->n - s->reference_n, av_inv_q(inlink->frame_rate), AV_TIME_BASE_Q) : 0;
+                duration = l->frame_rate.num > 0 ? av_rescale_q(s->n - s->reference_n, av_inv_q(l->frame_rate), AV_TIME_BASE_Q) : 0;
             else
                 duration = av_rescale_q(frame->pts - s->reference_frame->pts, inlink->time_base, AV_TIME_BASE_Q);
 
             frozen = is_frozen(s, s->reference_frame, frame);
             if (duration >= s->duration) {
                 if (!s->frozen)
-                    set_meta(s, frame, "lavfi.freezedetect.freeze_start", av_ts2timestr(s->reference_frame->pts, &inlink->time_base));
+                    set_meta(ctx, frame, "lavfi.freezedetect.freeze_start", av_ts2timestr(s->reference_frame->pts, &inlink->time_base));
                 if (!frozen) {
-                    set_meta(s, frame, "lavfi.freezedetect.freeze_duration", av_ts2timestr(duration, &AV_TIME_BASE_Q));
-                    set_meta(s, frame, "lavfi.freezedetect.freeze_end", av_ts2timestr(frame->pts, &inlink->time_base));
+                    set_meta(ctx, frame, "lavfi.freezedetect.freeze_duration", av_ts2timestr(duration, &AV_TIME_BASE_Q));
+                    set_meta(ctx, frame, "lavfi.freezedetect.freeze_end", av_ts2timestr(frame->pts, &inlink->time_base));
                 }
                 s->frozen = frozen;
             }
@@ -204,22 +205,15 @@ static const AVFilterPad freezedetect_inputs[] = {
     },
 };
 
-static const AVFilterPad freezedetect_outputs[] = {
-    {
-        .name          = "default",
-        .type          = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_freezedetect = {
-    .name          = "freezedetect",
-    .description   = NULL_IF_CONFIG_SMALL("Detects frozen video input."),
+const FFFilter ff_vf_freezedetect = {
+    .p.name        = "freezedetect",
+    .p.description = NULL_IF_CONFIG_SMALL("Detects frozen video input."),
+    .p.priv_class  = &freezedetect_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(FreezeDetectContext),
-    .priv_class    = &freezedetect_class,
     .uninit        = uninit,
-    .flags         = AVFILTER_FLAG_METADATA_ONLY,
     FILTER_INPUTS(freezedetect_inputs),
-    FILTER_OUTPUTS(freezedetect_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
     .activate      = activate,
 };

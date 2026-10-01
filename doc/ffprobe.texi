@@ -12,7 +12,7 @@
 
 @chapter Synopsis
 
-ffprobe [@var{options}] [@file{input_url}]
+ffprobe [@var{options}] @file{input_url}
 
 @chapter Description
 @c man begin DESCRIPTION
@@ -28,6 +28,9 @@ If a url is specified in input, ffprobe will try to open and
 probe the url content. If the url cannot be opened or recognized as
 a multimedia file, a positive exit code is returned.
 
+If no output is specified as output with @option{o} ffprobe will write
+to stdout.
+
 ffprobe may be employed both as a standalone application or in
 combination with a textual filter, which may perform more
 sophisticated processing, e.g. statistical processing or plotting.
@@ -38,15 +41,15 @@ ffprobe will show it.
 
 ffprobe output is designed to be easily parsable by a textual filter,
 and consists of one or more sections of a form defined by the selected
-writer, which is specified by the @option{print_format} option.
+writer, which is specified by the @option{output_format} option.
 
 Sections may contain other nested sections, and are identified by a
 name (which may be shared by other sections), and an unique
 name. See the output of @option{sections}.
 
 Metadata tags stored in the container or in the streams are recognized
-and printed in the corresponding "FORMAT", "STREAM" or "PROGRAM_STREAM"
-section.
+and printed in the corresponding "FORMAT", "STREAM", "STREAM_GROUP_STREAM"
+or "PROGRAM_STREAM" section.
 
 @c man end
 
@@ -80,7 +83,7 @@ Use sexagesimal format HH:MM:SS.MICROSECONDS for time values.
 Prettify the format of the displayed values, it corresponds to the
 options "-unit -prefix -byte_binary_prefix -sexagesimal".
 
-@item -of, -print_format @var{writer_name}[=@var{writer_options}]
+@item -output_format, -of, -print_format @var{writer_name}[=@var{writer_options}]
 Set the output printing format.
 
 @var{writer_name} specifies the name of the writer, and
@@ -88,7 +91,7 @@ Set the output printing format.
 
 For example for printing the output in JSON format, specify:
 @example
--print_format json
+-output_format json
 @end example
 
 For more details on the available output printing formats, see the
@@ -114,7 +117,8 @@ ffprobe -show_packets -select_streams v:1 INPUT
 @end example
 
 @item -show_data
-Show payload data, as a hexadecimal and ASCII dump. Coupled with
+Show payload data, as a hexadecimal and ASCII dump (other formats can be
+selected using @option{-data_dump_format}). Coupled with
 @option{-show_packets}, it will dump the packets' data. Coupled with
 @option{-show_streams}, it will dump the codec extradata.
 
@@ -123,6 +127,11 @@ The dump is printed as the "data" field. It may contain newlines.
 @item -show_data_hash @var{algorithm}
 Show a hash of payload data, for packets with @option{-show_packets} and for
 codec extradata with @option{-show_streams}.
+
+@item -data_dump_format @var{format}
+Select a format used for the data dumps enabled with the @option{-show_data}
+option. The default is @code{xxd} which is a hexdump format compatible with the
+well-known @command{xxd} program. @code{base64} is also supported.
 
 @item -show_error
 Show information about the error found when trying to probe the input.
@@ -135,13 +144,6 @@ stream.
 
 All the container format information is printed within a section with
 name "FORMAT".
-
-@item -show_format_entry @var{name}
-Like @option{-show_format}, but only prints the specified entry of the
-container format information, rather than all. This option may be given more
-than once, then all specified entries will be shown.
-
-This option is deprecated, use @code{show_entries} instead.
 
 @item -show_entries @var{section_entries}
 Set list of entries to show.
@@ -228,6 +230,13 @@ multimedia stream.
 
 Each media stream information is printed within a dedicated section
 with name "PROGRAM_STREAM".
+
+@item -show_stream_groups
+Show information about stream groups and their streams contained in the
+input multimedia stream.
+
+Each media stream information is printed within a dedicated section
+with name "STREAM_GROUP_STREAM".
 
 @item -show_chapters
 Show information about chapters stored in the format.
@@ -341,12 +350,35 @@ while other writers always print them. This option enables one to control this b
 Valid values are @code{always}/@code{1}, @code{never}/@code{0} and @code{auto}/@code{-1}.
 Default is @var{auto}.
 
+@item -analyze_frames
+Analyze frames and/or their side data up to the provided read interval,
+providing additional information that may be useful at a stream level.
+Must be paired with the @option{-show_streams} option or it will have no effect.
+
+Currently, the additional fields provided by this option when enabled are the
+@code{closed_captions} and @code{film_grain} fields.
+
+For example, to analyze the first 20 seconds and populate these fields:
+@example
+ffprobe -show_streams -analyze_frames -read_intervals "%+20" INPUT
+@end example
+
 @item -bitexact
 Force bitexact output, useful to produce output which is not dependent
 on the specific build.
 
 @item -i @var{input_url}
 Read @var{input_url}.
+
+@item -o @var{output_url}
+Write output to @var{output_url}. If not specified, the output is sent
+to stdout.
+
+@item -c:@var{media_specifier} @var{codec_name}
+@itemx -codec:@var{media_specifier} @var{codec_name}
+Force a specific decoder implementation for the stream identified by
+@var{media_specifier}, which can assume the values @code{a} (audio),
+@code{v} (video), @code{s} (subtitle), and @code{d} (data).
 
 @end table
 @c man end
@@ -408,8 +440,9 @@ keyN=valN
 [/SECTION]
 @end example
 
-Metadata tags are printed as a line in the corresponding FORMAT, STREAM or
-PROGRAM_STREAM section, and are prefixed by the string "TAG:".
+Metadata tags are printed as a line in the corresponding FORMAT, STREAM,
+STREAM_GROUP_STREAM or PROGRAM_STREAM section, and are prefixed by the
+string "TAG:".
 
 A description of the accepted options follows.
 

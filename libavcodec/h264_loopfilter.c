@@ -28,13 +28,10 @@
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mem_internal.h"
-#include "internal.h"
 #include "avcodec.h"
 #include "h264dec.h"
 #include "h264_ps.h"
-#include "mathops.h"
 #include "mpegutils.h"
-#include "rectangle.h"
 
 /* Deblocking filter (p153) */
 static const uint8_t alpha_table[52*3] = {
@@ -116,9 +113,9 @@ static av_always_inline void filter_mb_edgev(uint8_t *pix, int stride,
         tc[1] = tc0_table[index_a][bS[1]];
         tc[2] = tc0_table[index_a][bS[2]];
         tc[3] = tc0_table[index_a][bS[3]];
-        h->h264dsp.h264_h_loop_filter_luma(pix, stride, alpha, beta, tc);
+        h->h264dsp.h_loop_filter_luma(pix, stride, alpha, beta, tc);
     } else {
-        h->h264dsp.h264_h_loop_filter_luma_intra(pix, stride, alpha, beta);
+        h->h264dsp.h_loop_filter_luma_intra(pix, stride, alpha, beta);
     }
 }
 
@@ -138,15 +135,15 @@ static av_always_inline void filter_mb_edgecv(uint8_t *pix, int stride,
         tc[1] = tc0_table[index_a][bS[1]]+1;
         tc[2] = tc0_table[index_a][bS[2]]+1;
         tc[3] = tc0_table[index_a][bS[3]]+1;
-        h->h264dsp.h264_h_loop_filter_chroma(pix, stride, alpha, beta, tc);
+        h->h264dsp.h_loop_filter_chroma(pix, stride, alpha, beta, tc);
     } else {
-        h->h264dsp.h264_h_loop_filter_chroma_intra(pix, stride, alpha, beta);
+        h->h264dsp.h_loop_filter_chroma_intra(pix, stride, alpha, beta);
     }
 }
 
 static av_always_inline void filter_mb_mbaff_edgev(const H264Context *h, uint8_t *pix,
                                                    int stride,
-                                                   const int16_t bS[7], int bsi,
+                                                   const int16_t bS[ /* 1 + 2 * bsi */ ], int bsi,
                                                    int qp, int a, int b,
                                                    int intra)
 {
@@ -161,15 +158,15 @@ static av_always_inline void filter_mb_mbaff_edgev(const H264Context *h, uint8_t
         tc[1] = tc0_table[index_a][bS[1*bsi]];
         tc[2] = tc0_table[index_a][bS[2*bsi]];
         tc[3] = tc0_table[index_a][bS[3*bsi]];
-        h->h264dsp.h264_h_loop_filter_luma_mbaff(pix, stride, alpha, beta, tc);
+        h->h264dsp.h_loop_filter_luma_mbaff(pix, stride, alpha, beta, tc);
     } else {
-        h->h264dsp.h264_h_loop_filter_luma_mbaff_intra(pix, stride, alpha, beta);
+        h->h264dsp.h_loop_filter_luma_mbaff_intra(pix, stride, alpha, beta);
     }
 }
 
 static av_always_inline void filter_mb_mbaff_edgecv(const H264Context *h,
                                                     uint8_t *pix, int stride,
-                                                    const int16_t bS[7],
+                                                    const int16_t bS[ /* 1 + 2 * bsi */ ],
                                                     int bsi, int qp, int a,
                                                     int b, int intra)
 {
@@ -184,9 +181,9 @@ static av_always_inline void filter_mb_mbaff_edgecv(const H264Context *h,
         tc[1] = tc0_table[index_a][bS[1*bsi]] + 1;
         tc[2] = tc0_table[index_a][bS[2*bsi]] + 1;
         tc[3] = tc0_table[index_a][bS[3*bsi]] + 1;
-        h->h264dsp.h264_h_loop_filter_chroma_mbaff(pix, stride, alpha, beta, tc);
+        h->h264dsp.h_loop_filter_chroma_mbaff(pix, stride, alpha, beta, tc);
     } else {
-        h->h264dsp.h264_h_loop_filter_chroma_mbaff_intra(pix, stride, alpha, beta);
+        h->h264dsp.h_loop_filter_chroma_mbaff_intra(pix, stride, alpha, beta);
     }
 }
 
@@ -206,9 +203,9 @@ static av_always_inline void filter_mb_edgeh(uint8_t *pix, int stride,
         tc[1] = tc0_table[index_a][bS[1]];
         tc[2] = tc0_table[index_a][bS[2]];
         tc[3] = tc0_table[index_a][bS[3]];
-        h->h264dsp.h264_v_loop_filter_luma(pix, stride, alpha, beta, tc);
+        h->h264dsp.v_loop_filter_luma(pix, stride, alpha, beta, tc);
     } else {
-        h->h264dsp.h264_v_loop_filter_luma_intra(pix, stride, alpha, beta);
+        h->h264dsp.v_loop_filter_luma_intra(pix, stride, alpha, beta);
     }
 }
 
@@ -228,9 +225,9 @@ static av_always_inline void filter_mb_edgech(uint8_t *pix, int stride,
         tc[1] = tc0_table[index_a][bS[1]]+1;
         tc[2] = tc0_table[index_a][bS[2]]+1;
         tc[3] = tc0_table[index_a][bS[3]]+1;
-        h->h264dsp.h264_v_loop_filter_chroma(pix, stride, alpha, beta, tc);
+        h->h264dsp.v_loop_filter_chroma(pix, stride, alpha, beta, tc);
     } else {
-        h->h264dsp.h264_v_loop_filter_chroma_intra(pix, stride, alpha, beta);
+        h->h264dsp.v_loop_filter_chroma_intra(pix, stride, alpha, beta);
     }
 }
 
@@ -371,8 +368,8 @@ static av_always_inline void h264_filter_mb_fast_internal(const H264Context *h,
             int mask_edge0 = 3*((mask_edge1>>1) & ((5*left_type)>>5)&1); // (mb_type & (MB_TYPE_16x16 | MB_TYPE_8x16)) && (h->left_type[LTOP] & (MB_TYPE_16x16 | MB_TYPE_8x16)) ? 3 : 0;
             int step =  1+(mb_type>>24); //IS_8x8DCT(mb_type) ? 2 : 1;
             edges = 4 - 3*((mb_type>>3) & !(sl->cbp & 15)); //(mb_type & MB_TYPE_16x16) && !(h->cbp & 15) ? 1 : 4;
-            h->h264dsp.h264_loop_filter_strength(bS, sl->non_zero_count_cache, sl->ref_cache, sl->mv_cache,
-                                                 sl->list_count==2, edges, step, mask_edge0, mask_edge1, FIELD_PICTURE(h));
+            h->h264dsp.loop_filter_strength(bS, sl->non_zero_count_cache, sl->ref_cache, sl->mv_cache,
+                                            sl->list_count==2, edges, step, mask_edge0, mask_edge1, FIELD_PICTURE(h));
         }
         if( IS_INTRA(left_type) )
             AV_WN64A(bS[0][0], 0x0004000400040004ULL);
@@ -422,7 +419,7 @@ void ff_h264_filter_mb_fast(const H264Context *h, H264SliceContext *sl,
                             unsigned int linesize, unsigned int uvlinesize)
 {
     av_assert2(!FRAME_MBAFF(h));
-    if(!h->h264dsp.h264_loop_filter_strength || h->ps.pps->chroma_qp_diff) {
+    if (!h->h264dsp.loop_filter_strength || h->ps.pps->chroma_qp_diff) {
         ff_h264_filter_mb(h, sl, mb_x, mb_y, img_y, img_cb, img_cr, linesize, uvlinesize);
         return;
     }

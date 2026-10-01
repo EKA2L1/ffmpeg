@@ -1,4 +1,4 @@
-#! /bin/sh
+#!/bin/sh
 
 config=$1
 
@@ -30,14 +30,14 @@ lock(){
 checkout(){
     case "$repo" in
         file:*|/*) src="${repo#file:}"      ;;
-        git:*)     git clone --quiet --branch "$branch" "$repo" "$src" ;;
+        git:*|https:*) git clone --quiet --branch "$branch" "$repo" "$src" ;;
     esac
 }
 
 update()(
     cd ${src} || return
     case "$repo" in
-        git:*) git fetch --quiet --force && git reset --quiet --hard "origin/$branch" ;;
+        git:*|https:*) git fetch --quiet --force && git reset --quiet --hard "origin/$branch" ;;
     esac
 )
 
@@ -53,15 +53,20 @@ configure()(
         ${cpu:+--cpu="$cpu"}                                            \
         ${toolchain:+--toolchain="$toolchain"}                          \
         ${cross_prefix:+--cross-prefix="$cross_prefix"}                 \
+        ${ar:+--ar="$ar"}                                               \
         ${as:+--as="$as"}                                               \
         ${cc:+--cc="$cc"}                                               \
+        ${cxx:+--cxx="$cxx"}                                            \
         ${ld:+--ld="$ld"}                                               \
+        ${nm:+--nm="$nm"}                                               \
         ${target_os:+--target-os="$target_os"}                          \
         ${sysroot:+--sysroot="$sysroot"}                                \
         ${target_exec:+--target-exec="$target_exec"}                    \
         ${target_path:+--target-path="$target_path"}                    \
         ${target_samples:+--target-samples="$target_samples"}           \
         ${extra_cflags:+--extra-cflags="$extra_cflags"}                 \
+        ${extra_cxxflags:+--extra-cxxflags="$extra_cxxflags"}           \
+        ${extra_objcflags:+--extra-objcflags="$extra_objcflags"}        \
         ${extra_ldflags:+--extra-ldflags="$extra_ldflags"}              \
         ${extra_libs:+--extra-libs="$extra_libs"}                       \
         ${extra_conf}
@@ -75,11 +80,23 @@ compile()(
 fate()(
     test "$build_only" = "yes" && return
     cd ${build} || return
-    ${make} ${makeopts_fate-${makeopts}} -k fate
+    if [ -n "${fate_environments}" ]; then
+        ret=0
+        for e in ${fate_environments}; do
+            eval "curenv=\${${e}_env}"
+            echo Testing environment ${e}: ${curenv}
+            ${make} ${makeopts_fate-${makeopts}} -k ${fate_targets} FATE_SUFFIX=_${e} ${curenv}
+            cur_ret=$?
+            test $cur_ret != 0 && ret=$cur_ret
+        done
+        return $ret
+    else
+        ${make} ${makeopts_fate-${makeopts}} -k ${fate_targets}
+    fi
 )
 
 clean(){
-    rm -rf ${build} ${inst}
+    test "$skip_clean" = "yes" || rm -rf ${build} ${inst}
 }
 
 report(){
@@ -103,6 +120,7 @@ cd ${workdir}       || die "cd ${workdir} failed"
 src=${workdir}/src
 : ${build:=${workdir}/build}
 : ${inst:=${workdir}/install}
+: ${fate_targets:=fate}
 
 test -d "$src" && update || checkout || die "Error fetching source"
 

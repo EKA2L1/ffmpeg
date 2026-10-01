@@ -30,21 +30,21 @@
 #define OPENMPT_API_VERSION_AT_LEAST(major, minor, patch) (OPENMPT_API_VERSION >= OPENMPT_API_VERSION_MAKE((major), (minor), (patch)))
 #endif
 
-#include "libavutil/avstring.h"
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct OpenMPTContext {
     const AVClass *class;
     openmpt_module *module;
 
-    int channels;
     double duration;
     /* options */
     int sample_rate;
-    int64_t layout;
+    AVChannelLayout ch_layout;
     int subsong;
 } OpenMPTContext;
 
@@ -53,10 +53,10 @@ typedef struct OpenMPTContext {
 #define D AV_OPT_FLAG_DECODING_PARAM
 static const AVOption options[] = {
     { "sample_rate", "set sample rate",    OFFSET(sample_rate), AV_OPT_TYPE_INT,            { .i64 = 48000 },               1000, INT_MAX,   A | D },
-    { "layout",      "set channel layout", OFFSET(layout),      AV_OPT_TYPE_CHANNEL_LAYOUT, { .i64 = AV_CH_LAYOUT_STEREO }, 0,    INT64_MAX, A | D },
-    { "subsong",     "set subsong",        OFFSET(subsong),     AV_OPT_TYPE_INT,            { .i64 = -2 },                  -2,   INT_MAX,   A | D, "subsong"},
-    { "all",         "all",                0,                   AV_OPT_TYPE_CONST,          { .i64 = -1},                   0,    0,         A | D, "subsong" },
-    { "auto",        "auto",               0,                   AV_OPT_TYPE_CONST,          { .i64 = -2},                   0,    0,         A | D, "subsong" },
+    { "layout",      "set channel layout", OFFSET(ch_layout),   AV_OPT_TYPE_CHLAYOUT,       { .str = "stereo" },            0,    0,         A | D },
+    { "subsong",     "set subsong",        OFFSET(subsong),     AV_OPT_TYPE_INT,            { .i64 = -2 },                  -2,   INT_MAX,   A | D, .unit = "subsong"},
+    { "all",         "all",                0,                   AV_OPT_TYPE_CONST,          { .i64 = -1},                   0,    0,         A | D, .unit = "subsong" },
+    { "auto",        "auto",               0,                   AV_OPT_TYPE_CONST,          { .i64 = -2},                   0,    0,         A | D, .unit = "subsong" },
     { NULL }
 };
 
@@ -120,8 +120,6 @@ static int read_header_openmpt(AVFormatContext *s)
             return AVERROR_INVALIDDATA;
 #endif
 
-    openmpt->channels = av_get_channel_layout_nb_channels(openmpt->layout);
-
     if (openmpt->subsong >= openmpt_module_get_num_subsongs(openmpt->module)) {
         av_log(s, AV_LOG_ERROR, "Invalid subsong index: %d\n", openmpt->subsong);
         return AVERROR(EINVAL);
@@ -150,12 +148,15 @@ static int read_header_openmpt(AVFormatContext *s)
     if (!st)
         return AVERROR(ENOMEM);
     avpriv_set_pts_info(st, 64, 1, AV_TIME_BASE);
-    st->duration = llrint(openmpt->duration*AV_TIME_BASE);
+    if (openmpt->duration >= 0 && openmpt->duration < ((double)INT64_MAX + 1) / AV_TIME_BASE)
+        st->duration = llrint(openmpt->duration*AV_TIME_BASE);
 
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id    = AV_NE(AV_CODEC_ID_PCM_F32BE, AV_CODEC_ID_PCM_F32LE);
-    st->codecpar->channels    = openmpt->channels;
     st->codecpar->sample_rate = openmpt->sample_rate;
+    ret = av_channel_layout_copy(&st->codecpar->ch_layout, &openmpt->ch_layout);
+    if (ret < 0)
+        return ret;
 
     return 0;
 }
@@ -165,13 +166,15 @@ static int read_header_openmpt(AVFormatContext *s)
 static int read_packet_openmpt(AVFormatContext *s, AVPacket *pkt)
 {
     OpenMPTContext *openmpt = s->priv_data;
-    int n_samples = AUDIO_PKT_SIZE / (openmpt->channels ? openmpt->channels*4 : 4);
+    int n_samples = AUDIO_PKT_SIZE / (openmpt->ch_layout.nb_channels ? openmpt->ch_layout.nb_channels*4 : 4);
     int ret;
 
     if ((ret = av_new_packet(pkt, AUDIO_PKT_SIZE)) < 0)
         return ret;
 
-    switch (openmpt->channels) {
+    double pos = openmpt_module_get_position_seconds(openmpt->module);
+
+    switch (openmpt->ch_layout.nb_channels) {
     case 1:
         ret = openmpt_module_read_float_mono(openmpt->module, openmpt->sample_rate,
                                              n_samples, (float *)pkt->data);
@@ -185,7 +188,7 @@ static int read_packet_openmpt(AVFormatContext *s, AVPacket *pkt)
                                                          n_samples, (float *)pkt->data);
         break;
     default:
-        av_log(s, AV_LOG_ERROR, "Unsupported number of channels: %d", openmpt->channels);
+        av_log(s, AV_LOG_ERROR, "Unsupported number of channels: %d", openmpt->ch_layout.nb_channels);
         return AVERROR(EINVAL);
     }
 
@@ -194,7 +197,10 @@ static int read_packet_openmpt(AVFormatContext *s, AVPacket *pkt)
         return AVERROR_EOF;
     }
 
-    pkt->size = ret * (openmpt->channels * 4);
+    pkt->size = ret * (openmpt->ch_layout.nb_channels * 4);
+
+    if (pos >= 0 && pos < ((double)INT64_MAX + 1) / AV_TIME_BASE)
+        pkt->pts = llrint(pos * AV_TIME_BASE);
 
     return 0;
 }
@@ -212,6 +218,8 @@ static int read_close_openmpt(AVFormatContext *s)
 static int read_seek_openmpt(AVFormatContext *s, int stream_idx, int64_t ts, int flags)
 {
     OpenMPTContext *openmpt = s->priv_data;
+    if (ts < 0)
+        ts = 0;
     openmpt_module_set_position_seconds(openmpt->module, (double)ts/AV_TIME_BASE);
     return 0;
 }
@@ -244,7 +252,7 @@ static int read_probe_openmpt(const AVProbeData *p)
              * AVPROBE_SCORE_MAX in order to reduce the impact in the rare
              * cases of false positives.
              */
-            return AVPROBE_SCORE_MIME + 1;
+            return (AVPROBE_SCORE_MAX * 3) / 4 + 1;
         } else if (probe_result == OPENMPT_PROBE_FILE_HEADER_RESULT_WANTMOREDATA) {
             if (probe_openmpt_extension(p) > 0) {
                 return AVPROBE_SCORE_RETRY;
@@ -279,20 +287,20 @@ static const AVClass class_openmpt = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVInputFormat ff_libopenmpt_demuxer = {
-    .name           = "libopenmpt",
-    .long_name      = NULL_IF_CONFIG_SMALL("Tracker formats (libopenmpt)"),
+const FFInputFormat ff_libopenmpt_demuxer = {
+    .p.name         = "libopenmpt",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Tracker formats (libopenmpt)"),
+    .p.priv_class   = &class_openmpt,
+#if OPENMPT_API_VERSION_AT_LEAST(0,3,0)
+    .p.extensions   = "669,amf,ams,dbm,digi,dmf,dsm,dtm,far,gdm,ice,imf,it,j2b,m15,mdl,med,mmcmp,mms,mo3,mod,mptm,mt2,mtm,nst,okt,plm,ppm,psm,pt36,ptm,s3m,sfx,sfx2,st26,stk,stm,stp,ult,umx,wow,xm,xpk",
+#else
+    .p.extensions   = "669,amf,ams,dbm,digi,dmf,dsm,far,gdm,ice,imf,it,j2b,m15,mdl,med,mmcmp,mms,mo3,mod,mptm,mt2,mtm,nst,okt,plm,ppm,psm,pt36,ptm,s3m,sfx,sfx2,st26,stk,stm,ult,umx,wow,xm,xpk",
+#endif
     .priv_data_size = sizeof(OpenMPTContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = read_probe_openmpt,
     .read_header    = read_header_openmpt,
     .read_packet    = read_packet_openmpt,
     .read_close     = read_close_openmpt,
     .read_seek      = read_seek_openmpt,
-    .priv_class     = &class_openmpt,
-#if OPENMPT_API_VERSION_AT_LEAST(0,3,0)
-    .extensions     = "669,amf,ams,dbm,digi,dmf,dsm,dtm,far,gdm,ice,imf,it,j2b,m15,mdl,med,mmcmp,mms,mo3,mod,mptm,mt2,mtm,nst,okt,plm,ppm,psm,pt36,ptm,s3m,sfx,sfx2,st26,stk,stm,stp,ult,umx,wow,xm,xpk",
-#else
-    .extensions     = "669,amf,ams,dbm,digi,dmf,dsm,far,gdm,ice,imf,it,j2b,m15,mdl,med,mmcmp,mms,mo3,mod,mptm,mt2,mtm,nst,okt,plm,ppm,psm,pt36,ptm,s3m,sfx,sfx2,st26,stk,stm,ult,umx,wow,xm,xpk",
-#endif
 };

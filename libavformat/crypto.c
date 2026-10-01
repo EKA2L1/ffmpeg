@@ -19,11 +19,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "avformat.h"
+#include <inttypes.h>
+#include <string.h>
+
 #include "libavutil/aes.h"
 #include "libavutil/avstring.h"
+#include "libavutil/error.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "internal.h"
 #include "url.h"
 
 // encourage reads of 4096 bytes - 1 block is always retained.
@@ -63,7 +66,7 @@ typedef struct CryptoContext {
 #define OFFSET(x) offsetof(CryptoContext, x)
 #define D AV_OPT_FLAG_DECODING_PARAM
 #define E AV_OPT_FLAG_ENCODING_PARAM
-static const AVOption options[] = {
+static const AVOption crypto_options[] = {
     {"key", "AES encryption/decryption key",                   OFFSET(key),         AV_OPT_TYPE_BINARY, .flags = D|E },
     {"iv",  "AES encryption/decryption initialization vector", OFFSET(iv),          AV_OPT_TYPE_BINARY, .flags = D|E },
     {"decryption_key", "AES decryption key",                   OFFSET(decrypt_key), AV_OPT_TYPE_BINARY, .flags = D },
@@ -76,7 +79,7 @@ static const AVOption options[] = {
 static const AVClass crypto_class = {
     .class_name     = "crypto",
     .item_name      = av_default_item_name,
-    .option         = options,
+    .option         = crypto_options,
     .version        = LIBAVUTIL_VERSION_INT,
 };
 
@@ -157,7 +160,7 @@ static int crypto_open2(URLContext *h, const char *uri, int flags, AVDictionary 
         if (ret < 0)
             goto err;
 
-        // pass back information about the context we openned
+        // pass back information about the context we opened
         if (c->hd->is_streamed)
             h->is_streamed = c->hd->is_streamed;
     }
@@ -172,7 +175,7 @@ static int crypto_open2(URLContext *h, const char *uri, int flags, AVDictionary 
         if (ret < 0)
             goto err;
         // for write, we must be streamed
-        // - linear write only for crytpo aes-128-cbc
+        // - linear write only for crypto aes-128-cbc
         h->is_streamed = 1;
     }
 
@@ -256,7 +259,7 @@ static int64_t crypto_seek(URLContext *h, int64_t pos, int whence)
         newpos = ffurl_seek( c->hd, pos, AVSEEK_SIZE );
         if (newpos < 0) {
             av_log(h, AV_LOG_ERROR,
-                "Crypto: seek_end - can't get file size (pos=%lld)\r\n", (long long int)pos);
+                "Crypto: seek_end - can't get file size (pos=%"PRId64")\r\n", pos);
             return newpos;
         }
         pos = newpos - pos;
@@ -314,11 +317,9 @@ static int64_t crypto_seek(URLContext *h, int64_t pos, int whence)
 
         // if we did not get all the bytes
         if (len != 0) {
-            char errbuf[100] = "unknown error";
-            av_strerror(res, errbuf, sizeof(errbuf));
             av_log(h, AV_LOG_ERROR,
                 "Crypto: discard read did not get all the bytes (%d remain) - read returned (%d)-%s\n",
-                len, res, errbuf);
+                len, res, av_err2str(res));
             return AVERROR(EINVAL);
         }
     }

@@ -20,19 +20,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/intreadwrite.h"
+#include "libavutil/imgutils_internal.h"
 #include "libavutil/pixdesc.h"
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
 #include "encode.h"
-#include "internal.h"
 #include "xwd.h"
 
 #define WINDOW_NAME         "lavcxwdenc"
 #define WINDOW_NAME_SIZE    11
 
 static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
-                            const AVFrame *pict, int *got_packet)
+                            const AVFrame *p, int *got_packet)
 {
     enum AVPixelFormat pix_fmt = avctx->pix_fmt;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt);
@@ -40,8 +40,8 @@ static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     uint32_t rgb[3] = { 0 }, bitorder = 0;
     uint32_t header_size;
     int i, out_size, ret;
-    uint8_t *ptr, *buf;
-    AVFrame * const p = (AVFrame *)pict;
+    const uint8_t *ptr;
+    uint8_t *buf;
     uint32_t pal[256];
 
     pixdepth = av_get_bits_per_pixel(desc);
@@ -152,9 +152,6 @@ static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         return ret;
     buf = pkt->data;
 
-    p->key_frame = 1;
-    p->pict_type = AV_PICTURE_TYPE_I;
-
     bytestream_put_be32(&buf, header_size);
     bytestream_put_be32(&buf, XWD_VERSION);   // file version
     bytestream_put_be32(&buf, XWD_Z_PIXMAP);  // pixmap format
@@ -215,33 +212,19 @@ static int xwd_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     return 0;
 }
 
-const AVCodec ff_xwd_encoder = {
-    .name         = "xwd",
-    .long_name    = NULL_IF_CONFIG_SMALL("XWD (X Window Dump) image"),
-    .type         = AVMEDIA_TYPE_VIDEO,
-    .id           = AV_CODEC_ID_XWD,
-    .capabilities = AV_CODEC_CAP_DR1,
-    .encode2      = xwd_encode_frame,
-    .pix_fmts     = (const enum AVPixelFormat[]) { AV_PIX_FMT_BGRA,
-                                                 AV_PIX_FMT_RGBA,
-                                                 AV_PIX_FMT_ARGB,
-                                                 AV_PIX_FMT_ABGR,
-                                                 AV_PIX_FMT_RGB24,
-                                                 AV_PIX_FMT_BGR24,
-                                                 AV_PIX_FMT_RGB565BE,
-                                                 AV_PIX_FMT_RGB565LE,
-                                                 AV_PIX_FMT_BGR565BE,
-                                                 AV_PIX_FMT_BGR565LE,
-                                                 AV_PIX_FMT_RGB555BE,
-                                                 AV_PIX_FMT_RGB555LE,
-                                                 AV_PIX_FMT_BGR555BE,
-                                                 AV_PIX_FMT_BGR555LE,
-                                                 AV_PIX_FMT_RGB8,
-                                                 AV_PIX_FMT_BGR8,
-                                                 AV_PIX_FMT_RGB4_BYTE,
-                                                 AV_PIX_FMT_BGR4_BYTE,
-                                                 AV_PIX_FMT_PAL8,
-                                                 AV_PIX_FMT_GRAY8,
-                                                 AV_PIX_FMT_MONOWHITE,
-                                                 AV_PIX_FMT_NONE },
+const FFCodec ff_xwd_encoder = {
+    .p.name         = "xwd",
+    CODEC_LONG_NAME("XWD (X Window Dump) image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_XWD,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    FF_CODEC_ENCODE_CB(xwd_encode_frame),
+    CODEC_PIXFMTS(AV_PIX_FMT_BGRA, AV_PIX_FMT_RGBA,  AV_PIX_FMT_ARGB,
+                  AV_PIX_FMT_ABGR, AV_PIX_FMT_RGB24, AV_PIX_FMT_BGR24,
+                  AV_PIX_FMT_RGB565BE, AV_PIX_FMT_RGB565LE, AV_PIX_FMT_BGR565BE,
+                  AV_PIX_FMT_BGR565LE, AV_PIX_FMT_RGB555BE, AV_PIX_FMT_RGB555LE,
+                  AV_PIX_FMT_BGR555BE, AV_PIX_FMT_BGR555LE,
+                  AV_PIX_FMT_RGB8, AV_PIX_FMT_BGR8,
+                  AV_PIX_FMT_RGB4_BYTE, AV_PIX_FMT_BGR4_BYTE,
+                  AV_PIX_FMT_PAL8, AV_PIX_FMT_GRAY8, AV_PIX_FMT_MONOWHITE),
 };

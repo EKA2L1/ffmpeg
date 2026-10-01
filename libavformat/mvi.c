@@ -23,6 +23,7 @@
 
 #include "libavutil/channel_layout.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define MVI_FRAC_BITS 10
@@ -84,8 +85,7 @@ static int read_header(AVFormatContext *s)
     avpriv_set_pts_info(ast, 64, 1, ast->codecpar->sample_rate);
     ast->codecpar->codec_type      = AVMEDIA_TYPE_AUDIO;
     ast->codecpar->codec_id        = AV_CODEC_ID_PCM_U8;
-    ast->codecpar->channels        = 1;
-    ast->codecpar->channel_layout  = AV_CH_LAYOUT_MONO;
+    ast->codecpar->ch_layout       = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     ast->codecpar->bits_per_coded_sample = 8;
     ast->codecpar->bit_rate        = ast->codecpar->sample_rate * 8;
 
@@ -119,7 +119,7 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     if (mvi->video_frame_size == 0) {
         mvi->video_frame_size = (mvi->get_int)(pb);
         if (mvi->audio_size_left == 0)
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         if (mvi->audio_size_counter + 512 > UINT64_MAX - mvi->audio_frame_size ||
             mvi->audio_size_counter + 512 + mvi->audio_frame_size >= ((uint64_t)INT32_MAX) << MVI_FRAC_BITS)
             return AVERROR_INVALIDDATA;
@@ -143,11 +143,11 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-const AVInputFormat ff_mvi_demuxer = {
-    .name           = "mvi",
-    .long_name      = NULL_IF_CONFIG_SMALL("Motion Pixels MVI"),
+const FFInputFormat ff_mvi_demuxer = {
+    .p.name         = "mvi",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Motion Pixels MVI"),
+    .p.extensions   = "mvi",
     .priv_data_size = sizeof(MviDemuxContext),
     .read_header    = read_header,
     .read_packet    = read_packet,
-    .extensions     = "mvi",
 };

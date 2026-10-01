@@ -24,15 +24,14 @@
  * @see http://epubs.surrey.ac.uk/531590/1/MPEG-7%20Video%20Signature%20Author%27s%20Copy.pdf
  */
 
-#include <float.h>
 #include "libavcodec/put_bits.h"
 #include "libavformat/avformat.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/avstring.h"
-#include "libavutil/intreadwrite.h"
-#include "libavutil/timestamp.h"
+#include "libavutil/file_open.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "signature.h"
 #include "signature_lookup.c"
 
@@ -42,18 +41,18 @@
 
 static const AVOption signature_options[] = {
     { "detectmode", "set the detectmode",
-        OFFSET(mode),         AV_OPT_TYPE_INT,    {.i64 = MODE_OFF}, 0, NB_LOOKUP_MODE-1, FLAGS, "mode" },
-        { "off",  NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_OFF},  0, 0, .flags = FLAGS, "mode" },
-        { "full", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_FULL}, 0, 0, .flags = FLAGS, "mode" },
-        { "fast", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_FAST}, 0, 0, .flags = FLAGS, "mode" },
+        OFFSET(mode),         AV_OPT_TYPE_INT,    {.i64 = MODE_OFF}, 0, NB_LOOKUP_MODE-1, FLAGS, .unit = "mode" },
+        { "off",  NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_OFF},  0, 0, .flags = FLAGS, .unit = "mode" },
+        { "full", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_FULL}, 0, 0, .flags = FLAGS, .unit = "mode" },
+        { "fast", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = MODE_FAST}, 0, 0, .flags = FLAGS, .unit = "mode" },
     { "nb_inputs",  "number of inputs",
         OFFSET(nb_inputs),    AV_OPT_TYPE_INT,    {.i64 = 1},        1, INT_MAX,          FLAGS },
     { "filename",   "filename for output files",
         OFFSET(filename),     AV_OPT_TYPE_STRING, {.str = ""},       0, NB_FORMATS-1,     FLAGS },
     { "format",     "set output format",
-        OFFSET(format),       AV_OPT_TYPE_INT,    {.i64 = FORMAT_BINARY}, 0, 1,           FLAGS , "format" },
-        { "binary", 0, 0, AV_OPT_TYPE_CONST, {.i64=FORMAT_BINARY}, 0, 0, FLAGS, "format" },
-        { "xml",    0, 0, AV_OPT_TYPE_CONST, {.i64=FORMAT_XML},    0, 0, FLAGS, "format" },
+        OFFSET(format),       AV_OPT_TYPE_INT,    {.i64 = FORMAT_BINARY}, 0, 1,           FLAGS , .unit = "format" },
+        { "binary", 0, 0, AV_OPT_TYPE_CONST, {.i64=FORMAT_BINARY}, 0, 0, FLAGS, .unit = "format" },
+        { "xml",    0, 0, AV_OPT_TYPE_CONST, {.i64=FORMAT_XML},    0, 0, FLAGS, .unit = "format" },
     { "th_d",       "threshold to detect one word as similar",
         OFFSET(thworddist),   AV_OPT_TYPE_INT,    {.i64 = 9000},     1, INT_MAX,          FLAGS },
     { "th_dc",      "threshold to detect all words as similar",
@@ -219,7 +218,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
     dw1 = inlink->w / 32;
     if (inlink->w % 32)
         dw2 = dw1 + 1;
-    denom = (sc->divide) ? dh1 * dh2 * dw1 * dw2 : 1;
+    denom = (sc->divide) ? dh1 * (int64_t)dh2 * dw1 * dw2 : 1;
 
     for (i = 0; i < 32; i++) {
         rowcount = 0;
@@ -245,21 +244,17 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
         }
     }
 
-    denom = (sc->divide) ? 1 : dh1 * dh2 * dw1 * dw2;
+    denom = (sc->divide) ? 1 : dh1 * (int64_t)dh2 * dw1 * dw2;
 
     for (i = 0; i < ELEMENT_COUNT; i++) {
         const ElemCat* elemcat = elements[i];
         int64_t* elemsignature;
         uint64_t* sortsignature;
 
-        elemsignature = av_malloc_array(elemcat->elem_count, sizeof(int64_t));
+        elemsignature = av_malloc_array(elemcat->elem_count, 2 * sizeof(int64_t));
         if (!elemsignature)
             return AVERROR(ENOMEM);
-        sortsignature = av_malloc_array(elemcat->elem_count, sizeof(int64_t));
-        if (!sortsignature) {
-            av_freep(&elemsignature);
-            return AVERROR(ENOMEM);
-        }
+        sortsignature = elemsignature + elemcat->elem_count;
 
         for (j = 0; j < elemcat->elem_count; j++) {
             blocksum = 0;
@@ -309,7 +304,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
             f++;
         }
         av_freep(&elemsignature);
-        av_freep(&sortsignature);
     }
 
     /* confidence */
@@ -386,12 +380,13 @@ static int xml_export(AVFilterContext *ctx, StreamContext *sc, const char* filen
     FILE* f;
     unsigned int pot3[5] = { 3*3*3*3, 3*3*3, 3*3, 3, 1 };
 
-    f = fopen(filename, "w");
+    if (!sc->coarseend->last)
+        return AVERROR(EINVAL); // No frames ?
+
+    f = avpriv_fopen_utf8(filename, "w");
     if (!f) {
         int err = AVERROR(EINVAL);
-        char buf[128];
-        av_strerror(err, buf, sizeof(buf));
-        av_log(ctx, AV_LOG_ERROR, "cannot open xml file %s: %s\n", filename, buf);
+        av_log(ctx, AV_LOG_ERROR, "cannot open xml file %s: %s\n", filename, av_err2str(err));
         return err;
     }
 
@@ -500,12 +495,10 @@ static int binary_export(AVFilterContext *ctx, StreamContext *sc, const char* fi
     if (!buffer)
         return AVERROR(ENOMEM);
 
-    f = fopen(filename, "wb");
+    f = avpriv_fopen_utf8(filename, "wb");
     if (!f) {
         int err = AVERROR(EINVAL);
-        char buf[128];
-        av_strerror(err, buf, sizeof(buf));
-        av_log(ctx, AV_LOG_ERROR, "cannot open file %s: %s\n", filename, buf);
+        av_log(ctx, AV_LOG_ERROR, "cannot open file %s: %s\n", filename, av_err2str(err));
         av_freep(&buffer);
         return err;
     }
@@ -588,7 +581,7 @@ static int request_frame(AVFilterLink *outlink)
     StreamContext *sc, *sc2;
     MatchingInfo match;
     int i, j, ret;
-    int lookup = 1; /* indicates wheather EOF of all files is reached */
+    int lookup = 1; /* indicates whether EOF of all files is reached */
 
     /* process all inputs */
     for (i = 0; i < sic->nb_inputs; i++){
@@ -729,9 +722,11 @@ static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
     AVFilterLink *inlink = ctx->inputs[0];
+    FilterLink       *il = ff_filter_link(inlink);
+    FilterLink       *ol = ff_filter_link(outlink);
 
     outlink->time_base = inlink->time_base;
-    outlink->frame_rate = inlink->frame_rate;
+    ol->frame_rate = il->frame_rate;
     outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
     outlink->w = inlink->w;
     outlink->h = inlink->h;
@@ -748,15 +743,15 @@ static const AVFilterPad signature_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_signature = {
-    .name          = "signature",
-    .description   = NULL_IF_CONFIG_SMALL("Calculate the MPEG-7 video signature"),
+const FFFilter ff_vf_signature = {
+    .p.name        = "signature",
+    .p.description = NULL_IF_CONFIG_SMALL("Calculate the MPEG-7 video signature"),
+    .p.priv_class  = &signature_class,
+    .p.inputs      = NULL,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_INPUTS,
     .priv_size     = sizeof(SignatureContext),
-    .priv_class    = &signature_class,
     .init          = init,
     .uninit        = uninit,
     FILTER_OUTPUTS(signature_outputs),
-    .inputs        = NULL,
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_DYNAMIC_INPUTS,
 };

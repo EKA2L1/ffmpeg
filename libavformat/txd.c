@@ -19,8 +19,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define TXD_FILE            0x16
@@ -74,8 +76,10 @@ next_chunk:
     case TXD_INFO:
         if (chunk_size > 100)
             break;
+        av_fallthrough;
     case TXD_EXTRA:
         avio_skip(s->pb, chunk_size);
+        av_fallthrough;
     case TXD_FILE:
     case TXD_TEXTURE:
         goto next_chunk;
@@ -92,9 +96,9 @@ next_chunk:
     return 0;
 }
 
-const AVInputFormat ff_txd_demuxer = {
-    .name        = "txd",
-    .long_name   = NULL_IF_CONFIG_SMALL("Renderware TeXture Dictionary"),
+const FFInputFormat ff_txd_demuxer = {
+    .p.name      = "txd",
+    .p.long_name = NULL_IF_CONFIG_SMALL("Renderware TeXture Dictionary"),
     .read_probe  = txd_probe,
     .read_header = txd_read_header,
     .read_packet = txd_read_packet,

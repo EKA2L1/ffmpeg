@@ -25,9 +25,10 @@
  */
 
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
 #include "golomb.h"
-#include "internal.h"
 #include "mathops.h"
 
 enum LOCO_MODE {
@@ -91,10 +92,15 @@ static inline int loco_get_rice(RICEContext *r)
     if (get_bits_left(&r->gb) < 1)
         return INT_MIN;
     v = get_ur_golomb_jpegls(&r->gb, loco_get_rice_param(r), INT_MAX, 0);
+    if (v == -1)
+        return INT_MIN;
     loco_update_rice_param(r, (v + 1) >> 1);
     if (!v) {
         if (r->save >= 0) {
-            r->run = get_ur_golomb_jpegls(&r->gb, 2, INT_MAX, 0);
+            int run = get_ur_golomb_jpegls(&r->gb, 2, INT_MAX, 0);
+            if (run == -1)
+                return INT_MIN;
+            r->run = run;
             if (r->run > 1)
                 r->save += r->run + 1;
             else
@@ -151,6 +157,8 @@ static int loco_decode_plane(LOCOContext *l, uint8_t *data, int width, int heigh
 
     /* restore top left pixel */
     val     = loco_get_rice(&rc);
+    if (val == INT_MIN)
+        return AVERROR_INVALIDDATA;
     data[0] = 128 + val;
     /* restore top line */
     for (i = 1; i < width; i++) {
@@ -195,19 +203,16 @@ static void rotate_faulty_loco(uint8_t *data, int width, int height, int stride)
     }
 }
 
-static int decode_frame(AVCodecContext *avctx,
-                        void *data, int *got_frame,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *p,
+                        int *got_frame, AVPacket *avpkt)
 {
     LOCOContext * const l = avctx->priv_data;
     const uint8_t *buf    = avpkt->data;
     int buf_size          = avpkt->size;
-    AVFrame * const p     = data;
     int decoded, ret;
 
     if ((ret = ff_get_buffer(avctx, p, 0)) < 0)
         return ret;
-    p->key_frame = 1;
 
 #define ADVANCE_BY_DECODED do { \
     if (decoded < 0 || decoded >= buf_size) goto buf_too_small; \
@@ -337,14 +342,13 @@ static av_cold int decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-const AVCodec ff_loco_decoder = {
-    .name           = "loco",
-    .long_name      = NULL_IF_CONFIG_SMALL("LOCO"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_LOCO,
+const FFCodec ff_loco_decoder = {
+    .p.name         = "loco",
+    CODEC_LONG_NAME("LOCO"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_LOCO,
     .priv_data_size = sizeof(LOCOContext),
     .init           = decode_init,
-    .decode         = decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

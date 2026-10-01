@@ -24,9 +24,10 @@
  * MTV demuxer.
  */
 
-#include "libavutil/bswap.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define MTV_ASUBCHUNK_DATA_SIZE 500
@@ -104,6 +105,7 @@ static int mtv_read_header(AVFormatContext *s)
     AVIOContext   *pb  = s->pb;
     AVStream        *st;
     unsigned int    audio_subsegments;
+    int64_t ret64;
 
     avio_skip(pb, 3);
     mtv->file_size         = avio_rl32(pb);
@@ -189,8 +191,8 @@ static int mtv_read_header(AVFormatContext *s)
 
     // Jump over header
 
-    if(avio_seek(pb, MTV_HEADER_SIZE, SEEK_SET) != MTV_HEADER_SIZE)
-        return AVERROR(EIO);
+    if ((ret64 = avio_seek(pb, MTV_HEADER_SIZE, SEEK_SET)) < 0)
+        return (int)ret64;
 
     return 0;
 
@@ -225,9 +227,9 @@ static int mtv_read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-const AVInputFormat ff_mtv_demuxer = {
-    .name           = "mtv",
-    .long_name      = NULL_IF_CONFIG_SMALL("MTV"),
+const FFInputFormat ff_mtv_demuxer = {
+    .p.name         = "mtv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("MTV"),
     .priv_data_size = sizeof(MTVDemuxContext),
     .read_probe     = mtv_probe,
     .read_header    = mtv_read_header,

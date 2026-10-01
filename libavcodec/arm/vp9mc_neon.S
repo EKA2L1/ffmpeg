@@ -193,16 +193,16 @@ endfunc
 @ Helper macros for vmul/vmla with a constant from either d0 or d1 depending on index
 .macro vmul_lane dst, src, idx
 .if \idx < 4
-       vmul.s16         \dst, \src, d0[\idx]
+        vmul.s16        \dst, \src, d0[\idx]
 .else
-       vmul.s16         \dst, \src, d1[\idx - 4]
+        vmul.s16        \dst, \src, d1[\idx - 4]
 .endif
 .endm
 .macro vmla_lane dst, src, idx
 .if \idx < 4
-       vmla.s16         \dst, \src, d0[\idx]
+        vmla.s16        \dst, \src, d0[\idx]
 .else
-       vmla.s16         \dst, \src, d1[\idx - 4]
+        vmla.s16        \dst, \src, d1[\idx - 4]
 .endif
 .endm
 
@@ -279,10 +279,12 @@ function \type\()_8tap_\size\()h_\idx1\idx2
         sub             r1,  r1,  r5
 .endif
         @ size >= 16 loads two qwords and increments r2,
-        @ for size 4/8 it's enough with one qword and no
-        @ postincrement
+        @ size 4 loads 1 d word, increments r2 and loads 1 32-bit lane
+        @ for size 8 it's enough with one qword and no postincrement
 .if \size >= 16
         sub             r3,  r3,  r5
+        sub             r3,  r3,  #8
+.elseif \size == 4
         sub             r3,  r3,  #8
 .endif
         @ Load the filter vector
@@ -295,9 +297,14 @@ function \type\()_8tap_\size\()h_\idx1\idx2
 .if \size >= 16
         vld1.8          {d18, d19, d20}, [r2]!
         vld1.8          {d24, d25, d26}, [r7]!
-.else
+.elseif \size == 8
         vld1.8          {q9},  [r2]
         vld1.8          {q12}, [r7]
+.else @ size == 4
+        vld1.8          {d18}, [r2]!
+        vld1.8          {d24}, [r7]!
+        vld1.32         {d19[0]}, [r2]
+        vld1.32         {d25[0]}, [r7]
 .endif
         vmovl.u8        q8,  d18
         vmovl.u8        q9,  d19

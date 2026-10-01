@@ -18,16 +18,20 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes_internal.h"
 #include "libavutil/avstring.h"
 #include "libavutil/avassert.h"
 #include "libavutil/bprint.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/timestamp.h"
+#include "libavcodec/codec_desc.h"
 #include "libavcodec/bsf.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "url.h"
 
@@ -69,6 +73,7 @@ typedef struct {
     ConcatMatchMode stream_match_mode;
     unsigned auto_convert;
     int segment_time_metadata;
+    int recursion_depth;
 } ConcatContext;
 
 static int concat_probe(const AVProbeData *probe)
@@ -179,8 +184,9 @@ static int copy_stream_props(AVStream *st, AVStream *source_st)
             if (ret < 0)
                 return ret;
         }
-        memcpy(st->codecpar->extradata, source_st->codecpar->extradata,
-               source_st->codecpar->extradata_size);
+        if (source_st->codecpar->extradata_size)
+            memcpy(st->codecpar->extradata, source_st->codecpar->extradata,
+                   source_st->codecpar->extradata_size);
         return 0;
     }
     if ((ret = avcodec_parameters_copy(st->codecpar, source_st->codecpar)) < 0)
@@ -191,7 +197,6 @@ static int copy_stream_props(AVStream *st, AVStream *source_st)
     avpriv_set_pts_info(st, 64, source_st->time_base.num, source_st->time_base.den);
 
     av_dict_copy(&st->metadata, source_st->metadata, 0);
-    ff_stream_side_data_copy(st, source_st);
     return 0;
 }
 
@@ -321,9 +326,9 @@ static int64_t get_best_effort_duration(ConcatFile *file, AVFormatContext *avf)
     if (file->user_duration != AV_NOPTS_VALUE)
         return file->user_duration;
     if (file->outpoint != AV_NOPTS_VALUE)
-        return file->outpoint - file->file_inpoint;
+        return av_sat_sub64(file->outpoint, file->file_inpoint);
     if (avf->duration > 0)
-        return avf->duration - (file->file_inpoint - file->file_start_time);
+        return av_sat_sub64(avf->duration, file->file_inpoint - file->file_start_time);
     if (file->next_dts != AV_NOPTS_VALUE)
         return file->next_dts - file->file_inpoint;
     return AV_NOPTS_VALUE;
@@ -353,6 +358,12 @@ static int open_file(AVFormatContext *avf, unsigned fileno)
     if (ret < 0)
         return ret;
 
+    ret = av_dict_set_int(&options, "recursion_depth", cat->recursion_depth - 1, 0);
+    if (ret < 0) {
+        av_dict_free(&options);
+        return ret;
+    }
+
     if ((ret = avformat_open_input(&cat->avf, file->url, NULL, &options)) < 0 ||
         (ret = avformat_find_stream_info(cat->avf, NULL)) < 0) {
         av_log(avf, AV_LOG_ERROR, "Impossible to open '%s'\n", file->url);
@@ -360,6 +371,7 @@ static int open_file(AVFormatContext *avf, unsigned fileno)
         avformat_close_input(&cat->avf);
         return ret;
     }
+    av_dict_set(&options, "recursion_depth", NULL, 0);
     if (options) {
         av_log(avf, AV_LOG_WARNING, "Unused options for '%s'.\n", file->url);
         /* TODO log unused options once we have a proper string API */
@@ -416,7 +428,7 @@ static int concat_read_close(AVFormatContext *avf)
 
 typedef struct ParseSyntax {
     const char *keyword;
-    char args[MAX_ARGS];
+    attribute_nonstring char args[MAX_ARGS];
     uint8_t flags;
 } ParseSyntax;
 
@@ -636,6 +648,17 @@ static int concat_parse_script(AVFormatContext *avf)
         }
     }
 
+    if (!file) {
+        ret = AVERROR_INVALIDDATA;
+        goto fail;
+    }
+
+    if (file->inpoint != AV_NOPTS_VALUE && file->outpoint != AV_NOPTS_VALUE) {
+        if (file->inpoint  > file->outpoint ||
+            file->outpoint - (uint64_t)file->inpoint > INT64_MAX)
+            ret = AVERROR_INVALIDDATA;
+    }
+
 fail:
     for (arg = 0; arg < MAX_ARGS; arg++)
         av_freep(&arg_str[arg]);
@@ -649,6 +672,11 @@ static int concat_read_header(AVFormatContext *avf)
     int64_t time = 0;
     unsigned i;
     int ret;
+
+    if (cat->recursion_depth <= 0) {
+        av_log(avf, AV_LOG_ERROR, "Too deep recursion\n");
+        return AVERROR_INVALIDDATA;
+    }
 
     ret = concat_parse_script(avf);
     if (ret < 0)
@@ -664,11 +692,15 @@ static int concat_read_header(AVFormatContext *avf)
         else
             time = cat->files[i].start_time;
         if (cat->files[i].user_duration == AV_NOPTS_VALUE) {
-            if (cat->files[i].inpoint == AV_NOPTS_VALUE || cat->files[i].outpoint == AV_NOPTS_VALUE)
+            if (cat->files[i].inpoint == AV_NOPTS_VALUE || cat->files[i].outpoint == AV_NOPTS_VALUE ||
+                cat->files[i].outpoint - (uint64_t)cat->files[i].inpoint != av_sat_sub64(cat->files[i].outpoint, cat->files[i].inpoint)
+            )
                 break;
             cat->files[i].user_duration = cat->files[i].outpoint - cat->files[i].inpoint;
         }
         cat->files[i].duration = cat->files[i].user_duration;
+        if (time + (uint64_t)cat->files[i].user_duration > INT64_MAX)
+            return AVERROR_INVALIDDATA;
         time += cat->files[i].user_duration;
     }
     if (i == cat->nb_files) {
@@ -816,16 +848,6 @@ static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
     return 0;
 }
 
-static void rescale_interval(AVRational tb_in, AVRational tb_out,
-                             int64_t *min_ts, int64_t *ts, int64_t *max_ts)
-{
-    *ts     = av_rescale_q    (*    ts, tb_in, tb_out);
-    *min_ts = av_rescale_q_rnd(*min_ts, tb_in, tb_out,
-                               AV_ROUND_UP   | AV_ROUND_PASS_MINMAX);
-    *max_ts = av_rescale_q_rnd(*max_ts, tb_in, tb_out,
-                               AV_ROUND_DOWN | AV_ROUND_PASS_MINMAX);
-}
-
 static int try_seek(AVFormatContext *avf, int stream,
                     int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
 {
@@ -838,8 +860,8 @@ static int try_seek(AVFormatContext *avf, int stream,
     if (stream >= 0) {
         if (stream >= cat->avf->nb_streams)
             return AVERROR(EIO);
-        rescale_interval(AV_TIME_BASE_Q, cat->avf->streams[stream]->time_base,
-                         &min_ts, &ts, &max_ts);
+        ff_rescale_interval(AV_TIME_BASE_Q, cat->avf->streams[stream]->time_base,
+                            &min_ts, &ts, &max_ts);
     }
     return avformat_seek_file(cat->avf, stream, min_ts, ts, max_ts, flags);
 }
@@ -853,8 +875,8 @@ static int real_seek(AVFormatContext *avf, int stream,
     if (stream >= 0) {
         if (stream >= avf->nb_streams)
             return AVERROR(EINVAL);
-        rescale_interval(avf->streams[stream]->time_base, AV_TIME_BASE_Q,
-                         &min_ts, &ts, &max_ts);
+        ff_rescale_interval(avf->streams[stream]->time_base, AV_TIME_BASE_Q,
+                            &min_ts, &ts, &max_ts);
     }
 
     left  = 0;
@@ -931,6 +953,8 @@ static const AVOption options[] = {
       OFFSET(auto_convert), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, DEC },
     { "segment_time_metadata", "output file segment start time and duration as packet metadata",
       OFFSET(segment_time_metadata), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, DEC },
+    { "recursion_depth", "max recursion depth",
+      OFFSET(recursion_depth), AV_OPT_TYPE_INT, {.i64 = 10}, 0, INT_MAX, DEC },
     { NULL }
 };
 
@@ -942,15 +966,15 @@ static const AVClass concat_class = {
 };
 
 
-const AVInputFormat ff_concat_demuxer = {
-    .name           = "concat",
-    .long_name      = NULL_IF_CONFIG_SMALL("Virtual concatenation script"),
+const FFInputFormat ff_concat_demuxer = {
+    .p.name         = "concat",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Virtual concatenation script"),
+    .p.priv_class   = &concat_class,
     .priv_data_size = sizeof(ConcatContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = concat_probe,
     .read_header    = concat_read_header,
     .read_packet    = concat_read_packet,
     .read_close     = concat_read_close,
     .read_seek2     = concat_seek,
-    .priv_class     = &concat_class,
 };

@@ -23,7 +23,7 @@
 #include "libavutil/samplefmt.h"
 #include "avfilter.h"
 #include "audio.h"
-#include "internal.h"
+#include "filters.h"
 
 typedef struct DCShiftContext {
     const AVClass *class;
@@ -73,7 +73,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     if (s->limitergain > 0) {
-        for (i = 0; i < inlink->channels; i++) {
+        for (i = 0; i < inlink->ch_layout.nb_channels; i++) {
             const int32_t *src = (int32_t *)in->extended_data[i];
             int32_t *dst = (int32_t *)out->extended_data[i];
 
@@ -98,7 +98,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             }
         }
     } else {
-        for (i = 0; i < inlink->channels; i++) {
+        for (i = 0; i < inlink->ch_layout.nb_channels; i++) {
             const int32_t *src = (int32_t *)in->extended_data[i];
             int32_t *dst = (int32_t *)out->extended_data[i];
 
@@ -122,21 +122,14 @@ static const AVFilterPad dcshift_inputs[] = {
     },
 };
 
-static const AVFilterPad dcshift_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
-const AVFilter ff_af_dcshift = {
-    .name           = "dcshift",
-    .description    = NULL_IF_CONFIG_SMALL("Apply a DC shift to the audio."),
+const FFFilter ff_af_dcshift = {
+    .p.name         = "dcshift",
+    .p.description  = NULL_IF_CONFIG_SMALL("Apply a DC shift to the audio."),
+    .p.priv_class   = &dcshift_class,
+    .p.flags        = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size      = sizeof(DCShiftContext),
-    .priv_class     = &dcshift_class,
     .init           = init,
     FILTER_INPUTS(dcshift_inputs),
-    FILTER_OUTPUTS(dcshift_outputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
     FILTER_SINGLE_SAMPLEFMT(AV_SAMPLE_FMT_S32P),
-    .flags          = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
 };

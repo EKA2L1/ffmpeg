@@ -21,10 +21,10 @@
  */
 
 /**
- * @file
- * audio encoding with libavcodec API example.
- *
+ * @file libavcodec encoding audio API usage examples
  * @example encode_audio.c
+ *
+ * Generate a synthetic audio signal and encode it to an output MP2 file.
  */
 
 #include <stdint.h>
@@ -41,7 +41,17 @@
 /* check that a given sample format is supported by the encoder */
 static int check_sample_fmt(const AVCodec *codec, enum AVSampleFormat sample_fmt)
 {
-    const enum AVSampleFormat *p = codec->sample_fmts;
+    const void *out_config;
+    int ret = avcodec_get_supported_config(NULL, codec, AV_CODEC_CONFIG_SAMPLE_FORMAT,
+                                           0, &out_config, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Error getting supported sample formats\n");
+        exit(1);
+    }
+    const enum AVSampleFormat *p = out_config;
+
+    if (!p)
+        return 1;
 
     while (*p != AV_SAMPLE_FMT_NONE) {
         if (*p == sample_fmt)
@@ -54,13 +64,19 @@ static int check_sample_fmt(const AVCodec *codec, enum AVSampleFormat sample_fmt
 /* just pick the highest supported samplerate */
 static int select_sample_rate(const AVCodec *codec)
 {
-    const int *p;
+    const void *out_config;
+    int ret = avcodec_get_supported_config(NULL, codec, AV_CODEC_CONFIG_SAMPLE_RATE,
+                                           0, &out_config, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Error getting supported sample rates\n");
+        exit(1);
+    }
+    const int *p = out_config;
     int best_samplerate = 0;
 
-    if (!codec->supported_samplerates)
+    if (!p)
         return 44100;
 
-    p = codec->supported_samplerates;
     while (*p) {
         if (!best_samplerate || abs(44100 - *p) < abs(44100 - best_samplerate))
             best_samplerate = *p;
@@ -70,26 +86,31 @@ static int select_sample_rate(const AVCodec *codec)
 }
 
 /* select layout with the highest channel count */
-static int select_channel_layout(const AVCodec *codec)
+static int select_channel_layout(const AVCodec *codec, AVChannelLayout *dst)
 {
-    const uint64_t *p;
-    uint64_t best_ch_layout = 0;
+    const void *out_config;
+    int ret = avcodec_get_supported_config(NULL, codec, AV_CODEC_CONFIG_CHANNEL_LAYOUT,
+                                           0, &out_config, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Error getting supported channel layouts\n");
+        exit(1);
+    }
+    const AVChannelLayout *p = out_config, *best_ch_layout;
     int best_nb_channels   = 0;
 
-    if (!codec->channel_layouts)
-        return AV_CH_LAYOUT_STEREO;
+    if (!p)
+        return av_channel_layout_copy(dst, &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO);
 
-    p = codec->channel_layouts;
-    while (*p) {
-        int nb_channels = av_get_channel_layout_nb_channels(*p);
+    while (p->nb_channels) {
+        int nb_channels = p->nb_channels;
 
         if (nb_channels > best_nb_channels) {
-            best_ch_layout    = *p;
+            best_ch_layout   = p;
             best_nb_channels = nb_channels;
         }
         p++;
     }
-    return best_ch_layout;
+    return av_channel_layout_copy(dst, best_ch_layout);
 }
 
 static void encode(AVCodecContext *ctx, AVFrame *frame, AVPacket *pkt,
@@ -164,8 +185,9 @@ int main(int argc, char **argv)
 
     /* select other audio parameters supported by the encoder */
     c->sample_rate    = select_sample_rate(codec);
-    c->channel_layout = select_channel_layout(codec);
-    c->channels       = av_get_channel_layout_nb_channels(c->channel_layout);
+    ret = select_channel_layout(codec, &c->ch_layout);
+    if (ret < 0)
+        exit(1);
 
     /* open it */
     if (avcodec_open2(c, codec, NULL) < 0) {
@@ -195,7 +217,9 @@ int main(int argc, char **argv)
 
     frame->nb_samples     = c->frame_size;
     frame->format         = c->sample_fmt;
-    frame->channel_layout = c->channel_layout;
+    ret = av_channel_layout_copy(&frame->ch_layout, &c->ch_layout);
+    if (ret < 0)
+        exit(1);
 
     /* allocate the data buffers */
     ret = av_frame_get_buffer(frame, 0);
@@ -216,10 +240,10 @@ int main(int argc, char **argv)
         samples = (uint16_t*)frame->data[0];
 
         for (j = 0; j < c->frame_size; j++) {
-            samples[2*j] = (int)(sin(t) * 10000);
+            samples[c->ch_layout.nb_channels*j] = (int)(sin(t) * 10000);
 
-            for (k = 1; k < c->channels; k++)
-                samples[2*j + k] = samples[2*j];
+            for (k = 1; k < c->ch_layout.nb_channels; k++)
+                samples[c->ch_layout.nb_channels*j + k] = samples[c->ch_layout.nb_channels*j];
             t += tincr;
         }
         encode(c, frame, pkt, f);

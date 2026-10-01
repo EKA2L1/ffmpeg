@@ -52,6 +52,7 @@
 #include "libavformat/os_support.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 
 static int usage(const char *argv0, int ret)
 {
@@ -148,9 +149,7 @@ static int write_fragment(const char *filename, AVIOContext *in)
     int ret;
 
     if ((ret = avio_open2(&out, filename, AVIO_FLAG_WRITE, NULL, NULL)) < 0) {
-        char errbuf[100];
-        av_strerror(ret, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Unable to open %s: %s\n", filename, errbuf);
+        fprintf(stderr, "Unable to open %s: %s\n", filename, av_err2str(ret));
         return ret;
     }
     ret = copy_tag(in, out, MKBETAG('m', 'o', 'o', 'f'));
@@ -499,20 +498,18 @@ static int handle_file(struct Tracks *tracks, const char *file, int split,
 {
     AVFormatContext *ctx = NULL;
     int err = 0, i, orig_tracks = tracks->nb_tracks;
-    char errbuf[50], *ptr;
+    char *ptr;
     struct Track *track;
 
     err = avformat_open_input(&ctx, file, NULL, NULL);
     if (err < 0) {
-        av_strerror(err, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Unable to open %s: %s\n", file, errbuf);
+        fprintf(stderr, "Unable to open %s: %s\n", file, av_err2str(err));
         return 1;
     }
 
     err = avformat_find_stream_info(ctx, NULL);
     if (err < 0) {
-        av_strerror(err, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Unable to identify %s: %s\n", file, errbuf);
+        fprintf(stderr, "Unable to identify %s: %s\n", file, av_err2str(err));
         goto fail;
     }
 
@@ -574,7 +571,7 @@ static int handle_file(struct Tracks *tracks, const char *file, int split,
             if (tracks->audio_track < 0)
                 tracks->audio_track = tracks->nb_tracks;
             tracks->nb_audio_tracks++;
-            track->channels    = st->codecpar->channels;
+            track->channels    = st->codecpar->ch_layout.nb_channels;
             track->sample_rate = st->codecpar->sample_rate;
             if (st->codecpar->codec_id == AV_CODEC_ID_AAC) {
                 track->fourcc    = "AACL";

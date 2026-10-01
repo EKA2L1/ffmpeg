@@ -24,6 +24,7 @@
 #include "libavutil/parseutils.h"
 #include "libavutil/opt.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define CDXL_HEADER_SIZE 32
@@ -178,8 +179,7 @@ static int cdxl_read_packet(AVFormatContext *s, AVPacket *pkt)
             st->codecpar->codec_type    = AVMEDIA_TYPE_AUDIO;
             st->codecpar->codec_tag     = 0;
             st->codecpar->codec_id      = AV_CODEC_ID_PCM_S8_PLANAR;
-            st->codecpar->channels      = channels;
-            st->codecpar->channel_layout = channels == 2 ? AV_CH_LAYOUT_STEREO : AV_CH_LAYOUT_MONO;
+            av_channel_layout_default(&st->codecpar->ch_layout, channels);
             st->codecpar->sample_rate= cdxl->srate;
             st->start_time           = 0;
             cdxl->audio_stream_index = st->index;
@@ -258,15 +258,15 @@ static const AVClass cdxl_demuxer_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVInputFormat ff_cdxl_demuxer = {
-    .name           = "cdxl",
-    .long_name      = NULL_IF_CONFIG_SMALL("Commodore CDXL video"),
+const FFInputFormat ff_cdxl_demuxer = {
+    .p.name         = "cdxl",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Commodore CDXL video"),
+    .p.priv_class   = &cdxl_demuxer_class,
+    .p.extensions   = "cdxl,xl",
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .priv_data_size = sizeof(CDXLDemuxContext),
-    .priv_class     = &cdxl_demuxer_class,
     .read_probe     = cdxl_read_probe,
     .read_header    = cdxl_read_header,
     .read_packet    = cdxl_read_packet,
     .read_seek      = read_seek,
-    .extensions     = "cdxl,xl",
-    .flags          = AVFMT_GENERIC_INDEX,
 };

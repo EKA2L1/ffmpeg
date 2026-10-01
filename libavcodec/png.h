@@ -52,18 +52,12 @@
 /* Mask to determine which y pixels are valid in a pass */
 extern const uint8_t ff_png_pass_ymask[NB_PASSES];
 
-void *ff_png_zalloc(void *opaque, unsigned int items, unsigned int size);
-
-void ff_png_zfree(void *opaque, void *ptr);
-
 int ff_png_get_nb_channels(int color_type);
 
 /* compute the row size of an interleaved pass */
 int ff_png_pass_row_size(int pass, int bits_per_pixel, int width);
 
-void ff_add_png_paeth_prediction(uint8_t *dst, uint8_t *src, uint8_t *top, int w, int bpp);
-
 void ff_png_filter_row(PNGDSPContext *dsp, uint8_t *dst, int filter_type,
-                       uint8_t *src, uint8_t *last, int size, int bpp);
+                       const uint8_t *src, const uint8_t *last, int size, int bpp);
 
 #endif /* AVCODEC_PNG_H */

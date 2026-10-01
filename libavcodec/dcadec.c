@@ -18,10 +18,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/thread.h"
 
+#include "codec_internal.h"
 #include "dcadec.h"
 #include "dcahuff.h"
 #include "dca_syncwords.h"
@@ -39,25 +41,37 @@ int ff_dca_set_channel_layout(AVCodecContext *avctx, int *ch_remap, int dca_mask
 
     static const uint8_t dca2wav_wide[28] = {
          2,  0, 1, 4,  5,  3,  8,  4,  5,  9, 10, 6, 7, 12,
-        13, 14, 3, 9, 10, 11, 12, 14, 16, 15, 17, 8, 4,  5,
+        13, 14, 3, 6,  7, 11, 12, 14, 16, 15, 17, 8, 4,  5,
     };
 
-    int dca_ch, wav_ch, nchannels = 0;
+    DCAContext *s = avctx->priv_data;
 
-    if (avctx->request_channel_layout & AV_CH_LAYOUT_NATIVE) {
-        for (dca_ch = 0; dca_ch < DCA_SPEAKER_COUNT; dca_ch++)
+    int dca_ch, wav_ch, nchannels = 0;
+    const uint8_t *dca2wav;
+
+    if (dca_mask == DCA_SPEAKER_LAYOUT_7POINT0_WIDE ||
+        dca_mask == DCA_SPEAKER_LAYOUT_7POINT1_WIDE)
+        dca2wav = dca2wav_wide;
+    else
+        dca2wav = dca2wav_norm;
+
+    av_channel_layout_uninit(&avctx->ch_layout);
+    if (s->output_channel_order == CHANNEL_ORDER_CODED) {
+        int ret;
+        for (dca_ch = 0; dca_ch < DCA_SPEAKER_RSV1; dca_ch++)
             if (dca_mask & (1U << dca_ch))
                 ch_remap[nchannels++] = dca_ch;
-        avctx->channel_layout = dca_mask;
+        ret = av_channel_layout_custom_init(&avctx->ch_layout, nchannels);
+        if (ret < 0)
+            return ret;
+
+        nchannels = 0;
+        for (dca_ch = 0; dca_ch < DCA_SPEAKER_RSV1; dca_ch++)
+            if (dca_mask & (1U << dca_ch))
+                avctx->ch_layout.u.map[nchannels++].id = dca2wav[dca_ch];
     } else {
         int wav_mask = 0;
         int wav_map[18];
-        const uint8_t *dca2wav;
-        if (dca_mask == DCA_SPEAKER_LAYOUT_7POINT0_WIDE ||
-            dca_mask == DCA_SPEAKER_LAYOUT_7POINT1_WIDE)
-            dca2wav = dca2wav_wide;
-        else
-            dca2wav = dca2wav_norm;
         for (dca_ch = 0; dca_ch < 28; dca_ch++) {
             if (dca_mask & (1 << dca_ch)) {
                 wav_ch = dca2wav[dca_ch];
@@ -70,10 +84,10 @@ int ff_dca_set_channel_layout(AVCodecContext *avctx, int *ch_remap, int dca_mask
         for (wav_ch = 0; wav_ch < 18; wav_ch++)
             if (wav_mask & (1 << wav_ch))
                 ch_remap[nchannels++] = wav_map[wav_ch];
-        avctx->channel_layout = wav_mask;
+
+        av_channel_layout_from_mask(&avctx->ch_layout, wav_mask);
     }
 
-    avctx->channels = nchannels;
     return nchannels;
 }
 
@@ -142,12 +156,11 @@ void ff_dca_downmix_to_stereo_float(AVFloatDSPContext *fdsp, float **samples,
     }
 }
 
-static int dcadec_decode_frame(AVCodecContext *avctx, void *data,
+static int dcadec_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                                int *got_frame_ptr, AVPacket *avpkt)
 {
     DCAContext *s = avctx->priv_data;
-    AVFrame *frame = data;
-    uint8_t *input = avpkt->data;
+    const uint8_t *input = avpkt->data;
     int input_size = avpkt->size;
     int i, ret, prev_packet = s->packet;
     uint32_t mrk;
@@ -213,11 +226,10 @@ static int dcadec_decode_frame(AVCodecContext *avctx, void *data,
         if (asset && (asset->extension_mask & DCA_EXSS_XLL)) {
             if ((ret = ff_dca_xll_parse(&s->xll, input, asset)) < 0) {
                 // Conceal XLL synchronization error
-                if (ret == AVERROR(EAGAIN)
-                    && (prev_packet & DCA_PACKET_XLL)
-                    && (s->packet & DCA_PACKET_CORE))
-                    s->packet |= DCA_PACKET_XLL | DCA_PACKET_RECOVERY;
-                else if (ret == AVERROR(ENOMEM) || (avctx->err_recognition & AV_EF_EXPLODE))
+                if (ret == AVERROR(EAGAIN)) {
+                    if ((prev_packet & DCA_PACKET_XLL) && (s->packet & DCA_PACKET_CORE))
+                        s->packet |= DCA_PACKET_XLL | DCA_PACKET_RECOVERY;
+                } else if (ret == AVERROR(ENOMEM) || (avctx->err_recognition & AV_EF_EXPLODE))
                     return ret;
             } else {
                 s->packet |= DCA_PACKET_XLL;
@@ -349,23 +361,23 @@ static av_cold int dcadec_init(AVCodecContext *avctx)
 
     s->crctab = av_crc_get_table(AV_CRC_16_CCITT);
 
-    switch (avctx->request_channel_layout & ~AV_CH_LAYOUT_NATIVE) {
-    case 0:
-        s->request_channel_layout = 0;
-        break;
-    case AV_CH_LAYOUT_STEREO:
-    case AV_CH_LAYOUT_STEREO_DOWNMIX:
-        s->request_channel_layout = DCA_SPEAKER_LAYOUT_STEREO;
-        break;
-    case AV_CH_LAYOUT_5POINT0:
-        s->request_channel_layout = DCA_SPEAKER_LAYOUT_5POINT0;
-        break;
-    case AV_CH_LAYOUT_5POINT1:
-        s->request_channel_layout = DCA_SPEAKER_LAYOUT_5POINT1;
-        break;
-    default:
-        av_log(avctx, AV_LOG_WARNING, "Invalid request_channel_layout\n");
-        break;
+    if (s->downmix_layout.nb_channels) {
+        if (!av_channel_layout_compare(&s->downmix_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO) ||
+            !av_channel_layout_compare(&s->downmix_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO_DOWNMIX)) {
+            s->request_channel_layout = DCA_SPEAKER_LAYOUT_STEREO;
+            av_channel_layout_uninit(&avctx->ch_layout);
+            avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
+        } else if (!av_channel_layout_compare(&s->downmix_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT0)) {
+            s->request_channel_layout = DCA_SPEAKER_LAYOUT_5POINT0;
+            av_channel_layout_uninit(&avctx->ch_layout);
+            avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT0;
+        } else if (!av_channel_layout_compare(&s->downmix_layout, &(AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1)) {
+            s->request_channel_layout = DCA_SPEAKER_LAYOUT_5POINT1;
+            av_channel_layout_uninit(&avctx->ch_layout);
+            avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_5POINT1;
+        }
+        else
+            av_log(avctx, AV_LOG_WARNING, "Invalid downmix layout\n");
     }
 
     ff_thread_once(&init_static_once, dcadec_init_static);
@@ -378,6 +390,18 @@ static av_cold int dcadec_init(AVCodecContext *avctx)
 
 static const AVOption dcadec_options[] = {
     { "core_only", "Decode core only without extensions", OFFSET(core_only), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, PARAM },
+
+    { "channel_order", "Order in which the channels are to be exported",
+        OFFSET(output_channel_order), AV_OPT_TYPE_INT,
+        { .i64 = CHANNEL_ORDER_DEFAULT }, 0, 1, PARAM, .unit = "channel_order" },
+      { "default", "normal libavcodec channel order", 0, AV_OPT_TYPE_CONST,
+        { .i64 = CHANNEL_ORDER_DEFAULT }, .flags = PARAM, .unit = "channel_order" },
+      { "coded",    "order in which the channels are coded in the bitstream",
+        0, AV_OPT_TYPE_CONST, { .i64 = CHANNEL_ORDER_CODED }, .flags = PARAM, .unit = "channel_order" },
+
+    { "downmix", "Request a specific channel layout from the decoder", OFFSET(downmix_layout),
+        AV_OPT_TYPE_CHLAYOUT, {.str = NULL}, .flags = PARAM },
+
     { NULL }
 };
 
@@ -389,20 +413,18 @@ static const AVClass dcadec_class = {
     .category   = AV_CLASS_CATEGORY_DECODER,
 };
 
-const AVCodec ff_dca_decoder = {
-    .name           = "dca",
-    .long_name      = NULL_IF_CONFIG_SMALL("DCA (DTS Coherent Acoustics)"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_DTS,
+const FFCodec ff_dca_decoder = {
+    .p.name         = "dca",
+    CODEC_LONG_NAME("DCA (DTS Coherent Acoustics)"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_DTS,
     .priv_data_size = sizeof(DCAContext),
     .init           = dcadec_init,
-    .decode         = dcadec_decode_frame,
+    FF_CODEC_DECODE_CB(dcadec_decode_frame),
     .close          = dcadec_close,
     .flush          = dcadec_flush,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
-    .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_S32P,
-                                                      AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_NONE },
-    .priv_class     = &dcadec_class,
-    .profiles       = NULL_IF_CONFIG_SMALL(ff_dca_profiles),
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
+    .p.priv_class   = &dcadec_class,
+    .p.profiles     = NULL_IF_CONFIG_SMALL(ff_dca_profiles),
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

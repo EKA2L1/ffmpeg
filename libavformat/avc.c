@@ -20,90 +20,14 @@
  */
 
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavcodec/h264.h"
 #include "libavcodec/get_bits.h"
-#include "avformat.h"
+#include "libavcodec/golomb.h"
 #include "avio.h"
 #include "avc.h"
 #include "avio_internal.h"
-
-static const uint8_t *avc_find_startcode_internal(const uint8_t *p, const uint8_t *end)
-{
-    const uint8_t *a = p + 4 - ((intptr_t)p & 3);
-
-    for (end -= 3; p < a && p < end; p++) {
-        if (p[0] == 0 && p[1] == 0 && p[2] == 1)
-            return p;
-    }
-
-    for (end -= 3; p < end; p += 4) {
-        uint32_t x = *(const uint32_t*)p;
-//      if ((x - 0x01000100) & (~x) & 0x80008000) // little endian
-//      if ((x - 0x00010001) & (~x) & 0x00800080) // big endian
-        if ((x - 0x01010101) & (~x) & 0x80808080) { // generic
-            if (p[1] == 0) {
-                if (p[0] == 0 && p[2] == 1)
-                    return p;
-                if (p[2] == 0 && p[3] == 1)
-                    return p+1;
-            }
-            if (p[3] == 0) {
-                if (p[2] == 0 && p[4] == 1)
-                    return p+2;
-                if (p[4] == 0 && p[5] == 1)
-                    return p+3;
-            }
-        }
-    }
-
-    for (end += 3; p < end; p++) {
-        if (p[0] == 0 && p[1] == 0 && p[2] == 1)
-            return p;
-    }
-
-    return end + 3;
-}
-
-const uint8_t *ff_avc_find_startcode(const uint8_t *p, const uint8_t *end){
-    const uint8_t *out = avc_find_startcode_internal(p, end);
-    if(p<out && out<end && !out[-1]) out--;
-    return out;
-}
-
-int ff_avc_parse_nal_units(AVIOContext *pb, const uint8_t *buf_in, int size)
-{
-    const uint8_t *p = buf_in;
-    const uint8_t *end = p + size;
-    const uint8_t *nal_start, *nal_end;
-
-    size = 0;
-    nal_start = ff_avc_find_startcode(p, end);
-    for (;;) {
-        while (nal_start < end && !*(nal_start++));
-        if (nal_start == end)
-            break;
-
-        nal_end = ff_avc_find_startcode(nal_start, end);
-        avio_wb32(pb, nal_end - nal_start);
-        avio_write(pb, nal_start, nal_end - nal_start);
-        size += 4 + nal_end - nal_start;
-        nal_start = nal_end;
-    }
-    return size;
-}
-
-int ff_avc_parse_nal_units_buf(const uint8_t *buf_in, uint8_t **buf, int *size)
-{
-    AVIOContext *pb;
-    int ret = avio_open_dyn_buf(&pb);
-    if(ret < 0)
-        return ret;
-
-    ff_avc_parse_nal_units(pb, buf_in, *size);
-
-    *size = avio_close_dyn_buf(pb, buf);
-    return 0;
-}
+#include "nal.h"
 
 int ff_isom_write_avcc(AVIOContext *pb, const uint8_t *data, int len)
 {
@@ -123,7 +47,7 @@ int ff_isom_write_avcc(AVIOContext *pb, const uint8_t *data, int len)
         return 0;
     }
 
-    ret = ff_avc_parse_nal_units_buf(data, &buf, &len);
+    ret = ff_nal_parse_units_buf(data, &buf, &len);
     if (ret < 0)
         return ret;
     start = buf;
@@ -249,55 +173,6 @@ int ff_avc_write_annexb_extradata(const uint8_t *in, uint8_t **buf, int *size)
     return 0;
 }
 
-const uint8_t *ff_avc_mp4_find_startcode(const uint8_t *start,
-                                         const uint8_t *end,
-                                         int nal_length_size)
-{
-    unsigned int res = 0;
-
-    if (end - start < nal_length_size)
-        return NULL;
-    while (nal_length_size--)
-        res = (res << 8) | *start++;
-
-    if (res > end - start)
-        return NULL;
-
-    return start + res;
-}
-
-uint8_t *ff_nal_unit_extract_rbsp(const uint8_t *src, uint32_t src_len,
-                                  uint32_t *dst_len, int header_len)
-{
-    uint8_t *dst;
-    uint32_t i, len;
-
-    dst = av_malloc(src_len + AV_INPUT_BUFFER_PADDING_SIZE);
-    if (!dst)
-        return NULL;
-
-    /* NAL unit header */
-    i = len = 0;
-    while (i < header_len && i < src_len)
-        dst[len++] = src[i++];
-
-    while (i + 2 < src_len)
-        if (!src[i] && !src[i + 1] && src[i + 2] == 3) {
-            dst[len++] = src[i++];
-            dst[len++] = src[i++];
-            i++; // remove emulation_prevention_three_byte
-        } else
-            dst[len++] = src[i++];
-
-    while (i < src_len)
-        dst[len++] = src[i++];
-
-    memset(dst + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-
-    *dst_len = len;
-    return dst;
-}
-
 static const AVRational avc_sample_aspect_ratio[17] = {
     {   0,  1 },
     {   1,  1 },
@@ -317,19 +192,6 @@ static const AVRational avc_sample_aspect_ratio[17] = {
     {   3,  2 },
     {   2,  1 },
 };
-
-static inline int get_ue_golomb(GetBitContext *gb) {
-    int i;
-    for (i = 0; i < 32 && !get_bits1(gb); i++)
-        ;
-    return get_bitsz(gb, i) + (1 << i) - 1;
-}
-
-static inline int get_se_golomb(GetBitContext *gb) {
-    int v = get_ue_golomb(gb) + 1;
-    int sign = -(v & 1);
-    return ((v >> 1) ^ sign) - sign;
-}
 
 int ff_avc_decode_sps(H264SPS *sps, const uint8_t *buf, int buf_size)
 {
@@ -359,19 +221,19 @@ int ff_avc_decode_sps(H264SPS *sps, const uint8_t *buf, int buf_size)
     sps->constraint_set_flags |= get_bits1(&gb) << 5; // constraint_set5_flag
     skip_bits(&gb, 2); // reserved_zero_2bits
     sps->level_idc = get_bits(&gb, 8);
-    sps->id = get_ue_golomb(&gb);
+    sps->id = get_ue_golomb_long(&gb);
 
     if (sps->profile_idc == 100 || sps->profile_idc == 110 ||
         sps->profile_idc == 122 || sps->profile_idc == 244 || sps->profile_idc ==  44 ||
         sps->profile_idc ==  83 || sps->profile_idc ==  86 || sps->profile_idc == 118 ||
         sps->profile_idc == 128 || sps->profile_idc == 138 || sps->profile_idc == 139 ||
         sps->profile_idc == 134) {
-        sps->chroma_format_idc = get_ue_golomb(&gb); // chroma_format_idc
+        sps->chroma_format_idc = get_ue_golomb_long(&gb); // chroma_format_idc
         if (sps->chroma_format_idc == 3) {
             skip_bits1(&gb); // separate_colour_plane_flag
         }
-        sps->bit_depth_luma = get_ue_golomb(&gb) + 8;
-        sps->bit_depth_chroma = get_ue_golomb(&gb) + 8;
+        sps->bit_depth_luma = get_ue_golomb_long(&gb) + 8;
+        sps->bit_depth_chroma = get_ue_golomb_long(&gb) + 8;
         skip_bits1(&gb); // qpprime_y_zero_transform_bypass_flag
         if (get_bits1(&gb)) { // seq_scaling_matrix_present_flag
             for (i = 0; i < ((sps->chroma_format_idc != 3) ? 8 : 12); i++) {
@@ -382,7 +244,7 @@ int ff_avc_decode_sps(H264SPS *sps, const uint8_t *buf, int buf_size)
                 sizeOfScalingList = i < 6 ? 16 : 64;
                 for (j = 0; j < sizeOfScalingList; j++) {
                     if (nextScale != 0) {
-                        delta_scale = get_se_golomb(&gb);
+                        delta_scale = get_se_golomb_long(&gb);
                         nextScale = (lastScale + delta_scale) & 0xff;
                     }
                     lastScale = nextScale == 0 ? lastScale : nextScale;
@@ -395,24 +257,24 @@ int ff_avc_decode_sps(H264SPS *sps, const uint8_t *buf, int buf_size)
         sps->bit_depth_chroma = 8;
     }
 
-    get_ue_golomb(&gb); // log2_max_frame_num_minus4
-    pic_order_cnt_type = get_ue_golomb(&gb);
+    get_ue_golomb_long(&gb); // log2_max_frame_num_minus4
+    pic_order_cnt_type = get_ue_golomb_long(&gb);
 
     if (pic_order_cnt_type == 0) {
-        get_ue_golomb(&gb); // log2_max_pic_order_cnt_lsb_minus4
+        get_ue_golomb_long(&gb); // log2_max_pic_order_cnt_lsb_minus4
     } else if (pic_order_cnt_type == 1) {
         skip_bits1(&gb);    // delta_pic_order_always_zero
-        get_se_golomb(&gb); // offset_for_non_ref_pic
-        get_se_golomb(&gb); // offset_for_top_to_bottom_field
-        num_ref_frames_in_pic_order_cnt_cycle = get_ue_golomb(&gb);
+        get_se_golomb_long(&gb); // offset_for_non_ref_pic
+        get_se_golomb_long(&gb); // offset_for_top_to_bottom_field
+        num_ref_frames_in_pic_order_cnt_cycle = get_ue_golomb_long(&gb);
         for (i = 0; i < num_ref_frames_in_pic_order_cnt_cycle; i++)
-            get_se_golomb(&gb); // offset_for_ref_frame
+            get_se_golomb_long(&gb); // offset_for_ref_frame
     }
 
-    get_ue_golomb(&gb); // max_num_ref_frames
+    get_ue_golomb_long(&gb); // max_num_ref_frames
     skip_bits1(&gb); // gaps_in_frame_num_value_allowed_flag
-    get_ue_golomb(&gb); // pic_width_in_mbs_minus1
-    get_ue_golomb(&gb); // pic_height_in_map_units_minus1
+    get_ue_golomb_long(&gb); // pic_width_in_mbs_minus1
+    get_ue_golomb_long(&gb); // pic_height_in_map_units_minus1
 
     sps->frame_mbs_only_flag = get_bits1(&gb);
     if (!sps->frame_mbs_only_flag)
@@ -421,10 +283,10 @@ int ff_avc_decode_sps(H264SPS *sps, const uint8_t *buf, int buf_size)
     skip_bits1(&gb); // direct_8x8_inference_flag
 
     if (get_bits1(&gb)) { // frame_cropping_flag
-        get_ue_golomb(&gb); // frame_crop_left_offset
-        get_ue_golomb(&gb); // frame_crop_right_offset
-        get_ue_golomb(&gb); // frame_crop_top_offset
-        get_ue_golomb(&gb); // frame_crop_bottom_offset
+        get_ue_golomb_long(&gb); // frame_crop_left_offset
+        get_ue_golomb_long(&gb); // frame_crop_right_offset
+        get_ue_golomb_long(&gb); // frame_crop_top_offset
+        get_ue_golomb_long(&gb); // frame_crop_bottom_offset
     }
 
     if (get_bits1(&gb)) { // vui_parameters_present_flag

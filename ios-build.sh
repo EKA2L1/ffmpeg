@@ -44,14 +44,12 @@ build_one() {
         --disable-shared \
         --enable-static \
         --enable-pic \
-        --disable-asm \
         --disable-avdevice \
         --disable-filters \
         --disable-programs \
         --disable-network \
         --disable-avfilter \
-        --disable-postproc \
-        --disable-encoders \
+            --disable-encoders \
         --disable-doc \
         --disable-ffplay \
         --disable-ffprobe \

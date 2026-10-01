@@ -18,11 +18,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/common.h"
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
 #include "decode.h"
-#include "internal.h"
 
 typedef struct SimbiosisIMXContext {
     AVFrame *frame;
@@ -46,7 +47,7 @@ static av_cold int imx_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int imx_decode_frame(AVCodecContext *avctx, void *data,
+static int imx_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
                             int *got_frame, AVPacket *avpkt)
 {
     SimbiosisIMXContext *imx = avctx->priv_data;
@@ -58,11 +59,9 @@ static int imx_decode_frame(AVCodecContext *avctx, void *data,
         return ret;
 
     if (ff_copy_palette(imx->pal, avpkt, avctx)) {
-        frame->palette_has_changed = 1;
-        frame->key_frame = 1;
+        frame->flags |= AV_FRAME_FLAG_KEY;
     } else {
-        frame->key_frame = 0;
-        frame->palette_has_changed = 0;
+        frame->flags &= ~AV_FRAME_FLAG_KEY;
     }
 
     bytestream2_init(&gb, avpkt->data, avpkt->size);
@@ -80,6 +79,7 @@ static int imx_decode_frame(AVCodecContext *avctx, void *data,
         switch (op) {
         case 3:
             len = len * 64 + bytestream2_get_byte(&gb);
+            av_fallthrough;
         case 0:
             while (len > 0) {
                 x++;
@@ -92,7 +92,7 @@ static int imx_decode_frame(AVCodecContext *avctx, void *data,
                     break;
             }
 
-            frame->key_frame = 0;
+            frame->flags &= ~AV_FRAME_FLAG_KEY;
             break;
         case 1:
             if (len == 0) {
@@ -114,7 +114,7 @@ static int imx_decode_frame(AVCodecContext *avctx, void *data,
                         break;
                 }
 
-                frame->key_frame = 0;
+                frame->flags &= ~AV_FRAME_FLAG_KEY;
             } else {
                 while (len > 0) {
                     fill = bytestream2_get_byte(&gb);
@@ -150,9 +150,9 @@ static int imx_decode_frame(AVCodecContext *avctx, void *data,
         }
     }
 
-    frame->pict_type = frame->key_frame ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
+    frame->pict_type = (frame->flags & AV_FRAME_FLAG_KEY) ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
 
-    if ((ret = av_frame_ref(data, frame)) < 0)
+    if ((ret = av_frame_ref(rframe, frame)) < 0)
         return ret;
 
     *got_frame = 1;
@@ -160,7 +160,7 @@ static int imx_decode_frame(AVCodecContext *avctx, void *data,
     return avpkt->size;
 }
 
-static void imx_decode_flush(AVCodecContext *avctx)
+static av_cold void imx_decode_flush(AVCodecContext *avctx)
 {
     SimbiosisIMXContext *imx = avctx->priv_data;
 
@@ -170,7 +170,7 @@ static void imx_decode_flush(AVCodecContext *avctx)
     memset(imx->history, 0, sizeof(imx->history));
 }
 
-static int imx_decode_close(AVCodecContext *avctx)
+static av_cold int imx_decode_close(AVCodecContext *avctx)
 {
     SimbiosisIMXContext *imx = avctx->priv_data;
 
@@ -179,17 +179,16 @@ static int imx_decode_close(AVCodecContext *avctx)
     return 0;
 }
 
-const AVCodec ff_simbiosis_imx_decoder = {
-    .name           = "simbiosis_imx",
-    .long_name      = NULL_IF_CONFIG_SMALL("Simbiosis Interactive IMX Video"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_SIMBIOSIS_IMX,
+const FFCodec ff_simbiosis_imx_decoder = {
+    .p.name         = "simbiosis_imx",
+    CODEC_LONG_NAME("Simbiosis Interactive IMX Video"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_SIMBIOSIS_IMX,
     .priv_data_size = sizeof(SimbiosisIMXContext),
     .init           = imx_decode_init,
-    .decode         = imx_decode_frame,
+    FF_CODEC_DECODE_CB(imx_decode_frame),
     .close          = imx_decode_close,
     .flush          = imx_decode_flush,
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE |
-                      FF_CODEC_CAP_INIT_CLEANUP,
+    .p.capabilities = AV_CODEC_CAP_DR1,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

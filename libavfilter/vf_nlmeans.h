@@ -35,11 +35,10 @@ typedef struct NLMeansDSPContext {
                                  float *total_weight,
                                  float *sum,
                                  const float *const weight_lut,
-                                 int max_meaningful_diff,
-                                 int startx, int endx);
+                                 ptrdiff_t max_meaningful_diff,
+                                 ptrdiff_t startx, ptrdiff_t endx);
 } NLMeansDSPContext;
 
-void ff_nlmeans_init(NLMeansDSPContext *dsp);
 void ff_nlmeans_init_aarch64(NLMeansDSPContext *dsp);
 void ff_nlmeans_init_x86(NLMeansDSPContext *dsp);
 

@@ -23,18 +23,11 @@
 #define AVFORMAT_AVC_H
 
 #include <stdint.h>
+#include "libavutil/rational.h"
 #include "avio.h"
 
-int ff_avc_parse_nal_units(AVIOContext *s, const uint8_t *buf, int size);
-int ff_avc_parse_nal_units_buf(const uint8_t *buf_in, uint8_t **buf, int *size);
 int ff_isom_write_avcc(AVIOContext *pb, const uint8_t *data, int len);
-const uint8_t *ff_avc_find_startcode(const uint8_t *p, const uint8_t *end);
 int ff_avc_write_annexb_extradata(const uint8_t *in, uint8_t **buf, int *size);
-const uint8_t *ff_avc_mp4_find_startcode(const uint8_t *start,
-                                         const uint8_t *end,
-                                         int nal_length_size);
-uint8_t *ff_nal_unit_extract_rbsp(const uint8_t *src, uint32_t src_len,
-                                  uint32_t *dst_len, int header_len);
 
 typedef struct {
     uint8_t id;

@@ -24,8 +24,11 @@
 
 #include <stdint.h>
 
-#include "ac3.h"
+#include "ac3defs.h"
 
+#include "libavutil/attributes_internal.h"
+
+FF_VISIBILITY_PUSH_HIDDEN
 extern const uint16_t ff_ac3_frame_size_tab[38][3];
 extern const uint8_t  ff_ac3_channels_tab[8];
 extern const uint16_t ff_ac3_channel_layout_tab[8];
@@ -34,8 +37,6 @@ extern const int      ff_ac3_sample_rate_tab[];
 extern const uint16_t ff_ac3_bitrate_tab[19];
 extern const uint8_t  ff_ac3_rematrix_band_tab[5];
 extern const uint8_t  ff_eac3_default_cpl_band_struct[18];
-extern const uint8_t  ff_ac3_log_add_tab[260];
-extern const uint16_t ff_ac3_hearing_threshold_tab[AC3_CRITICAL_BANDS][3];
 extern const uint8_t  ff_ac3_bap_tab[64];
 extern const uint8_t  ff_ac3_slow_decay_tab[4];
 extern const uint8_t  ff_ac3_fast_decay_tab[4];
@@ -45,23 +46,9 @@ extern const int16_t  ff_ac3_floor_tab[8];
 extern const uint16_t ff_ac3_fast_gain_tab[8];
 extern const uint8_t  ff_ac3_band_start_tab[AC3_CRITICAL_BANDS+1];
 extern const uint8_t  ff_ac3_bin_to_band_tab[253];
+extern const float    ff_ac3_gain_levels[9];
 extern const uint64_t ff_eac3_custom_channel_map_locations[16][2];
-
-
-/** Custom channel map locations bitmask
- *  Other channels described in documentation:
- *      Lc/Rc pair, Lrs/Rrs pair, Ts, Lsd/Rsd pair,
- *      Lw/Rw pair, Lvh/Rvh pair, Cvh, Reserved, LFE2
- */
-enum CustomChannelMapLocation{
-    AC3_CHMAP_L=        1<<(15-0),
-    AC3_CHMAP_C=        1<<(15-1),
-    AC3_CHMAP_R=        1<<(15-2),
-    AC3_CHMAP_L_SUR=    1<<(15-3),
-    AC3_CHMAP_R_SUR =   1<<(15-4),
-    AC3_CHMAP_C_SUR=    1<<(15-7),
-    AC3_CHMAP_LFE =     1<<(15-15)
-};
+FF_VISIBILITY_POP_HIDDEN
 
 #define COMMON_CHANNEL_MAP \
     { { 0, 1,          }, { 0, 1, 2,         } },\

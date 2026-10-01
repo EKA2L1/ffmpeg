@@ -16,11 +16,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 
 #include "avcodec.h"
+#include "codec_desc.h"
 #include "decode.h"
 #include "internal.h"
 #include "vaapi_decode.h"
@@ -35,12 +39,24 @@ int ff_vaapi_decode_make_param_buffer(AVCodecContext *avctx,
 {
     VAAPIDecodeContext *ctx = avctx->internal->hwaccel_priv_data;
     VAStatus vas;
-    VABufferID buffer;
 
-    av_assert0(pic->nb_param_buffers + 1 <= MAX_PARAM_BUFFERS);
+    av_assert0(pic->nb_param_buffers <= pic->nb_param_buffers_allocated);
+    if (pic->nb_param_buffers == pic->nb_param_buffers_allocated) {
+        VABufferID *tmp =
+            av_realloc_array(pic->param_buffers,
+                             pic->nb_param_buffers_allocated + 16,
+                             sizeof(*pic->param_buffers));
+        if (!tmp)
+            return AVERROR(ENOMEM);
+
+        pic->param_buffers = tmp;
+        pic->nb_param_buffers_allocated += 16;
+    }
+    av_assert0(pic->nb_param_buffers + 1 <= pic->nb_param_buffers_allocated);
 
     vas = vaCreateBuffer(ctx->hwctx->display, ctx->va_context,
-                         type, size, 1, (void*)data, &buffer);
+                         type, size, 1, (void*)data,
+                         &pic->param_buffers[pic->nb_param_buffers]);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create parameter "
                "buffer (type %d): %d (%s).\n",
@@ -48,17 +64,18 @@ int ff_vaapi_decode_make_param_buffer(AVCodecContext *avctx,
         return AVERROR(EIO);
     }
 
-    pic->param_buffers[pic->nb_param_buffers++] = buffer;
-
     av_log(avctx, AV_LOG_DEBUG, "Param buffer (type %d, %zu bytes) "
-           "is %#x.\n", type, size, buffer);
+           "is %#x.\n", type, size, pic->param_buffers[pic->nb_param_buffers]);
+
+    ++pic->nb_param_buffers;
+
     return 0;
 }
-
 
 int ff_vaapi_decode_make_slice_buffer(AVCodecContext *avctx,
                                       VAAPIDecodePicture *pic,
                                       const void *params_data,
+                                      int nb_params,
                                       size_t params_size,
                                       const void *slice_data,
                                       size_t slice_size)
@@ -67,27 +84,25 @@ int ff_vaapi_decode_make_slice_buffer(AVCodecContext *avctx,
     VAStatus vas;
     int index;
 
-    av_assert0(pic->nb_slices <= pic->slices_allocated);
-    if (pic->nb_slices == pic->slices_allocated) {
-        if (pic->slices_allocated > 0)
-            pic->slices_allocated *= 2;
-        else
-            pic->slices_allocated = 64;
-
-        pic->slice_buffers =
+    av_assert0(pic->nb_slices <= pic->nb_slice_buffers_allocated);
+    if (pic->nb_slices == pic->nb_slice_buffers_allocated) {
+        VABufferID *tmp =
             av_realloc_array(pic->slice_buffers,
-                             pic->slices_allocated,
+                             pic->nb_slice_buffers_allocated ? pic->nb_slice_buffers_allocated * 2 : 64,
                              2 * sizeof(*pic->slice_buffers));
-        if (!pic->slice_buffers)
+        if (!tmp)
             return AVERROR(ENOMEM);
+
+        pic->slice_buffers = tmp;
+        pic->nb_slice_buffers_allocated = pic->nb_slice_buffers_allocated ? pic->nb_slice_buffers_allocated * 2 : 64;
     }
-    av_assert0(pic->nb_slices + 1 <= pic->slices_allocated);
+    av_assert0(pic->nb_slices + 1 <= pic->nb_slice_buffers_allocated);
 
     index = 2 * pic->nb_slices;
 
     vas = vaCreateBuffer(ctx->hwctx->display, ctx->va_context,
                          VASliceParameterBufferType,
-                         params_size, 1, (void*)params_data,
+                         params_size, nb_params, (void*)params_data,
                          &pic->slice_buffers[index]);
     if (vas != VA_STATUS_SUCCESS) {
         av_log(avctx, AV_LOG_ERROR, "Failed to create slice "
@@ -155,6 +170,11 @@ int ff_vaapi_decode_issue(AVCodecContext *avctx,
     VAStatus vas;
     int err;
 
+    if (pic->nb_slices <= 0) {
+        err = AVERROR(EINVAL);
+        goto fail;
+    }
+
     av_log(avctx, AV_LOG_DEBUG, "Decode to surface %#x.\n",
            pic->output_surface);
 
@@ -214,9 +234,11 @@ fail:
     ff_vaapi_decode_destroy_buffers(avctx, pic);
 fail_at_end:
 exit:
-    pic->nb_param_buffers = 0;
-    pic->nb_slices        = 0;
-    pic->slices_allocated = 0;
+    pic->nb_param_buffers           = 0;
+    pic->nb_param_buffers_allocated = 0;
+    av_freep(&pic->param_buffers);
+    pic->nb_slices                  = 0;
+    pic->nb_slice_buffers_allocated = 0;
     av_freep(&pic->slice_buffers);
 
     return err;
@@ -227,9 +249,11 @@ int ff_vaapi_decode_cancel(AVCodecContext *avctx,
 {
     ff_vaapi_decode_destroy_buffers(avctx, pic);
 
-    pic->nb_param_buffers = 0;
-    pic->nb_slices        = 0;
-    pic->slices_allocated = 0;
+    pic->nb_param_buffers           = 0;
+    pic->nb_param_buffers_allocated = 0;
+    av_freep(&pic->param_buffers);
+    pic->nb_slices                  = 0;
+    pic->nb_slice_buffers_allocated = 0;
     av_freep(&pic->slice_buffers);
 
     return 0;
@@ -261,13 +285,28 @@ static const struct {
 #ifdef VA_FOURCC_Y210
     MAP(Y210,    Y210),
 #endif
+#ifdef VA_FOURCC_Y212
+    MAP(Y212,    Y212),
+#endif
     // 4:4:0
     MAP(422V, YUV440P),
     // 4:4:4
     MAP(444P, YUV444P),
+#ifdef VA_FOURCC_XYUV
+    MAP(XYUV, VUYX),
+#endif
+#ifdef VA_FOURCC_Y410
+    MAP(Y410,    XV30),
+#endif
+#ifdef VA_FOURCC_Y412
+    MAP(Y412,    XV36),
+#endif
     // 4:2:0 10-bit
 #ifdef VA_FOURCC_P010
     MAP(P010, P010),
+#endif
+#ifdef VA_FOURCC_P012
+    MAP(P012, P012),
 #endif
 #ifdef VA_FOURCC_I010
     MAP(I010, YUV420P10),
@@ -355,6 +394,8 @@ static int vaapi_decode_find_best_format(AVCodecContext *avctx,
 
         ctx->pixel_format_attribute = (VASurfaceAttrib) {
             .type          = VASurfaceAttribPixelFormat,
+            .flags         = VA_SURFACE_ATTRIB_SETTABLE,
+            .value.type    = VAGenericValueTypeInteger,
             .value.value.i = best_fourcc,
         };
 
@@ -371,7 +412,7 @@ static const struct {
     VAProfile va_profile;
     VAProfile (*profile_parser)(AVCodecContext *avctx);
 } vaapi_profile_map[] = {
-#define MAP(c, p, v, ...) { AV_CODEC_ID_ ## c, FF_PROFILE_ ## p, VAProfile ## v, __VA_ARGS__ }
+#define MAP(c, p, v, ...) { AV_CODEC_ID_ ## c, AV_PROFILE_ ## p, VAProfile ## v, __VA_ARGS__ }
     MAP(MPEG2VIDEO,  MPEG2_SIMPLE,    MPEG2Simple ),
     MAP(MPEG2VIDEO,  MPEG2_MAIN,      MPEG2Main   ),
     MAP(H263,        UNKNOWN,         H263Baseline),
@@ -379,6 +420,11 @@ static const struct {
     MAP(MPEG4,       MPEG4_ADVANCED_SIMPLE,
                                MPEG4AdvancedSimple),
     MAP(MPEG4,       MPEG4_MAIN,      MPEG4Main   ),
+#if VA_CHECK_VERSION(1, 18, 0)
+    MAP(H264,        H264_HIGH_10_INTRA,
+                                      H264High10  ),
+    MAP(H264,        H264_HIGH_10,    H264High10  ),
+#endif
     MAP(H264,        H264_CONSTRAINED_BASELINE,
                            H264ConstrainedBaseline),
     MAP(H264,        H264_MAIN,       H264Main    ),
@@ -391,7 +437,9 @@ static const struct {
 #endif
 #if VA_CHECK_VERSION(1, 2, 0) && CONFIG_HEVC_VAAPI_HWACCEL
     MAP(HEVC,        HEVC_REXT,       None,
-                 ff_vaapi_parse_hevc_rext_profile ),
+                 ff_vaapi_parse_hevc_rext_scc_profile ),
+    MAP(HEVC,        HEVC_SCC,        None,
+                 ff_vaapi_parse_hevc_rext_scc_profile ),
 #endif
     MAP(MJPEG,       MJPEG_HUFFMAN_BASELINE_DCT,
                                       JPEGBaseline),
@@ -408,11 +456,16 @@ static const struct {
     MAP(VP9,         VP9_0,           VP9Profile0 ),
 #endif
 #if VA_CHECK_VERSION(0, 39, 0)
+    MAP(VP9,         VP9_1,           VP9Profile1 ),
     MAP(VP9,         VP9_2,           VP9Profile2 ),
+    MAP(VP9,         VP9_3,           VP9Profile3 ),
 #endif
 #if VA_CHECK_VERSION(1, 8, 0)
     MAP(AV1,         AV1_MAIN,        AV1Profile0),
     MAP(AV1,         AV1_HIGH,        AV1Profile1),
+#endif
+#if VA_CHECK_VERSION(1, 22, 0)
+    MAP(H266,        VVC_MAIN_10,     VVCMain10),
 #endif
 
 #undef MAP
@@ -469,7 +522,7 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
         if (avctx->codec_id != vaapi_profile_map[i].codec_id)
             continue;
         if (avctx->profile == vaapi_profile_map[i].codec_profile ||
-            vaapi_profile_map[i].codec_profile == FF_PROFILE_UNKNOWN)
+            vaapi_profile_map[i].codec_profile == AV_PROFILE_UNKNOWN)
             profile_match = 1;
 
         va_profile = vaapi_profile_map[i].profile_parser ?
@@ -572,22 +625,27 @@ static int vaapi_decode_make_config(AVCodecContext *avctx,
         if (err < 0)
             goto fail;
 
-        frames->initial_pool_size = 1;
-        // Add per-codec number of surfaces used for storing reference frames.
-        switch (avctx->codec_id) {
-        case AV_CODEC_ID_H264:
-        case AV_CODEC_ID_HEVC:
-        case AV_CODEC_ID_AV1:
-            frames->initial_pool_size += 16;
-            break;
-        case AV_CODEC_ID_VP9:
-            frames->initial_pool_size += 8;
-            break;
-        case AV_CODEC_ID_VP8:
-            frames->initial_pool_size += 3;
-            break;
-        default:
-            frames->initial_pool_size += 2;
+        if (CONFIG_VAAPI_1)
+            frames->initial_pool_size = 0;
+        else {
+            frames->initial_pool_size = 1;
+            // Add per-codec number of surfaces used for storing reference frames.
+            switch (avctx->codec_id) {
+            case AV_CODEC_ID_H264:
+            case AV_CODEC_ID_H266:
+            case AV_CODEC_ID_HEVC:
+            case AV_CODEC_ID_AV1:
+                frames->initial_pool_size += 16;
+                break;
+            case AV_CODEC_ID_VP9:
+                frames->initial_pool_size += 8;
+                break;
+            case AV_CODEC_ID_VP8:
+                frames->initial_pool_size += 3;
+                break;
+            default:
+                frames->initial_pool_size += 2;
+            }
         }
     }
 
@@ -650,7 +708,7 @@ int ff_vaapi_decode_init(AVCodecContext *avctx)
     ctx->hwctx  = ctx->device->hwctx;
 
     err = vaapi_decode_make_config(avctx, ctx->frames->device_ref,
-                                   &ctx->va_config, avctx->hw_frames_ctx);
+                                   &ctx->va_config, NULL);
     if (err)
         goto fail;
 

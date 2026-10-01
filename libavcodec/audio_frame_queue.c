@@ -20,9 +20,9 @@
  */
 
 #include "libavutil/attributes.h"
-#include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "audio_frame_queue.h"
-#include "internal.h"
+#include "encode.h"
 #include "libavutil/avassert.h"
 
 av_cold void ff_af_queue_init(AVCodecContext *avctx, AudioFrameQueue *afq)
@@ -33,7 +33,7 @@ av_cold void ff_af_queue_init(AVCodecContext *avctx, AudioFrameQueue *afq)
     afq->frame_count       = 0;
 }
 
-void ff_af_queue_close(AudioFrameQueue *afq)
+av_cold void ff_af_queue_close(AudioFrameQueue *afq)
 {
     if(afq->frame_count)
         av_log(afq->avctx, AV_LOG_WARNING, "%d frames left in the queue on closing\n", afq->frame_count);

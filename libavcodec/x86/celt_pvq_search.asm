@@ -20,7 +20,6 @@
 ;* Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 ;******************************************************************************
 
-%include "config.asm"
 %include "libavutil/x86/x86util.asm"
 
 %ifdef __NASM_VER__
@@ -74,7 +73,7 @@ SECTION .text
 ; "movaps m0, [r5 + r4]" if PIC is enabled
 ; "movaps m0, [constant_name + r4]" if texrel are used
 %macro SET_PIC_BASE 3; reg, const_label
-%ifdef PIC
+%if PIC
     %{1}     %2, [%3]      ; lea r5, [rip+const]
     %define  pic_base_%3 %2
 %else
@@ -105,7 +104,7 @@ align 16
     addps          m5, m7           ; m5 = Sxy_new = X[i] + Sxy_norm
 
   %if USE_APPROXIMATION == 1
-    andps          m5, m0           ; if(X[i] == 0) Sxy_new = 0; Prevent aproximation error from setting pulses in array padding.
+    andps          m5, m0           ; if(X[i] == 0) Sxy_new = 0; Prevent approximation error from setting pulses in array padding.
   %endif
 
 %else
@@ -195,7 +194,7 @@ align 16
 ; PIC relative addressing. Use this
 ; to count it in cglobal
 ;
-%ifdef PIC
+%if PIC
   %define num_pic_regs 1
 %else
   %define num_pic_regs 0

@@ -98,7 +98,7 @@ extern const ff_asf_guid ff_asf_language_guid;
 extern const ff_asf_guid ff_asf_content_encryption;
 extern const ff_asf_guid ff_asf_ext_content_encryption;
 extern const ff_asf_guid ff_asf_digital_signature;
-extern const ff_asf_guid ff_asf_extended_stream_properties_object;
+#define ff_asf_extended_stream_properties_object ff_asf_ext_stream_header
 extern const ff_asf_guid ff_asf_group_mutual_exclusion_object;
 extern const ff_asf_guid ff_asf_mutex_language;
 
@@ -113,6 +113,17 @@ extern const AVMetadataConv ff_asf_metadata_conv[];
 int ff_asf_handle_byte_array(AVFormatContext *s, const char *name,
                              int val_len);
 
+/* convert from av time to windows filetime */
+static inline int64_t ff_asf_avtime_to_filetime(int64_t avtime)
+{
+    return avtime * 10 + 116444736000000000;
+}
+
+/* convert from windows filetime to av time */
+static inline int64_t ff_asf_filetime_to_avtime(int64_t filetime)
+{
+    return filetime / 10 - 11644473600000000;
+}
 
 #define ASF_PACKET_FLAG_ERROR_CORRECTION_PRESENT 0x80 //1000 0000
 

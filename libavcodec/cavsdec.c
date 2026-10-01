@@ -25,13 +25,18 @@
  * @author Stefan Gehrer <stefan.gehrer@gmx.de>
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "get_bits.h"
 #include "golomb.h"
 #include "cavs.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
+#include "mathops.h"
 #include "mpeg12data.h"
+#include "startcode.h"
 
 static const uint8_t mv_scan[4] = {
     MV_FWD_X0, MV_FWD_X1,
@@ -504,7 +509,7 @@ static inline int get_ue_code(GetBitContext *gb, int order)
 {
     unsigned ret = get_ue_golomb(gb);
     if (ret >= ((1U<<31)>>order)) {
-        av_log(NULL, AV_LOG_ERROR, "get_ue_code: value too larger\n");
+        av_log(NULL, AV_LOG_ERROR, "get_ue_code: value too large\n");
         return AVERROR_INVALIDDATA;
     }
     if (order) {
@@ -518,7 +523,7 @@ static inline int dequant(AVSContext *h, int16_t *level_buf, uint8_t *run_buf,
 {
     int round = 1 << (shift - 1);
     int pos = -1;
-    const uint8_t *scantab = h->scantable.permutated;
+    const uint8_t *scantab = h->permutated_scantable;
 
     /* inverse scan and dequantization */
     while (--coeff_num >= 0) {
@@ -1017,6 +1022,9 @@ static int decode_pic(AVSContext *h)
             skip_bits(&h->gb, 1); //marker_bit
     }
 
+    if (get_bits_left(&h->gb) < 23)
+        return AVERROR_INVALIDDATA;
+
     ret = ff_get_buffer(h->avctx, h->cur.f, h->cur.f->pict_type == AV_PICTURE_TYPE_B ?
                         0 : AV_GET_BUFFER_FLAG_REF);
     if (ret < 0)
@@ -1152,7 +1160,6 @@ static int decode_pic(AVSContext *h)
                 break;
         } while (ff_cavs_next_mb(h));
     }
-    emms_c();
     if (ret >= 0 && h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
         av_frame_unref(h->DPB[1].f);
         FFSWAP(AVSFrame, h->cur, h->DPB[1]);
@@ -1174,6 +1181,11 @@ static int decode_seq_header(AVSContext *h)
     int ret;
 
     h->profile = get_bits(&h->gb, 8);
+    if (h->profile != 0x20) {
+        avpriv_report_missing_feature(h->avctx,
+                                      "only support JiZhun profile");
+        return AVERROR_PATCHWELCOME;
+    }
     h->level   = get_bits(&h->gb, 8);
     skip_bits1(&h->gb); //progressive sequence
 
@@ -1217,14 +1229,14 @@ static int decode_seq_header(AVSContext *h)
     return 0;
 }
 
-static void cavs_flush(AVCodecContext * avctx)
+static av_cold void cavs_flush(AVCodecContext * avctx)
 {
     AVSContext *h = avctx->priv_data;
     h->got_keyframe = 0;
 }
 
-static int cavs_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                             AVPacket *avpkt)
+static int cavs_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                             int *got_frame, AVPacket *avpkt)
 {
     AVSContext *h      = avctx->priv_data;
     const uint8_t *buf = avpkt->data;
@@ -1238,7 +1250,7 @@ static int cavs_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     if (buf_size == 0) {
         if (!h->low_delay && h->DPB[0].f->data[0]) {
             *got_frame = 1;
-            av_frame_move_ref(data, h->DPB[0].f);
+            av_frame_move_ref(rframe, h->DPB[0].f);
         }
         return 0;
     }
@@ -1254,10 +1266,11 @@ static int cavs_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
                 av_log(h->avctx, AV_LOG_WARNING, "no frame decoded\n");
             return FFMAX(0, buf_ptr - buf);
         }
-        input_size = (buf_end - buf_ptr) * 8;
+        input_size = buf_end - buf_ptr;
+        if ((ret = init_get_bits8(&h->gb, buf_ptr, input_size)) < 0)
+            return ret;
         switch (stc) {
         case CAVS_START_CODE:
-            init_get_bits(&h->gb, buf_ptr, input_size);
             decode_seq_header(h);
             break;
         case PIC_I_START_CODE:
@@ -1266,29 +1279,29 @@ static int cavs_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
                 av_frame_unref(h->DPB[1].f);
                 h->got_keyframe = 1;
             }
+            av_fallthrough;
         case PIC_PB_START_CODE:
             if (frame_start > 1)
                 return AVERROR_INVALIDDATA;
             frame_start ++;
             if (*got_frame)
-                av_frame_unref(data);
+                av_frame_unref(rframe);
             *got_frame = 0;
             if (!h->got_keyframe)
                 break;
-            init_get_bits(&h->gb, buf_ptr, input_size);
             h->stc = stc;
             if (decode_pic(h))
                 break;
             *got_frame = 1;
             if (h->cur.f->pict_type != AV_PICTURE_TYPE_B) {
                 if (h->DPB[!h->low_delay].f->data[0]) {
-                    if ((ret = av_frame_ref(data, h->DPB[!h->low_delay].f)) < 0)
+                    if ((ret = av_frame_ref(rframe, h->DPB[!h->low_delay].f)) < 0)
                         return ret;
                 } else {
                     *got_frame = 0;
                 }
             } else {
-                av_frame_move_ref(data, h->cur.f);
+                av_frame_move_ref(rframe, h->cur.f);
             }
             break;
         case EXT_START_CODE:
@@ -1299,7 +1312,6 @@ static int cavs_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
             break;
         default:
             if (stc <= SLICE_MAX_START_CODE) {
-                init_get_bits(&h->gb, buf_ptr, input_size);
                 decode_slice_header(h, &h->gb);
             }
             break;
@@ -1307,15 +1319,16 @@ static int cavs_decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     }
 }
 
-const AVCodec ff_cavs_decoder = {
-    .name           = "cavs",
-    .long_name      = NULL_IF_CONFIG_SMALL("Chinese AVS (Audio Video Standard) (AVS1-P2, JiZhun profile)"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_CAVS,
+const FFCodec ff_cavs_decoder = {
+    .p.name         = "cavs",
+    CODEC_LONG_NAME("Chinese AVS (Audio Video Standard) (AVS1-P2, JiZhun profile)"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_CAVS,
     .priv_data_size = sizeof(AVSContext),
     .init           = ff_cavs_init,
     .close          = ff_cavs_end,
-    .decode         = cavs_decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
+    FF_CODEC_DECODE_CB(cavs_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
     .flush          = cavs_flush,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

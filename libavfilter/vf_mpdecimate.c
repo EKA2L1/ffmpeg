@@ -29,9 +29,14 @@
 #include "libavutil/pixelutils.h"
 #include "libavutil/timestamp.h"
 #include "avfilter.h"
-#include "internal.h"
-#include "formats.h"
+#include "filters.h"
 #include "video.h"
+
+typedef enum {
+    DECIMATE_DROP,          ///< similar frame, past keep threshold — drop it
+    DECIMATE_KEEP_UPDATE,   ///< keep frame and update reference (frame is different, or first frame)
+    DECIMATE_KEEP_NO_UPDATE,///< keep frame without updating reference (similar frame under keep threshold, or forced keep due to max_drop_count)
+} DecimateResult;
 
 typedef struct DecimateContext {
     const AVClass *class;
@@ -46,6 +51,9 @@ typedef struct DecimateContext {
     int drop_count;                ///< if positive: number of frames sequentially dropped
                                    ///< if negative: number of sequential frames which were not dropped
 
+    int max_keep_count;            ///< number of similar frames to ignore before to start dropping them
+    int keep_count;                ///< number of similar frames already ignored
+
     int hsub, vsub;                ///< chroma subsampling values
     AVFrame *ref;                  ///< reference picture
     av_pixelutils_sad_fn sad;      ///< sum of absolute difference function
@@ -57,6 +65,8 @@ typedef struct DecimateContext {
 static const AVOption mpdecimate_options[] = {
     { "max",  "set the maximum number of consecutive dropped frames (positive), or the minimum interval between dropped frames (negative)",
       OFFSET(max_drop_count), AV_OPT_TYPE_INT, {.i64=0}, INT_MIN, INT_MAX, FLAGS },
+    { "keep", "set the number of similar consecutive frames to be kept before starting to drop similar frames",
+      OFFSET(max_keep_count), AV_OPT_TYPE_INT, {.i64=0}, 0, INT_MAX, FLAGS },
     { "hi",   "set high dropping threshold", OFFSET(hi), AV_OPT_TYPE_INT, {.i64=64*12}, INT_MIN, INT_MAX, FLAGS },
     { "lo",   "set low dropping threshold", OFFSET(lo), AV_OPT_TYPE_INT, {.i64=64*5}, INT_MIN, INT_MAX, FLAGS },
     { "frac", "set fraction dropping threshold",  OFFSET(frac), AV_OPT_TYPE_FLOAT, {.dbl=0.33}, 0, 1, FLAGS },
@@ -106,18 +116,13 @@ static int diff_planes(AVFilterContext *ctx,
  * Tell if the frame should be decimated, for example if it is no much
  * different with respect to the reference frame ref.
  */
-static int decimate_frame(AVFilterContext *ctx,
-                          AVFrame *cur, AVFrame *ref)
+static DecimateResult decimate_frame(AVFilterContext *ctx, AVFrame *cur, AVFrame *ref)
 {
     DecimateContext *decimate = ctx->priv;
     int plane;
+    int is_similar;
 
-    if (decimate->max_drop_count > 0 &&
-        decimate->drop_count >= decimate->max_drop_count)
-        return 0;
-    if (decimate->max_drop_count < 0 &&
-        (decimate->drop_count-1) > decimate->max_drop_count)
-        return 0;
+    is_similar = 1;
 
     for (plane = 0; ref->data[plane] && ref->linesize[plane]; plane++) {
         /* use 8x8 SAD even on subsampled planes.  The blocks won't match up with
@@ -132,13 +137,28 @@ static int decimate_frame(AVFilterContext *ctx,
                         ref->data[plane], ref->linesize[plane],
                         AV_CEIL_RSHIFT(ref->width,  hsub),
                         AV_CEIL_RSHIFT(ref->height, vsub))) {
-            emms_c();
-            return 0;
+            is_similar = 0;
+            break;
         }
     }
+    if (!is_similar) {
+        return DECIMATE_KEEP_UPDATE;
+    }
+    /* Frame is similar - check if we must keep it due to drop limits */
+    if (decimate->max_drop_count > 0 &&
+        decimate->drop_count >= decimate->max_drop_count)
+        return DECIMATE_KEEP_NO_UPDATE;
+    if (decimate->max_drop_count < 0 &&
+        (decimate->drop_count - 1) > decimate->max_drop_count)
+        return DECIMATE_KEEP_NO_UPDATE;
 
-    emms_c();
-    return 1;
+    /* Frame is similar - check if we must keep it due to keep option */
+    if (decimate->max_keep_count > 0 && decimate->keep_count > -1 &&
+        decimate->keep_count < decimate->max_keep_count) {
+        decimate->keep_count++;
+        return DECIMATE_KEEP_NO_UPDATE;
+    }
+    return DECIMATE_DROP;
 }
 
 static av_cold int init(AVFilterContext *ctx)
@@ -192,27 +212,47 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *cur)
 {
     DecimateContext *decimate = inlink->dst->priv;
     AVFilterLink *outlink = inlink->dst->outputs[0];
+    AVFrame *out = NULL;
     int ret;
+    DecimateResult result = decimate->ref ? decimate_frame(inlink->dst, cur, decimate->ref) : DECIMATE_KEEP_UPDATE;
 
-    if (decimate->ref && decimate_frame(inlink->dst, cur, decimate->ref)) {
+    switch (result) {
+    case DECIMATE_DROP:
         decimate->drop_count = FFMAX(1, decimate->drop_count+1);
-    } else {
+        decimate->keep_count = -1;
+        break;
+    case DECIMATE_KEEP_NO_UPDATE:
+        decimate->drop_count = FFMIN(-1, decimate->drop_count-1);
+        out = cur;
+        break;
+    case DECIMATE_KEEP_UPDATE:
+        out = av_frame_clone(cur);
+        if (!out) {
+            av_frame_free(&cur);
+            return AVERROR(ENOMEM);
+        }
         av_frame_free(&decimate->ref);
         decimate->ref = cur;
         decimate->drop_count = FFMIN(-1, decimate->drop_count-1);
-
-        if ((ret = ff_filter_frame(outlink, av_frame_clone(cur))) < 0)
-            return ret;
+        decimate->keep_count = 0;
+        break;
     }
 
     av_log(inlink->dst, AV_LOG_DEBUG,
-           "%s pts:%s pts_time:%s drop_count:%d\n",
-           decimate->drop_count > 0 ? "drop" : "keep",
+           "%s pts:%s pts_time:%s drop_count:%d keep_count:%d\n",
+           result == DECIMATE_DROP ? "drop" : "keep",
            av_ts2str(cur->pts), av_ts2timestr(cur->pts, &inlink->time_base),
-           decimate->drop_count);
+           decimate->drop_count,
+           decimate->keep_count);
 
-    if (decimate->drop_count > 0)
+    if (result == DECIMATE_DROP) {
         av_frame_free(&cur);
+        return 0;
+    }
+
+    ret = ff_filter_frame(outlink, out);
+    if (ret < 0)
+        return ret;
 
     return 0;
 }
@@ -226,21 +266,14 @@ static const AVFilterPad mpdecimate_inputs[] = {
     },
 };
 
-static const AVFilterPad mpdecimate_outputs[] = {
-    {
-        .name          = "default",
-        .type          = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_mpdecimate = {
-    .name          = "mpdecimate",
-    .description   = NULL_IF_CONFIG_SMALL("Remove near-duplicate frames."),
+const FFFilter ff_vf_mpdecimate = {
+    .p.name        = "mpdecimate",
+    .p.description = NULL_IF_CONFIG_SMALL("Remove near-duplicate frames."),
+    .p.priv_class  = &mpdecimate_class,
     .init          = init,
     .uninit        = uninit,
     .priv_size     = sizeof(DecimateContext),
-    .priv_class    = &mpdecimate_class,
     FILTER_INPUTS(mpdecimate_inputs),
-    FILTER_OUTPUTS(mpdecimate_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
 };

@@ -22,10 +22,10 @@
 */
 
 #include <gme/gme.h>
-#include "libavutil/avstring.h"
-#include "libavutil/eval.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct GMEContext {
@@ -142,7 +142,7 @@ static int read_header_gme(AVFormatContext *s)
         st->duration = duration;
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id    = AV_NE(AV_CODEC_ID_PCM_S16BE, AV_CODEC_ID_PCM_S16LE);
-    st->codecpar->channels    = 2;
+    st->codecpar->ch_layout.nb_channels = 2;
     st->codecpar->sample_rate = gme->sample_rate;
 
     return 0;
@@ -193,15 +193,15 @@ static const AVClass class_gme = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVInputFormat ff_libgme_demuxer = {
-    .name           = "libgme",
-    .long_name      = NULL_IF_CONFIG_SMALL("Game Music Emu demuxer"),
+const FFInputFormat ff_libgme_demuxer = {
+    .p.name         = "libgme",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Game Music Emu demuxer"),
+    .p.priv_class   = &class_gme,
     .priv_data_size = sizeof(GMEContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = probe_gme,
     .read_header    = read_header_gme,
     .read_packet    = read_packet_gme,
     .read_close     = read_close_gme,
     .read_seek      = read_seek_gme,
-    .priv_class     = &class_gme,
 };

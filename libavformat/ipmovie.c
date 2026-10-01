@@ -35,6 +35,8 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 
 #define CHUNK_PREAMBLE_SIZE 4
@@ -254,16 +256,14 @@ static int init_audio(AVFormatContext *s)
     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id = ipmovie->audio_type;
     st->codecpar->codec_tag = 0;  /* no tag */
-    st->codecpar->channels = ipmovie->audio_channels;
-    st->codecpar->channel_layout = st->codecpar->channels == 1 ? AV_CH_LAYOUT_MONO :
-                                                            AV_CH_LAYOUT_STEREO;
+    av_channel_layout_default(&st->codecpar->ch_layout, ipmovie->audio_channels);
     st->codecpar->sample_rate = ipmovie->audio_sample_rate;
     st->codecpar->bits_per_coded_sample = ipmovie->audio_bits;
-    st->codecpar->bit_rate = st->codecpar->channels * st->codecpar->sample_rate *
+    st->codecpar->bit_rate = ipmovie->audio_channels * st->codecpar->sample_rate *
         st->codecpar->bits_per_coded_sample;
     if (st->codecpar->codec_id == AV_CODEC_ID_INTERPLAY_DPCM)
         st->codecpar->bit_rate /= 2;
-    st->codecpar->block_align = st->codecpar->channels * st->codecpar->bits_per_coded_sample;
+    st->codecpar->block_align = ipmovie->audio_channels * st->codecpar->bits_per_coded_sample;
 
     return 0;
 }
@@ -612,10 +612,13 @@ static int ipmovie_read_header(AVFormatContext *s)
     unsigned char chunk_preamble[CHUNK_PREAMBLE_SIZE];
     int chunk_type, i;
     uint8_t signature_buffer[sizeof(signature)];
+    int ret;
 
     ipmovie->avf = s;
 
-    avio_read(pb, signature_buffer, sizeof(signature_buffer));
+    ret = ffio_read_size(pb, signature_buffer, sizeof(signature_buffer));
+    if (ret < 0)
+        return ret;
     while (memcmp(signature_buffer, signature, sizeof(signature))) {
         memmove(signature_buffer, signature_buffer + 1, sizeof(signature_buffer) - 1);
         signature_buffer[sizeof(signature_buffer) - 1] = avio_r8(pb);
@@ -636,9 +639,8 @@ static int ipmovie_read_header(AVFormatContext *s)
 
     /* peek ahead to the next chunk-- if it is an init audio chunk, process
      * it; if it is the first video chunk, this is a silent file */
-    if (avio_read(pb, chunk_preamble, CHUNK_PREAMBLE_SIZE) !=
-        CHUNK_PREAMBLE_SIZE)
-        return AVERROR(EIO);
+    if ((ret = ffio_read_size(pb, chunk_preamble, CHUNK_PREAMBLE_SIZE)) < 0)
+        return ret;
     chunk_type = AV_RL16(&chunk_preamble[2]);
     avio_seek(pb, -CHUNK_PREAMBLE_SIZE, SEEK_CUR);
 
@@ -685,7 +687,7 @@ static int ipmovie_read_packet(AVFormatContext *s,
         if (ret == CHUNK_BAD)
             ret = AVERROR_INVALIDDATA;
         else if (ret == CHUNK_EOF)
-            ret = AVERROR(EIO);
+            ret = AVERROR_INVALIDDATA;
         else if (ret == CHUNK_NOMEM)
             ret = AVERROR(ENOMEM);
         else if (ret == CHUNK_END || ret == CHUNK_SHUTDOWN)
@@ -701,9 +703,9 @@ static int ipmovie_read_packet(AVFormatContext *s,
     }
 }
 
-const AVInputFormat ff_ipmovie_demuxer = {
-    .name           = "ipmovie",
-    .long_name      = NULL_IF_CONFIG_SMALL("Interplay MVE"),
+const FFInputFormat ff_ipmovie_demuxer = {
+    .p.name         = "ipmovie",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Interplay MVE"),
     .priv_data_size = sizeof(IPMVEContext),
     .read_probe     = ipmovie_probe,
     .read_header    = ipmovie_read_header,

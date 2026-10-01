@@ -20,6 +20,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 #include "avformat.h"
+#include "mux.h"
 #include "riff.h"
 #include "internal.h"
 #include "avio_internal.h"
@@ -67,7 +68,7 @@ typedef struct AMVContext
 
     /*
      * Cumulative PTS values for each stream, used for the final
-     * duration calculcation.
+     * duration calculation.
      */
     int64_t lastpts[AMV_STREAM_COUNT];
 } AMVContext;
@@ -112,11 +113,7 @@ static av_cold int amv_init(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
-    if (ast->codecpar->codec_id != AV_CODEC_ID_ADPCM_IMA_AMV) {
-        av_log(s, AV_LOG_ERROR, "Second AMV stream must be %s\n",
-                avcodec_get_name(AV_CODEC_ID_ADPCM_IMA_AMV));
-        return AVERROR(EINVAL);
-    }
+    av_assert1(ast->codecpar->codec_id == AV_CODEC_ID_ADPCM_IMA_AMV);
 
     /* These files are broken-enough as they are. They shouldn't be streamed. */
     if (!(s->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
@@ -244,9 +241,9 @@ static void amv_write_alist(AVFormatContext *s, AVCodecParameters *par)
     /* Bodge an (incorrect) WAVEFORMATEX (+2 pad bytes) */
     tag_str = ff_start_tag(pb, "strf");
     AV_WL16(buf +  0, 1);
-    AV_WL16(buf +  2, par->channels);
+    AV_WL16(buf +  2, par->ch_layout.nb_channels);
     AV_WL32(buf +  4, par->sample_rate);
-    AV_WL32(buf +  8, par->sample_rate * par->channels * 2);
+    AV_WL32(buf +  8, par->sample_rate * par->ch_layout.nb_channels * 2);
     AV_WL16(buf + 12, 2);
     AV_WL16(buf + 14, 16);
     AV_WL16(buf + 16, 0);
@@ -401,14 +398,17 @@ static int amv_write_trailer(AVFormatContext *s)
     return 0;
 }
 
-const AVOutputFormat ff_amv_muxer = {
-    .name           = "amv",
-    .long_name      = NULL_IF_CONFIG_SMALL("AMV"),
-    .mime_type      = "video/amv",
-    .extensions     = "amv",
+const FFOutputFormat ff_amv_muxer = {
+    .p.name         = "amv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("AMV"),
+    .p.mime_type    = "video/amv",
+    .p.extensions   = "amv",
     .priv_data_size = sizeof(AMVContext),
-    .audio_codec    = AV_CODEC_ID_ADPCM_IMA_AMV,
-    .video_codec    = AV_CODEC_ID_AMV,
+    .p.audio_codec  = AV_CODEC_ID_ADPCM_IMA_AMV,
+    .p.video_codec  = AV_CODEC_ID_AMV,
+    .p.subtitle_codec = AV_CODEC_ID_NONE,
+    .flags_internal   = FF_OFMT_FLAG_MAX_ONE_OF_EACH |
+                        FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
     .init           = amv_init,
     .deinit         = amv_deinit,
     .write_header   = amv_write_header,

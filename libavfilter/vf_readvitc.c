@@ -27,11 +27,10 @@
 #include "libavutil/common.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
-#include "libavutil/pixdesc.h"
 #include "libavutil/timecode.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
 #define LINE_DATA_SIZE 9
 
@@ -230,21 +229,14 @@ static const AVFilterPad inputs[] = {
     },
 };
 
-static const AVFilterPad outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_readvitc = {
-    .name          = "readvitc",
-    .description   = NULL_IF_CONFIG_SMALL("Read vertical interval timecode and write it to frame metadata."),
+const FFFilter ff_vf_readvitc = {
+    .p.name        = "readvitc",
+    .p.description = NULL_IF_CONFIG_SMALL("Read vertical interval timecode and write it to frame metadata."),
+    .p.priv_class  = &readvitc_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(ReadVitcContext),
-    .priv_class    = &readvitc_class,
-    .flags         = AVFILTER_FLAG_METADATA_ONLY,
     FILTER_INPUTS(inputs),
-    FILTER_OUTPUTS(outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pixel_fmts),
     .init          = init,
 };

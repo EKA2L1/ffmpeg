@@ -23,9 +23,10 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/bprint.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
 static int print_link_prop(AVBPrint *buf, AVFilterLink *link)
 {
@@ -49,7 +50,7 @@ static int print_link_prop(AVBPrint *buf, AVFilterLink *link)
             format = av_x_if_null(av_get_sample_fmt_name(link->format), "?");
             av_bprintf(buf, "[%dHz %s:",
                        (int)link->sample_rate, format);
-            av_bprint_channel_layout(buf, link->channels, link->channel_layout);
+            av_channel_layout_describe_bprint(&link->ch_layout, buf);
             av_bprint_chars(buf, ']', 1);
             break;
 

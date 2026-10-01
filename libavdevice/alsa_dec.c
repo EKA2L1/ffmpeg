@@ -52,6 +52,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 
+#include "libavformat/demux.h"
 #include "libavformat/internal.h"
 
 #include "avdevice.h"
@@ -72,7 +73,7 @@ static av_cold int audio_read_header(AVFormatContext *s1)
     }
     codec_id    = s1->audio_codec_id;
 
-    ret = ff_alsa_open(s1, SND_PCM_STREAM_CAPTURE, &s->sample_rate, s->channels,
+    ret = ff_alsa_open(s1, SND_PCM_STREAM_CAPTURE, &s->sample_rate, &s->ch_layout,
         &codec_id);
     if (ret < 0) {
         return AVERROR(EIO);
@@ -82,20 +83,24 @@ static av_cold int audio_read_header(AVFormatContext *s1)
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id    = codec_id;
     st->codecpar->sample_rate = s->sample_rate;
-    st->codecpar->channels    = s->channels;
+    ret = av_channel_layout_copy(&st->codecpar->ch_layout, &s->ch_layout);
+    if (ret < 0)
+        goto fail;
     st->codecpar->frame_size = s->frame_size;
     avpriv_set_pts_info(st, 64, 1, 1000000);  /* 64 bits pts in us */
     /* microseconds instead of seconds, MHz instead of Hz */
     s->timefilter = ff_timefilter_new(1000000.0 / s->sample_rate,
                                       s->period_size, 1.5E-6);
-    if (!s->timefilter)
+    if (!s->timefilter) {
+        ret = AVERROR(EIO);
         goto fail;
+    }
 
     return 0;
 
 fail:
     snd_pcm_close(s->h);
-    return AVERROR(EIO);
+    return ret;
 }
 
 static int audio_read_packet(AVFormatContext *s1, AVPacket *pkt)
@@ -145,7 +150,7 @@ static int audio_get_device_list(AVFormatContext *h, AVDeviceInfoList *device_li
 
 static const AVOption options[] = {
     { "sample_rate", "", offsetof(AlsaData, sample_rate), AV_OPT_TYPE_INT, {.i64 = 48000}, 1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
-    { "channels",    "", offsetof(AlsaData, channels),    AV_OPT_TYPE_INT, {.i64 = 2},     1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
+    { "ch_layout",   "", offsetof(AlsaData, ch_layout),   AV_OPT_TYPE_CHLAYOUT, {.str = "2C"}, INT_MIN, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
 
@@ -157,14 +162,14 @@ static const AVClass alsa_demuxer_class = {
     .category       = AV_CLASS_CATEGORY_DEVICE_AUDIO_INPUT,
 };
 
-const AVInputFormat ff_alsa_demuxer = {
-    .name           = "alsa",
-    .long_name      = NULL_IF_CONFIG_SMALL("ALSA audio input"),
+const FFInputFormat ff_alsa_demuxer = {
+    .p.name         = "alsa",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("ALSA audio input"),
+    .p.flags        = AVFMT_NOFILE,
+    .p.priv_class   = &alsa_demuxer_class,
     .priv_data_size = sizeof(AlsaData),
     .read_header    = audio_read_header,
     .read_packet    = audio_read_packet,
     .read_close     = ff_alsa_close,
     .get_device_list = audio_get_device_list,
-    .flags          = AVFMT_NOFILE,
-    .priv_class     = &alsa_demuxer_class,
 };

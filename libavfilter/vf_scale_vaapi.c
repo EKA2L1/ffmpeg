@@ -22,8 +22,7 @@
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "scale_eval.h"
 #include "video.h"
 #include "vaapi_vpp.h"
@@ -40,6 +39,7 @@ typedef struct ScaleVAAPIContext {
 
     int force_original_aspect_ratio;
     int force_divisible_by;
+    int reset_sar;
 
     char *colour_primaries_string;
     char *colour_transfer_string;
@@ -74,6 +74,7 @@ static int scale_vaapi_config_output(AVFilterLink *outlink)
     AVFilterContext *avctx   = outlink->src;
     VAAPIVPPContext *vpp_ctx = avctx->priv;
     ScaleVAAPIContext *ctx   = avctx->priv;
+    double w_adj = 1.0;
     int err;
 
     if ((err = ff_scale_eval_dimensions(ctx,
@@ -82,14 +83,33 @@ static int scale_vaapi_config_output(AVFilterLink *outlink)
                                         &vpp_ctx->output_width, &vpp_ctx->output_height)) < 0)
         return err;
 
-    ff_scale_adjust_dimensions(inlink, &vpp_ctx->output_width, &vpp_ctx->output_height,
-                               ctx->force_original_aspect_ratio, ctx->force_divisible_by);
+    if (ctx->reset_sar)
+        w_adj = inlink->sample_aspect_ratio.num ?
+        (double)inlink->sample_aspect_ratio.num / inlink->sample_aspect_ratio.den : 1;
+
+    err = ff_scale_adjust_dimensions(inlink, &vpp_ctx->output_width, &vpp_ctx->output_height,
+                                     ctx->force_original_aspect_ratio,
+                                     ctx->force_divisible_by, w_adj);
+    if (err < 0)
+        return err;
+
+    if (inlink->w == vpp_ctx->output_width && inlink->h == vpp_ctx->output_height &&
+        (vpp_ctx->input_frames->sw_format == vpp_ctx->output_format ||
+         vpp_ctx->output_format == AV_PIX_FMT_NONE) &&
+        ctx->colour_primaries == AVCOL_PRI_UNSPECIFIED &&
+        ctx->colour_transfer == AVCOL_TRC_UNSPECIFIED &&
+        ctx->colour_matrix == AVCOL_SPC_UNSPECIFIED &&
+        ctx->colour_range == AVCOL_RANGE_UNSPECIFIED &&
+        ctx->chroma_location == AVCHROMA_LOC_UNSPECIFIED)
+        vpp_ctx->passthrough = 1;
 
     err = ff_vaapi_vpp_config_output(outlink);
     if (err < 0)
         return err;
 
-    if (inlink->sample_aspect_ratio.num)
+    if (ctx->reset_sar)
+        outlink->sample_aspect_ratio = (AVRational){1, 1};
+    else if (inlink->sample_aspect_ratio.num)
         outlink->sample_aspect_ratio = av_mul_q((AVRational){outlink->h * inlink->w, outlink->w * inlink->h}, inlink->sample_aspect_ratio);
     else
         outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
@@ -111,6 +131,9 @@ static int scale_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame)
            av_get_pix_fmt_name(input_frame->format),
            input_frame->width, input_frame->height, input_frame->pts);
 
+   if (vpp_ctx->passthrough)
+       return ff_filter_frame(outlink, input_frame);
+
     if (vpp_ctx->va_context == VA_INVALID_ID)
         return AVERROR(EINVAL);
 
@@ -124,6 +147,12 @@ static int scale_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame)
     err = av_frame_copy_props(output_frame, input_frame);
     if (err < 0)
         goto fail;
+
+    if (output_frame->width != input_frame->width || output_frame->height != input_frame->height) {
+        av_frame_side_data_remove_by_props(&output_frame->side_data,
+                                           &output_frame->nb_side_data,
+                                           AV_SIDE_DATA_PROP_SIZE_DEPENDENT);
+    }
 
     if (ctx->colour_primaries != AVCOL_PRI_UNSPECIFIED)
         output_frame->color_primaries = ctx->colour_primaries;
@@ -213,34 +242,34 @@ static const AVOption scale_vaapi_options[] = {
       OFFSET(output_format_string), AV_OPT_TYPE_STRING, .flags = FLAGS },
     { "mode", "Scaling mode",
       OFFSET(mode), AV_OPT_TYPE_INT, { .i64 = VA_FILTER_SCALING_HQ },
-      0, VA_FILTER_SCALING_NL_ANAMORPHIC, FLAGS, "mode" },
+      0, VA_FILTER_SCALING_NL_ANAMORPHIC, FLAGS, .unit = "mode" },
         { "default", "Use the default (depend on the driver) scaling algorithm",
-          0, AV_OPT_TYPE_CONST, { .i64 = VA_FILTER_SCALING_DEFAULT }, 0, 0, FLAGS, "mode" },
+          0, AV_OPT_TYPE_CONST, { .i64 = VA_FILTER_SCALING_DEFAULT }, 0, 0, FLAGS, .unit = "mode" },
         { "fast", "Use fast scaling algorithm",
-          0, AV_OPT_TYPE_CONST, { .i64 = VA_FILTER_SCALING_FAST }, 0, 0, FLAGS, "mode" },
+          0, AV_OPT_TYPE_CONST, { .i64 = VA_FILTER_SCALING_FAST }, 0, 0, FLAGS, .unit = "mode" },
         { "hq", "Use high quality scaling algorithm",
-          0, AV_OPT_TYPE_CONST, { .i64 = VA_FILTER_SCALING_HQ }, 0, 0, FLAGS,  "mode" },
+          0, AV_OPT_TYPE_CONST, { .i64 = VA_FILTER_SCALING_HQ }, 0, 0, FLAGS,  .unit = "mode" },
         { "nl_anamorphic", "Use nolinear anamorphic scaling algorithm",
-          0, AV_OPT_TYPE_CONST, { .i64 = VA_FILTER_SCALING_NL_ANAMORPHIC }, 0, 0, FLAGS,  "mode" },
+          0, AV_OPT_TYPE_CONST, { .i64 = VA_FILTER_SCALING_NL_ANAMORPHIC }, 0, 0, FLAGS,  .unit = "mode" },
 
     // These colour properties match the ones of the same name in vf_scale.
     { "out_color_matrix", "Output colour matrix coefficient set",
       OFFSET(colour_matrix_string), AV_OPT_TYPE_STRING, { .str = NULL }, .flags = FLAGS },
     { "out_range", "Output colour range",
       OFFSET(colour_range), AV_OPT_TYPE_INT, { .i64 = AVCOL_RANGE_UNSPECIFIED },
-      AVCOL_RANGE_UNSPECIFIED, AVCOL_RANGE_JPEG, FLAGS, "range" },
+      AVCOL_RANGE_UNSPECIFIED, AVCOL_RANGE_JPEG, FLAGS, .unit = "range" },
     { "full",    "Full range",
-      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, "range" },
+      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, .unit = "range" },
     { "limited", "Limited range",
-      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG }, 0, 0, FLAGS, "range" },
+      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG }, 0, 0, FLAGS, .unit = "range" },
     { "jpeg",    "Full range",
-      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, "range" },
+      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, .unit = "range" },
     { "mpeg",    "Limited range",
-      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG }, 0, 0, FLAGS, "range" },
+      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG }, 0, 0, FLAGS, .unit = "range" },
     { "tv",      "Limited range",
-      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG }, 0, 0, FLAGS, "range" },
+      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG }, 0, 0, FLAGS, .unit = "range" },
     { "pc",      "Full range",
-      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, "range" },
+      0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG }, 0, 0, FLAGS, .unit = "range" },
     // These colour properties are new here.
     { "out_color_primaries", "Output colour primaries",
       OFFSET(colour_primaries_string), AV_OPT_TYPE_STRING,
@@ -251,11 +280,12 @@ static const AVOption scale_vaapi_options[] = {
     { "out_chroma_location", "Output chroma sample location",
       OFFSET(chroma_location_string),  AV_OPT_TYPE_STRING,
       { .str = NULL }, .flags = FLAGS },
-    { "force_original_aspect_ratio", "decrease or increase w/h if necessary to keep the original AR", OFFSET(force_original_aspect_ratio), AV_OPT_TYPE_INT, { .i64 = 0}, 0, 2, FLAGS, "force_oar" },
-    { "disable",  NULL, 0, AV_OPT_TYPE_CONST, {.i64 = 0 }, 0, 0, FLAGS, "force_oar" },
-    { "decrease", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = 1 }, 0, 0, FLAGS, "force_oar" },
-    { "increase", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = 2 }, 0, 0, FLAGS, "force_oar" },
+    { "force_original_aspect_ratio", "decrease or increase w/h if necessary to keep the original AR", OFFSET(force_original_aspect_ratio), AV_OPT_TYPE_INT, { .i64 = 0}, 0, SCALE_FORCE_OAR_NB-1, FLAGS, .unit = "force_oar" },
+    { "disable",  NULL, 0, AV_OPT_TYPE_CONST, {.i64 = SCALE_FORCE_OAR_DISABLE  }, 0, 0, FLAGS, .unit = "force_oar" },
+    { "decrease", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = SCALE_FORCE_OAR_DECREASE }, 0, 0, FLAGS, .unit = "force_oar" },
+    { "increase", NULL, 0, AV_OPT_TYPE_CONST, {.i64 = SCALE_FORCE_OAR_INCREASE }, 0, 0, FLAGS, .unit = "force_oar" },
     { "force_divisible_by", "enforce that the output resolution is divisible by a defined integer when force_original_aspect_ratio is used", OFFSET(force_divisible_by), AV_OPT_TYPE_INT, { .i64 = 1}, 1, 256, FLAGS },
+    { "reset_sar", "reset SAR to 1 and scale to square pixels if scaling proportionally", OFFSET(reset_sar), AV_OPT_TYPE_BOOL, { .i64 = 0}, 0, 1, FLAGS },
 
     { NULL },
 };
@@ -279,15 +309,15 @@ static const AVFilterPad scale_vaapi_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_scale_vaapi = {
-    .name          = "scale_vaapi",
-    .description   = NULL_IF_CONFIG_SMALL("Scale to/from VAAPI surfaces."),
+const FFFilter ff_vf_scale_vaapi = {
+    .p.name        = "scale_vaapi",
+    .p.description = NULL_IF_CONFIG_SMALL("Scale to/from VAAPI surfaces."),
+    .p.priv_class  = &scale_vaapi_class,
     .priv_size     = sizeof(ScaleVAAPIContext),
     .init          = &scale_vaapi_init,
     .uninit        = &ff_vaapi_vpp_ctx_uninit,
     FILTER_INPUTS(scale_vaapi_inputs),
     FILTER_OUTPUTS(scale_vaapi_outputs),
-    FILTER_QUERY_FUNC(&ff_vaapi_vpp_query_formats),
-    .priv_class    = &scale_vaapi_class,
+    FILTER_QUERY_FUNC2(&ff_vaapi_vpp_query_formats),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

@@ -21,8 +21,8 @@
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
+#include "filters.h"
 #include "framesync.h"
-#include "internal.h"
 #include "opencl.h"
 #include "opencl_source.h"
 #include "video.h"
@@ -51,7 +51,7 @@ static int overlay_opencl_load(AVFilterContext *avctx,
 {
     OverlayOpenCLContext *ctx = avctx->priv;
     cl_int cle;
-    const char *source = ff_opencl_source_overlay;
+    const char *source = ff_source_overlay_cl;
     const char *kernel;
     const AVPixFmtDescriptor *main_desc, *overlay_desc;
     int err, i, main_planes, overlay_planes;
@@ -310,11 +310,12 @@ static const AVFilterPad overlay_opencl_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_overlay_opencl = {
-    .name            = "overlay_opencl",
-    .description     = NULL_IF_CONFIG_SMALL("Overlay one video on top of another"),
+const FFFilter ff_vf_overlay_opencl = {
+    .p.name          = "overlay_opencl",
+    .p.description   = NULL_IF_CONFIG_SMALL("Overlay one video on top of another"),
+    .p.priv_class    = &overlay_opencl_class,
+    .p.flags         = AVFILTER_FLAG_HWDEVICE,
     .priv_size       = sizeof(OverlayOpenCLContext),
-    .priv_class      = &overlay_opencl_class,
     .init            = &overlay_opencl_init,
     .uninit          = &overlay_opencl_uninit,
     .activate        = &overlay_opencl_activate,

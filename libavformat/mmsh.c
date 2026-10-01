@@ -28,10 +28,10 @@
 #include <string.h>
 #include "libavutil/intreadwrite.h"
 #include "libavutil/avstring.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "internal.h"
+#include "avformat.h"
 #include "mms.h"
-#include "asf.h"
 #include "http.h"
 #include "url.h"
 
@@ -118,7 +118,7 @@ static int read_data_packet(MMSHContext *mmsh, const int len)
     int res;
     if (len > sizeof(mms->in_buffer)) {
         av_log(NULL, AV_LOG_ERROR,
-               "Data packet length %d exceeds the in_buffer size %"SIZE_SPECIFIER"\n",
+               "Data packet length %d exceeds the in_buffer size %zu\n",
                len, sizeof(mms->in_buffer));
         return AVERROR(EIO);
     }
@@ -193,7 +193,7 @@ static int get_http_header_data(MMSHContext *mmsh)
             if (len) {
                 if (len > sizeof(mms->in_buffer)) {
                     av_log(NULL, AV_LOG_ERROR,
-                           "Other packet len = %d exceed the in_buffer size %"SIZE_SPECIFIER"\n",
+                           "Other packet len = %d exceed the in_buffer size %zu\n",
                            len, sizeof(mms->in_buffer));
                     return AVERROR(EIO);
                 }
@@ -372,9 +372,10 @@ static int mmsh_read(URLContext *h, uint8_t *buf, int size)
     return res;
 }
 
-static int64_t mmsh_read_seek(URLContext *h, int stream_index,
+static int64_t mmsh_read_seek(void *opaque, int stream_index,
                         int64_t timestamp, int flags)
 {
+    URLContext *h = opaque;
     MMSHContext *mmsh_old = h->priv_data;
     MMSHContext *mmsh     = av_mallocz(sizeof(*mmsh));
     int ret;

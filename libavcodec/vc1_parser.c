@@ -26,10 +26,12 @@
  */
 
 #include "libavutil/attributes.h"
+#include "libavutil/avassert.h"
 #include "parser.h"
+#include "parser_internal.h"
 #include "vc1.h"
 #include "get_bits.h"
-#include "internal.h"
+#include "vc1dsp.h"
 
 /** The maximum number of bytes of a sequence, entry point or
  *  frame header whose values we pay any attention to */
@@ -66,8 +68,9 @@ static void vc1_extract_header(AVCodecParserContext *s, AVCodecContext *avctx,
     GetBitContext gb;
     int ret;
     vpc->v.s.avctx = avctx;
-    vpc->v.parse_only = 1;
-    init_get_bits8(&gb, buf, buf_size);
+    ret = init_get_bits8(&gb, buf, buf_size);
+    av_assert1(ret >= 0); // buf_size is bounded by UNESCAPED_THRESHOLD
+
     switch (vpc->prev_start_code) {
     case VC1_CODE_SEQHDR & 0xFF:
         ff_vc1_decode_sequence_header(avctx, &vpc->v, &gb);
@@ -90,11 +93,10 @@ static void vc1_extract_header(AVCodecParserContext *s, AVCodecContext *avctx,
         else
             s->pict_type = vpc->v.s.pict_type;
 
-        if (avctx->ticks_per_frame > 1){
+        if (vpc->v.broadcast){
             // process pulldown flags
             s->repeat_pict = 1;
             // Pulldown flags are only valid when 'broadcast' has been set.
-            // So ticks_per_frame will be 2
             if (vpc->v.rff){
                 // repeat field
                 s->repeat_pict = 2;
@@ -113,8 +115,6 @@ static void vc1_extract_header(AVCodecParserContext *s, AVCodecContext *avctx,
 
         break;
     }
-    if (avctx->framerate.num)
-        avctx->time_base = av_inv_q(av_mul_q(avctx->framerate, (AVRational){avctx->ticks_per_frame, 1}));
     s->format = vpc->v.chromaformat == 1 ? AV_PIX_FMT_YUV420P
                                          : AV_PIX_FMT_NONE;
     if (avctx->width && avctx->height) {
@@ -180,6 +180,7 @@ static int vc1_parse(AVCodecParserContext *s,
             // start codes if we know it contains a complete frame and
             // we've already unescaped all we need of the frame header
             vc1_extract_header(s, avctx, unesc_buffer, unesc_index);
+            unesc_index = 0;
             break;
         }
         if (unesc_index >= UNESCAPED_THRESHOLD && !start_code_found) {
@@ -216,7 +217,8 @@ static int vc1_parse(AVCodecParserContext *s,
                 if (!pic_found && (b == (VC1_CODE_FRAME & 0xFF) || b == (VC1_CODE_FIELD & 0xFF))) {
                     pic_found = 1;
                 }
-                else if (pic_found && b != (VC1_CODE_FIELD & 0xFF) && b != (VC1_CODE_SLICE & 0xFF)) {
+                else if (pic_found && b != (VC1_CODE_FIELD & 0xFF) && b != (VC1_CODE_SLICE & 0xFF)
+                                   && b != (VC1_CODE_ENDOFSEQ & 0xFF)) {
                     next = i - 4;
                     pic_found = b == (VC1_CODE_FRAME & 0xFF);
                     break;
@@ -261,18 +263,19 @@ static av_cold int vc1_parse_init(AVCodecParserContext *s)
     VC1ParseContext *vpc = s->priv_data;
     vpc->v.s.slice_context_count = 1;
     vpc->v.first_pic_header_flag = 1;
+    vpc->v.parse_only = 1;
     vpc->prev_start_code = 0;
     vpc->bytes_to_skip = 0;
     vpc->unesc_index = 0;
     vpc->search_state = NO_MATCH;
-    ff_vc1_init_common(&vpc->v);
+    ff_vc1dsp_init(&vpc->v.vc1dsp); /* startcode_find_candidate */
     return 0;
 }
 
-const AVCodecParser ff_vc1_parser = {
-    .codec_ids      = { AV_CODEC_ID_VC1 },
+const FFCodecParser ff_vc1_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_VC1),
     .priv_data_size = sizeof(VC1ParseContext),
-    .parser_init    = vc1_parse_init,
-    .parser_parse   = vc1_parse,
-    .parser_close   = ff_parse_close,
+    .init           = vc1_parse_init,
+    .parse          = vc1_parse,
+    .close          = ff_parse_close,
 };

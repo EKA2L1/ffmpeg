@@ -25,12 +25,13 @@
  * Ported from MPlayer libmpcodecs/vf_boxblur.c.
  */
 
-#include "libavutil/avstring.h"
+#include "libavutil/avassert.h"
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 #include "boxblur.h"
 
@@ -55,7 +56,9 @@ static av_cold void uninit(AVFilterContext *ctx)
     av_freep(&s->temp[1]);
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
     AVFilterFormats *formats = NULL;
     int fmt, ret;
@@ -63,13 +66,14 @@ static int query_formats(AVFilterContext *ctx)
     for (fmt = 0; av_pix_fmt_desc_get(fmt); fmt++) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(fmt);
         if (!(desc->flags & (AV_PIX_FMT_FLAG_HWACCEL | AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_PAL)) &&
+            desc->comp[0].depth <= 16 &&
             (desc->flags & AV_PIX_FMT_FLAG_PLANAR || desc->nb_components == 1) &&
             (!(desc->flags & AV_PIX_FMT_FLAG_BE) == !HAVE_BIGENDIAN || desc->comp[0].depth == 8) &&
             (ret = ff_add_format(&formats, fmt)) < 0)
             return ret;
     }
 
-    return ff_set_common_formats(ctx, formats);
+    return ff_set_common_formats2(ctx, cfg_in, cfg_out, formats);
 }
 
 static int config_input(AVFilterLink *inlink)
@@ -161,7 +165,10 @@ static inline void blur(uint8_t *dst, int dst_step, const uint8_t *src, int src_
                         int len, int radius, int pixsize)
 {
     if (pixsize == 1) blur8 (dst, dst_step   , src, src_step   , len, radius);
-    else              blur16((uint16_t*)dst, dst_step>>1, (const uint16_t*)src, src_step>>1, len, radius);
+    else if (pixsize == 2)
+                      blur16((uint16_t*)dst, dst_step>>1, (const uint16_t*)src, src_step>>1, len, radius);
+    else
+        av_assert0(0);
 }
 
 static inline void blur_power(uint8_t *dst, int dst_step, const uint8_t *src, int src_step,
@@ -295,21 +302,14 @@ static const AVFilterPad avfilter_vf_boxblur_inputs[] = {
     },
 };
 
-static const AVFilterPad avfilter_vf_boxblur_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_boxblur = {
-    .name          = "boxblur",
-    .description   = NULL_IF_CONFIG_SMALL("Blur the input."),
+const FFFilter ff_vf_boxblur = {
+    .p.name        = "boxblur",
+    .p.description = NULL_IF_CONFIG_SMALL("Blur the input."),
+    .p.priv_class  = &boxblur_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
     .priv_size     = sizeof(BoxBlurContext),
-    .priv_class    = &boxblur_class,
     .uninit        = uninit,
     FILTER_INPUTS(avfilter_vf_boxblur_inputs),
-    FILTER_OUTPUTS(avfilter_vf_boxblur_outputs),
-    FILTER_QUERY_FUNC(query_formats),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC,
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+    FILTER_QUERY_FUNC2(query_formats),
 };

@@ -24,18 +24,21 @@
  * MPEG Audio decoder
  */
 
+#include "config_components.h"
+
 #include "libavutil/attributes.h"
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/crc.h"
 #include "libavutil/float_dsp.h"
 #include "libavutil/libm.h"
+#include "libavutil/mem.h"
 #include "libavutil/mem_internal.h"
 #include "libavutil/thread.h"
 
 #include "avcodec.h"
+#include "decode.h"
 #include "get_bits.h"
-#include "internal.h"
 #include "mathops.h"
 #include "mpegaudiodsp.h"
 
@@ -90,7 +93,7 @@ typedef struct MPADecodeContext {
     int err_recognition;
     AVCodecContext* avctx;
     MPADSPContext mpadsp;
-    void (*butterflies_float)(float *av_restrict v1, float *av_restrict v2, int len);
+    void (*butterflies_float)(float *restrict v1, float *restrict v2, int len);
     AVFrame *frame;
     uint32_t crc;
 } MPADecodeContext;
@@ -277,10 +280,9 @@ static av_cold void decode_init_static(void)
     ff_mpegaudiodec_common_init_static();
 }
 
-static av_cold int decode_init(AVCodecContext * avctx)
+static av_cold int decode_ctx_init(AVCodecContext *avctx, MPADecodeContext *s)
 {
     static AVOnce init_static_once = AV_ONCE_INIT;
-    MPADecodeContext *s = avctx->priv_data;
 
     s->avctx = avctx;
 
@@ -310,6 +312,11 @@ static av_cold int decode_init(AVCodecContext * avctx)
     ff_thread_once(&init_static_once, decode_init_static);
 
     return 0;
+}
+
+static av_cold int decode_init(AVCodecContext *avctx)
+{
+    return decode_ctx_init(avctx, avctx->priv_data);
 }
 
 #define C3 FIXHR(0.86602540378443864676/2)
@@ -372,13 +379,13 @@ static int handle_crc(MPADecodeContext *s, int sec_len)
         crc_val = av_crc(crc_tab, crc_val, &buf[6], sec_byte_len);
 
         AV_WB32(tmp_buf,
-                ((buf[6 + sec_byte_len] & (0xFF00 >> sec_rem_bits)) << 24) +
+                ((buf[6 + sec_byte_len] & (0xFF00U >> sec_rem_bits)) << 24) +
                 ((s->crc << 16) >> sec_rem_bits));
 
         crc_val = av_crc(crc_tab, crc_val, tmp_buf, 3);
 
         if (crc_val) {
-            av_log(s->avctx, AV_LOG_ERROR, "CRC mismatch %X!\n", crc_val);
+            av_log(s->avctx, AV_LOG_ERROR, "CRC mismatch %"PRIX32"!\n", crc_val);
             if (s->err_recognition & AV_EF_EXPLODE)
                 return AVERROR_INVALIDDATA;
         }
@@ -758,6 +765,7 @@ static int huffman_decode(MPADecodeContext *s, GranuleDef *g,
     /* low frequencies (called big values) */
     s_index = 0;
     for (i = 0; i < 3; i++) {
+        const VLCElem *vlctab;
         int j, k, l, linbits;
         j = g->region_size[i];
         if (j == 0)
@@ -766,13 +774,13 @@ static int huffman_decode(MPADecodeContext *s, GranuleDef *g,
         k       = g->table_select[i];
         l       = ff_mpa_huff_data[k][0];
         linbits = ff_mpa_huff_data[k][1];
-        vlc     = &ff_huff_vlc[l];
 
         if (!l) {
             memset(&g->sb_hybrid[s_index], 0, sizeof(*g->sb_hybrid) * 2 * j);
             s_index += 2 * j;
             continue;
         }
+        vlctab  = ff_huff_vlc[l];
 
         /* read huffcode and compute each couple */
         for (; j > 0; j--) {
@@ -785,7 +793,7 @@ static int huffman_decode(MPADecodeContext *s, GranuleDef *g,
                 if (pos >= end_pos)
                     break;
             }
-            y = get_vlc2(&s->gb, vlc->table, 7, 3);
+            y = get_vlc2(&s->gb, vlctab, 7, 3);
 
             if (!y) {
                 g->sb_hybrid[s_index    ] =
@@ -1481,6 +1489,7 @@ static int mp_decode_frame(MPADecodeContext *s, OUT_INT **samples,
         break;
     case 3:
         s->avctx->frame_size = s->lsf ? 576 : 1152;
+        av_fallthrough;
     default:
         nb_frames = mp_decode_layer3(s);
 
@@ -1546,8 +1555,8 @@ static int mp_decode_frame(MPADecodeContext *s, OUT_INT **samples,
     return nb_frames * 32 * sizeof(OUT_INT) * s->nb_channels;
 }
 
-static int decode_frame(AVCodecContext * avctx, void *data, int *got_frame_ptr,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *frame,
+                        int *got_frame_ptr, AVPacket *avpkt)
 {
     const uint8_t *buf  = avpkt->data;
     int buf_size        = avpkt->size;
@@ -1580,8 +1589,9 @@ static int decode_frame(AVCodecContext * avctx, void *data, int *got_frame_ptr,
         return AVERROR_INVALIDDATA;
     }
     /* update codec info */
-    avctx->channels       = s->nb_channels;
-    avctx->channel_layout = s->nb_channels == 1 ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout = s->nb_channels == 1 ? (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO :
+                                             (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
     if (!avctx->bit_rate)
         avctx->bit_rate = s->bit_rate;
 
@@ -1593,13 +1603,14 @@ static int decode_frame(AVCodecContext * avctx, void *data, int *got_frame_ptr,
         buf_size= s->frame_size;
     }
 
-    s->frame = data;
+    s->frame = frame;
 
     ret = mp_decode_frame(s, NULL, buf, buf_size);
     if (ret >= 0) {
         s->frame->nb_samples = avctx->frame_size;
         *got_frame_ptr       = 1;
-        avctx->sample_rate   = s->sample_rate;
+        if (avctx->codec_id != AV_CODEC_ID_AHX)
+            avctx->sample_rate = s->sample_rate;
         //FIXME maybe move the other codec info stuff from above here too
     } else {
         av_log(avctx, AV_LOG_ERROR, "Error while decoding MPEG audio frame.\n");
@@ -1616,7 +1627,7 @@ static int decode_frame(AVCodecContext * avctx, void *data, int *got_frame_ptr,
     return buf_size + skipped;
 }
 
-static void mp_flush(MPADecodeContext *ctx)
+static av_cold void mp_flush(MPADecodeContext *ctx)
 {
     memset(ctx->synth_buf, 0, sizeof(ctx->synth_buf));
     memset(ctx->mdct_buf, 0, sizeof(ctx->mdct_buf));
@@ -1624,13 +1635,13 @@ static void mp_flush(MPADecodeContext *ctx)
     ctx->dither_state = 0;
 }
 
-static void flush(AVCodecContext *avctx)
+static av_cold void flush(AVCodecContext *avctx)
 {
     mp_flush(avctx->priv_data);
 }
 
 #if CONFIG_MP3ADU_DECODER || CONFIG_MP3ADUFLOAT_DECODER
-static int decode_frame_adu(AVCodecContext *avctx, void *data,
+static int decode_frame_adu(AVCodecContext *avctx, AVFrame *frame,
                             int *got_frame_ptr, AVPacket *avpkt)
 {
     const uint8_t *buf  = avpkt->data;
@@ -1661,14 +1672,15 @@ static int decode_frame_adu(AVCodecContext *avctx, void *data,
     }
     /* update codec info */
     avctx->sample_rate = s->sample_rate;
-    avctx->channels    = s->nb_channels;
-    avctx->channel_layout = s->nb_channels == 1 ? AV_CH_LAYOUT_MONO : AV_CH_LAYOUT_STEREO;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout = s->nb_channels == 1 ? (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO :
+                                             (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
     if (!avctx->bit_rate)
         avctx->bit_rate = s->bit_rate;
 
     s->frame_size = len;
 
-    s->frame = data;
+    s->frame = frame;
 
     ret = mp_decode_frame(s, NULL, buf, buf_size);
     if (ret < 0) {
@@ -1728,10 +1740,8 @@ static const int16_t chan_layout[8] = {
 static av_cold int decode_close_mp3on4(AVCodecContext * avctx)
 {
     MP3On4DecodeContext *s = avctx->priv_data;
-    int i;
 
-    for (i = 0; i < s->frames; i++)
-        av_freep(&s->mp3decctx[i]);
+    av_freep(&s->mp3decctx[0]);
 
     return 0;
 }
@@ -1756,28 +1766,22 @@ static av_cold int decode_init_mp3on4(AVCodecContext * avctx)
     }
     s->frames             = mp3Frames[cfg.chan_config];
     s->coff               = chan_offset[cfg.chan_config];
-    avctx->channels       = ff_mpeg4audio_channels[cfg.chan_config];
-    avctx->channel_layout = chan_layout[cfg.chan_config];
+    av_channel_layout_uninit(&avctx->ch_layout);
+    av_channel_layout_from_mask(&avctx->ch_layout, chan_layout[cfg.chan_config]);
 
     if (cfg.sample_rate < 16000)
         s->syncword = 0xffe00000;
     else
         s->syncword = 0xfff00000;
 
-    /* Init the first mp3 decoder in standard way, so that all tables get builded
-     * We replace avctx->priv_data with the context of the first decoder so that
-     * decode_init() does not have to be changed.
+    /* Init the first mp3 decoder in standard way, so that all tables get built
      * Other decoders will be initialized here copying data from the first context
      */
-    // Allocate zeroed memory for the first decoder context
-    s->mp3decctx[0] = av_mallocz(sizeof(MPADecodeContext));
+    // Allocate zeroed memory for the decoder contexts
+    s->mp3decctx[0] = av_calloc(s->frames, sizeof(*s->mp3decctx[0]));
     if (!s->mp3decctx[0])
         return AVERROR(ENOMEM);
-    // Put decoder context in place to make init_decode() happy
-    avctx->priv_data = s->mp3decctx[0];
-    ret = decode_init(avctx);
-    // Restore mp3on4 context pointer
-    avctx->priv_data = s;
+    ret = decode_ctx_init(avctx, s->mp3decctx[0]);
     if (ret < 0)
         return ret;
     s->mp3decctx[0]->adu_mode = 1; // Set adu mode
@@ -1786,20 +1790,20 @@ static av_cold int decode_init_mp3on4(AVCodecContext * avctx)
      * Each frame is 1 or 2 channels - up to 5 frames allowed
      */
     for (i = 1; i < s->frames; i++) {
-        s->mp3decctx[i] = av_mallocz(sizeof(MPADecodeContext));
-        if (!s->mp3decctx[i])
-            return AVERROR(ENOMEM);
+        s->mp3decctx[i] = s->mp3decctx[0] + i;
         s->mp3decctx[i]->adu_mode = 1;
         s->mp3decctx[i]->avctx = avctx;
         s->mp3decctx[i]->mpadsp = s->mp3decctx[0]->mpadsp;
+#if USE_FLOATS
         s->mp3decctx[i]->butterflies_float = s->mp3decctx[0]->butterflies_float;
+#endif
     }
 
     return 0;
 }
 
 
-static void flush_mp3on4(AVCodecContext *avctx)
+static av_cold void flush_mp3on4(AVCodecContext *avctx)
 {
     int i;
     MP3On4DecodeContext *s = avctx->priv_data;
@@ -1809,10 +1813,9 @@ static void flush_mp3on4(AVCodecContext *avctx)
 }
 
 
-static int decode_frame_mp3on4(AVCodecContext *avctx, void *data,
+static int decode_frame_mp3on4(AVCodecContext *avctx, AVFrame *frame,
                                int *got_frame_ptr, AVPacket *avpkt)
 {
-    AVFrame *frame         = data;
     const uint8_t *buf     = avpkt->data;
     int buf_size           = avpkt->size;
     MP3On4DecodeContext *s = avctx->priv_data;
@@ -1854,8 +1857,8 @@ static int decode_frame_mp3on4(AVCodecContext *avctx, void *data,
             return AVERROR_INVALIDDATA;
         }
 
-        if (ch + m->nb_channels > avctx->channels ||
-            s->coff[fr] + m->nb_channels > avctx->channels) {
+        if (ch + m->nb_channels > avctx->ch_layout.nb_channels ||
+            s->coff[fr] + m->nb_channels > avctx->ch_layout.nb_channels) {
             av_log(avctx, AV_LOG_ERROR, "frame channel count exceeds codec "
                                         "channel count\n");
             return AVERROR_INVALIDDATA;
@@ -1880,7 +1883,7 @@ static int decode_frame_mp3on4(AVCodecContext *avctx, void *data,
 
         avctx->bit_rate += m->bit_rate;
     }
-    if (ch != avctx->channels) {
+    if (ch != avctx->ch_layout.nb_channels) {
         av_log(avctx, AV_LOG_ERROR, "failed to decode all channels\n");
         return AVERROR_INVALIDDATA;
     }
@@ -1888,7 +1891,7 @@ static int decode_frame_mp3on4(AVCodecContext *avctx, void *data,
     /* update codec info */
     avctx->sample_rate = s->mp3decctx[0]->sample_rate;
 
-    frame->nb_samples = out_size / (avctx->channels * sizeof(OUT_INT));
+    frame->nb_samples = out_size / (avctx->ch_layout.nb_channels * sizeof(OUT_INT));
     *got_frame_ptr    = 1;
 
     return buf_size;

@@ -23,6 +23,7 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 static int dfa_probe(const AVProbeData *p)
@@ -88,7 +89,7 @@ static int dfa_read_packet(AVFormatContext *s, AVPacket *pkt)
         return AVERROR_EOF;
 
     if (av_get_packet(pb, pkt, 12) != 12)
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     while (!avio_feof(pb)) {
         if (!first) {
             ret = av_append_packet(pb, pkt, 12);
@@ -100,7 +101,7 @@ static int dfa_read_packet(AVFormatContext *s, AVPacket *pkt)
         frame_size = AV_RL32(pkt->data + pkt->size - 8);
         if (frame_size > INT_MAX - 4) {
             av_log(s, AV_LOG_ERROR, "Too large chunk size: %"PRIu32"\n", frame_size);
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         }
         if (AV_RL32(pkt->data + pkt->size - 12) == MKTAG('E', 'O', 'F', 'R')) {
             if (frame_size) {
@@ -120,11 +121,11 @@ static int dfa_read_packet(AVFormatContext *s, AVPacket *pkt)
     return 0;
 }
 
-const AVInputFormat ff_dfa_demuxer = {
-    .name           = "dfa",
-    .long_name      = NULL_IF_CONFIG_SMALL("Chronomaster DFA"),
+const FFInputFormat ff_dfa_demuxer = {
+    .p.name         = "dfa",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Chronomaster DFA"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe     = dfa_probe,
     .read_header    = dfa_read_header,
     .read_packet    = dfa_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
 };

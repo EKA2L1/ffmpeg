@@ -20,8 +20,8 @@
  */
 
 
-#include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
 #include "avformat.h"
@@ -70,8 +70,14 @@ static const AVOption options[] = {
 
 static void cat_header(AVBPrint *bp, const char key[], const char value[])
 {
-    if (NOT_EMPTY(value))
+    if (NOT_EMPTY(value)) {
+        if (strpbrk(value, "\r\n")) {
+            av_log(NULL, AV_LOG_ERROR,
+                   "Refusing to send '%s' header: value contains CR/LF\n", key);
+            return;
+        }
         av_bprintf(bp, "%s: %s\r\n", key, value);
+    }
 }
 
 static int icecast_close(URLContext *h)

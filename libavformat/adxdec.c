@@ -25,12 +25,15 @@
 
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
+#include "rawdec.h"
 
 #define BLOCK_SIZE    18
 #define BLOCK_SAMPLES 32
 
 typedef struct ADXDemuxerContext {
+    FFRawDemuxerContext rawctx;
     int header_size;
 } ADXDemuxerContext;
 
@@ -53,15 +56,13 @@ static int adx_read_packet(AVFormatContext *s, AVPacket *pkt)
     AVCodecParameters *par = s->streams[0]->codecpar;
     int ret, size;
 
+    if (par->codec_id == AV_CODEC_ID_AHX)
+        return ff_raw_read_partial_packet(s, pkt);
+
     if (avio_feof(s->pb))
         return AVERROR_EOF;
 
-    if (par->channels <= 0) {
-        av_log(s, AV_LOG_ERROR, "invalid number of channels %d\n", par->channels);
-        return AVERROR_INVALIDDATA;
-    }
-
-    size = BLOCK_SIZE * par->channels;
+    size = BLOCK_SIZE * par->ch_layout.nb_channels;
 
     pkt->pos = avio_tell(s->pb);
     pkt->stream_index = 0;
@@ -74,13 +75,13 @@ static int adx_read_packet(AVFormatContext *s, AVPacket *pkt)
         av_shrink_packet(pkt, size);
         pkt->flags &= ~AV_PKT_FLAG_CORRUPT;
     } else if (ret < size) {
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     } else {
         size = ret;
     }
 
-    pkt->duration = size / (BLOCK_SIZE * par->channels);
-    pkt->pts      = (pkt->pos - c->header_size) / (BLOCK_SIZE * par->channels);
+    pkt->duration = size / (BLOCK_SIZE * par->ch_layout.nb_channels);
+    pkt->pts      = (pkt->pos - c->header_size) / (BLOCK_SIZE * par->ch_layout.nb_channels);
 
     return 0;
 }
@@ -89,7 +90,10 @@ static int adx_read_header(AVFormatContext *s)
 {
     ADXDemuxerContext *c = s->priv_data;
     AVCodecParameters *par;
+    FFStream *sti;
     int ret;
+    int channels;
+
     AVStream *st = avformat_new_stream(s, NULL);
     if (!st)
         return AVERROR(ENOMEM);
@@ -107,11 +111,11 @@ static int adx_read_header(AVFormatContext *s)
         av_log(s, AV_LOG_ERROR, "Invalid extradata size.\n");
         return AVERROR_INVALIDDATA;
     }
-    par->channels    = AV_RB8 (par->extradata + 7);
+    channels = AV_RB8 (par->extradata + 7);
     par->sample_rate = AV_RB32(par->extradata + 8);
 
-    if (par->channels <= 0) {
-        av_log(s, AV_LOG_ERROR, "invalid number of channels %d\n", par->channels);
+    if (channels <= 0) {
+        av_log(s, AV_LOG_ERROR, "invalid number of channels %d\n", channels);
         return AVERROR_INVALIDDATA;
     }
 
@@ -120,23 +124,37 @@ static int adx_read_header(AVFormatContext *s)
         return AVERROR_INVALIDDATA;
     }
 
+    sti = ffstream(st);
+    par->ch_layout.nb_channels = channels;
     par->codec_type  = AVMEDIA_TYPE_AUDIO;
-    par->codec_id    = s->iformat->raw_codec_id;
-    par->bit_rate    = (int64_t)par->sample_rate * par->channels * BLOCK_SIZE * 8LL / BLOCK_SAMPLES;
-
-    avpriv_set_pts_info(st, 64, BLOCK_SAMPLES, par->sample_rate);
+    switch (par->extradata[4]) {
+    case 3:
+        sti->need_parsing = AVSTREAM_PARSE_FULL_RAW;
+        par->codec_id = AV_CODEC_ID_ADPCM_ADX;
+        par->bit_rate    = (int64_t)par->sample_rate * par->ch_layout.nb_channels * BLOCK_SIZE * 8LL / BLOCK_SAMPLES;
+        avpriv_set_pts_info(st, 64, BLOCK_SAMPLES, par->sample_rate);
+        break;
+    case 16:
+        sti->need_parsing = AVSTREAM_PARSE_FULL_RAW;
+        par->codec_id = AV_CODEC_ID_AHX;
+        avpriv_set_pts_info(st, 64, 1, par->sample_rate);
+        break;
+    default:
+        av_log(s, AV_LOG_ERROR, "Unsupported format: %d\n", par->extradata[4]);
+        return AVERROR_INVALIDDATA;
+    }
 
     return 0;
 }
 
-const AVInputFormat ff_adx_demuxer = {
-    .name           = "adx",
-    .long_name      = NULL_IF_CONFIG_SMALL("CRI ADX"),
+const FFInputFormat ff_adx_demuxer = {
+    .p.name         = "adx",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("CRI ADX"),
+    .p.extensions   = "adx",
+    .p.priv_class   = &ff_raw_demuxer_class,
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe     = adx_probe,
     .priv_data_size = sizeof(ADXDemuxerContext),
     .read_header    = adx_read_header,
     .read_packet    = adx_read_packet,
-    .extensions     = "adx",
-    .raw_codec_id   = AV_CODEC_ID_ADPCM_ADX,
-    .flags          = AVFMT_GENERIC_INDEX,
 };

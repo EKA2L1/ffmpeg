@@ -28,12 +28,10 @@
 #include <float.h>
 #include <math.h>
 
-#include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "libswscale/swscale.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 #include <lensfun.h>
@@ -73,7 +71,7 @@ typedef struct DistortionCorrectionThreadData {
 
 typedef struct LensfunContext {
     const AVClass *class;
-    const char *make, *model, *lens_model;
+    const char *make, *model, *lens_model, *db_path;
     int mode;
     float focal_length;
     float aperture;
@@ -97,32 +95,33 @@ static const AVOption lensfun_options[] = {
     { "make", "set camera maker", OFFSET(make), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
     { "model", "set camera model", OFFSET(model), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
     { "lens_model", "set lens model", OFFSET(lens_model), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
-    { "mode", "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=GEOMETRY_DISTORTION}, 0, VIGNETTING | GEOMETRY_DISTORTION | SUBPIXEL_DISTORTION, FLAGS, "mode" },
-        { "vignetting", "fix lens vignetting", 0, AV_OPT_TYPE_CONST, {.i64=VIGNETTING}, 0, 0, FLAGS, "mode" },
-        { "geometry", "correct geometry distortion", 0, AV_OPT_TYPE_CONST, {.i64=GEOMETRY_DISTORTION}, 0, 0, FLAGS, "mode" },
-        { "subpixel", "fix chromatic aberrations", 0, AV_OPT_TYPE_CONST, {.i64=SUBPIXEL_DISTORTION}, 0, 0, FLAGS, "mode" },
-        { "vig_geo", "fix lens vignetting and correct geometry distortion", 0, AV_OPT_TYPE_CONST, {.i64=VIGNETTING | GEOMETRY_DISTORTION}, 0, 0, FLAGS, "mode" },
-        { "vig_subpixel", "fix lens vignetting and chromatic aberrations", 0, AV_OPT_TYPE_CONST, {.i64=VIGNETTING | SUBPIXEL_DISTORTION}, 0, 0, FLAGS, "mode" },
-        { "distortion", "correct geometry distortion and chromatic aberrations", 0, AV_OPT_TYPE_CONST, {.i64=GEOMETRY_DISTORTION | SUBPIXEL_DISTORTION}, 0, 0, FLAGS, "mode" },
-        { "all", NULL, 0, AV_OPT_TYPE_CONST, {.i64=VIGNETTING | GEOMETRY_DISTORTION | SUBPIXEL_DISTORTION}, 0, 0, FLAGS, "mode" },
+    { "db_path", "set path to database", OFFSET(db_path), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS },
+    { "mode", "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=GEOMETRY_DISTORTION}, 0, VIGNETTING | GEOMETRY_DISTORTION | SUBPIXEL_DISTORTION, FLAGS, .unit = "mode" },
+        { "vignetting", "fix lens vignetting", 0, AV_OPT_TYPE_CONST, {.i64=VIGNETTING}, 0, 0, FLAGS, .unit = "mode" },
+        { "geometry", "correct geometry distortion", 0, AV_OPT_TYPE_CONST, {.i64=GEOMETRY_DISTORTION}, 0, 0, FLAGS, .unit = "mode" },
+        { "subpixel", "fix chromatic aberrations", 0, AV_OPT_TYPE_CONST, {.i64=SUBPIXEL_DISTORTION}, 0, 0, FLAGS, .unit = "mode" },
+        { "vig_geo", "fix lens vignetting and correct geometry distortion", 0, AV_OPT_TYPE_CONST, {.i64=VIGNETTING | GEOMETRY_DISTORTION}, 0, 0, FLAGS, .unit = "mode" },
+        { "vig_subpixel", "fix lens vignetting and chromatic aberrations", 0, AV_OPT_TYPE_CONST, {.i64=VIGNETTING | SUBPIXEL_DISTORTION}, 0, 0, FLAGS, .unit = "mode" },
+        { "distortion", "correct geometry distortion and chromatic aberrations", 0, AV_OPT_TYPE_CONST, {.i64=GEOMETRY_DISTORTION | SUBPIXEL_DISTORTION}, 0, 0, FLAGS, .unit = "mode" },
+        { "all", NULL, 0, AV_OPT_TYPE_CONST, {.i64=VIGNETTING | GEOMETRY_DISTORTION | SUBPIXEL_DISTORTION}, 0, 0, FLAGS, .unit = "mode" },
     { "focal_length", "focal length of video (zoom; constant for the duration of the use of this filter)", OFFSET(focal_length), AV_OPT_TYPE_FLOAT, {.dbl=18}, 0.0, DBL_MAX, FLAGS },
     { "aperture", "aperture (constant for the duration of the use of this filter)", OFFSET(aperture), AV_OPT_TYPE_FLOAT, {.dbl=3.5}, 0.0, DBL_MAX, FLAGS },
     { "focus_distance", "focus distance (constant for the duration of the use of this filter)", OFFSET(focus_distance), AV_OPT_TYPE_FLOAT, {.dbl=1000.0f}, 0.0, DBL_MAX, FLAGS },
     { "scale", "scale factor applied after corrections (0.0 means automatic scaling)", OFFSET(scale), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, DBL_MAX, FLAGS },
-    { "target_geometry", "target geometry of the lens correction (only when geometry correction is enabled)", OFFSET(target_geometry), AV_OPT_TYPE_INT, {.i64=LF_RECTILINEAR}, 0, INT_MAX, FLAGS, "lens_geometry" },
-        { "rectilinear", "rectilinear lens (default)", 0, AV_OPT_TYPE_CONST, {.i64=LF_RECTILINEAR}, 0, 0, FLAGS, "lens_geometry" },
-        { "fisheye", "fisheye lens", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE}, 0, 0, FLAGS, "lens_geometry" },
-        { "panoramic", "panoramic (cylindrical)", 0, AV_OPT_TYPE_CONST, {.i64=LF_PANORAMIC}, 0, 0, FLAGS, "lens_geometry" },
-        { "equirectangular", "equirectangular", 0, AV_OPT_TYPE_CONST, {.i64=LF_EQUIRECTANGULAR}, 0, 0, FLAGS, "lens_geometry" },
-        { "fisheye_orthographic", "orthographic fisheye", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE_ORTHOGRAPHIC}, 0, 0, FLAGS, "lens_geometry" },
-        { "fisheye_stereographic", "stereographic fisheye", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE_STEREOGRAPHIC}, 0, 0, FLAGS, "lens_geometry" },
-        { "fisheye_equisolid", "equisolid fisheye", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE_EQUISOLID}, 0, 0, FLAGS, "lens_geometry" },
-        { "fisheye_thoby", "fisheye as measured by thoby", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE_THOBY}, 0, 0, FLAGS, "lens_geometry" },
+    { "target_geometry", "target geometry of the lens correction (only when geometry correction is enabled)", OFFSET(target_geometry), AV_OPT_TYPE_INT, {.i64=LF_RECTILINEAR}, 0, INT_MAX, FLAGS, .unit = "lens_geometry" },
+        { "rectilinear", "rectilinear lens (default)", 0, AV_OPT_TYPE_CONST, {.i64=LF_RECTILINEAR}, 0, 0, FLAGS, .unit = "lens_geometry" },
+        { "fisheye", "fisheye lens", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE}, 0, 0, FLAGS, .unit = "lens_geometry" },
+        { "panoramic", "panoramic (cylindrical)", 0, AV_OPT_TYPE_CONST, {.i64=LF_PANORAMIC}, 0, 0, FLAGS, .unit = "lens_geometry" },
+        { "equirectangular", "equirectangular", 0, AV_OPT_TYPE_CONST, {.i64=LF_EQUIRECTANGULAR}, 0, 0, FLAGS, .unit = "lens_geometry" },
+        { "fisheye_orthographic", "orthographic fisheye", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE_ORTHOGRAPHIC}, 0, 0, FLAGS, .unit = "lens_geometry" },
+        { "fisheye_stereographic", "stereographic fisheye", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE_STEREOGRAPHIC}, 0, 0, FLAGS, .unit = "lens_geometry" },
+        { "fisheye_equisolid", "equisolid fisheye", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE_EQUISOLID}, 0, 0, FLAGS, .unit = "lens_geometry" },
+        { "fisheye_thoby", "fisheye as measured by thoby", 0, AV_OPT_TYPE_CONST, {.i64=LF_FISHEYE_THOBY}, 0, 0, FLAGS, .unit = "lens_geometry" },
     { "reverse", "Does reverse correction (regular image to lens distorted)", OFFSET(reverse), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
-    { "interpolation", "Type of interpolation", OFFSET(interpolation_type), AV_OPT_TYPE_INT, {.i64=LINEAR}, 0, LANCZOS, FLAGS, "interpolation" },
-        { "nearest", NULL, 0, AV_OPT_TYPE_CONST, {.i64=NEAREST}, 0, 0, FLAGS, "interpolation" },
-        { "linear", NULL, 0, AV_OPT_TYPE_CONST, {.i64=LINEAR}, 0, 0, FLAGS, "interpolation" },
-        { "lanczos", NULL, 0, AV_OPT_TYPE_CONST, {.i64=LANCZOS}, 0, 0, FLAGS, "interpolation" },
+    { "interpolation", "Type of interpolation", OFFSET(interpolation_type), AV_OPT_TYPE_INT, {.i64=LINEAR}, 0, LANCZOS, FLAGS, .unit = "interpolation" },
+        { "nearest", NULL, 0, AV_OPT_TYPE_CONST, {.i64=NEAREST}, 0, 0, FLAGS, .unit = "interpolation" },
+        { "linear", NULL, 0, AV_OPT_TYPE_CONST, {.i64=LINEAR}, 0, 0, FLAGS, .unit = "interpolation" },
+        { "lanczos", NULL, 0, AV_OPT_TYPE_CONST, {.i64=LANCZOS}, 0, 0, FLAGS, .unit = "interpolation" },
     { NULL }
 };
 
@@ -136,9 +135,10 @@ static av_cold int init(AVFilterContext *ctx)
     const lfLens **lenses;
 
     db = lf_db_create();
-    if (lf_db_load(db) != LF_NO_ERROR) {
+    if ((lensfun->db_path ? lf_db_load_path(db, lensfun->db_path) : lf_db_load(db)) != LF_NO_ERROR) {
         lf_db_destroy(db);
-        av_log(ctx, AV_LOG_FATAL, "Failed to load lensfun database\n");
+        av_log(ctx, AV_LOG_FATAL, "Failed to load lensfun database from %s path\n",
+               lensfun->db_path ? lensfun->db_path : "default");
         return AVERROR_INVALIDDATA;
     }
 
@@ -284,8 +284,8 @@ static int config_props(AVFilterLink *inlink)
 static int vignetting_filter_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 {
     const VignettingThreadData *thread_data = arg;
-    const int slice_start = thread_data->height *  jobnr      / nb_jobs;
-    const int slice_end   = thread_data->height * (jobnr + 1) / nb_jobs;
+    const int slice_start = ff_slice_pos(thread_data->height, jobnr, nb_jobs);
+    const int slice_end   = ff_slice_pos(thread_data->height, jobnr + 1, nb_jobs);
 
     lf_modifier_apply_color_modification(thread_data->modifier,
                                          thread_data->data_in + slice_start * thread_data->linesize_in,
@@ -307,8 +307,8 @@ static float square(float x)
 static int distortion_correction_filter_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 {
     const DistortionCorrectionThreadData *thread_data = arg;
-    const int slice_start = thread_data->height *  jobnr      / nb_jobs;
-    const int slice_end   = thread_data->height * (jobnr + 1) / nb_jobs;
+    const int slice_start = ff_slice_pos(thread_data->height, jobnr, nb_jobs);
+    const int slice_end   = ff_slice_pos(thread_data->height, jobnr + 1, nb_jobs);
 
     int x, y, i, j, rgb_index;
     float interpolated, new_x, new_y, d, norm;
@@ -441,9 +441,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *out;
     VignettingThreadData vignetting_thread_data;
     DistortionCorrectionThreadData distortion_correction_thread_data;
+    int ret;
 
     if (lensfun->mode & VIGNETTING) {
-        av_frame_make_writable(in);
+        ret = ff_inlink_make_frame_writable(inlink, &in);
+        if (ret < 0) {
+            av_frame_free(&in);
+            return ret;
+        }
 
         vignetting_thread_data = (VignettingThreadData) {
             .width = inlink->w,
@@ -514,22 +519,15 @@ static const AVFilterPad lensfun_inputs[] = {
     },
 };
 
-static const AVFilterPad lensfun_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_lensfun = {
-    .name          = "lensfun",
-    .description   = NULL_IF_CONFIG_SMALL("Apply correction to an image based on info derived from the lensfun database."),
+const FFFilter ff_vf_lensfun = {
+    .p.name        = "lensfun",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply correction to an image based on info derived from the lensfun database."),
+    .p.priv_class  = &lensfun_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(LensfunContext),
     .init          = init,
     .uninit        = uninit,
     FILTER_INPUTS(lensfun_inputs),
-    FILTER_OUTPUTS(lensfun_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_RGB24),
-    .priv_class    = &lensfun_class,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
 };

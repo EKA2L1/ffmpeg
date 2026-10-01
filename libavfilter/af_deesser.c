@@ -21,10 +21,11 @@
  */
 
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avfilter.h"
 #include "audio.h"
-#include "formats.h"
+#include "filters.h"
 
 typedef struct DeesserChannel {
     double s1, s2, s3;
@@ -59,10 +60,10 @@ static const AVOption deesser_options[] = {
     { "i", "set intensity",    OFFSET(intensity), AV_OPT_TYPE_DOUBLE, {.dbl=0.0}, 0.0, 1.0, A },
     { "m", "set max deessing", OFFSET(max),       AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0.0, 1.0, A },
     { "f", "set frequency",    OFFSET(frequency), AV_OPT_TYPE_DOUBLE, {.dbl=0.5}, 0.0, 1.0, A },
-    { "s", "set output mode",  OFFSET(mode),      AV_OPT_TYPE_INT,    {.i64=OUT_MODE}, 0, NB_MODES-1, A, "mode" },
-    {  "i", "input",           0,                 AV_OPT_TYPE_CONST,  {.i64=IN_MODE},  0, 0, A, "mode" },
-    {  "o", "output",          0,                 AV_OPT_TYPE_CONST,  {.i64=OUT_MODE}, 0, 0, A, "mode" },
-    {  "e", "ess",             0,                 AV_OPT_TYPE_CONST,  {.i64=ESS_MODE}, 0, 0, A, "mode" },
+    { "s", "set output mode",  OFFSET(mode),      AV_OPT_TYPE_INT,    {.i64=OUT_MODE}, 0, NB_MODES-1, A, .unit = "mode" },
+    {  "i", "input",           0,                 AV_OPT_TYPE_CONST,  {.i64=IN_MODE},  0, 0, A, .unit = "mode" },
+    {  "o", "output",          0,                 AV_OPT_TYPE_CONST,  {.i64=OUT_MODE}, 0, 0, A, .unit = "mode" },
+    {  "e", "ess",             0,                 AV_OPT_TYPE_CONST,  {.i64=ESS_MODE}, 0, 0, A, .unit = "mode" },
     { NULL }
 };
 
@@ -73,11 +74,11 @@ static int config_input(AVFilterLink *inlink)
     AVFilterContext *ctx = inlink->dst;
     DeesserContext *s = ctx->priv;
 
-    s->chan = av_calloc(inlink->channels, sizeof(*s->chan));
+    s->chan = av_calloc(inlink->ch_layout.nb_channels, sizeof(*s->chan));
     if (!s->chan)
         return AVERROR(ENOMEM);
 
-    for (int i = 0; i < inlink->channels; i++) {
+    for (int i = 0; i < inlink->ch_layout.nb_channels; i++) {
         DeesserChannel *chan = &s->chan[i];
 
         chan->ratioA = chan->ratioB = 1.0;
@@ -104,7 +105,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         av_frame_copy_props(out, in);
     }
 
-    for (int ch = 0; ch < inlink->channels; ch++) {
+    for (int ch = 0; ch < inlink->ch_layout.nb_channels; ch++) {
         DeesserChannel *dec = &s->chan[ch];
         double *src = (double *)in->extended_data[ch];
         double *dst = (double *)out->extended_data[ch];
@@ -193,21 +194,14 @@ static const AVFilterPad inputs[] = {
     },
 };
 
-static const AVFilterPad outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
-const AVFilter ff_af_deesser = {
-    .name          = "deesser",
-    .description   = NULL_IF_CONFIG_SMALL("Apply de-essing to the audio."),
+const FFFilter ff_af_deesser = {
+    .p.name        = "deesser",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply de-essing to the audio."),
+    .p.priv_class  = &deesser_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .priv_size     = sizeof(DeesserContext),
-    .priv_class    = &deesser_class,
     .uninit        = uninit,
     FILTER_INPUTS(inputs),
-    FILTER_OUTPUTS(outputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
     FILTER_SINGLE_SAMPLEFMT(AV_SAMPLE_FMT_DBLP),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
 };

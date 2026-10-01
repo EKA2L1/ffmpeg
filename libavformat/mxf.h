@@ -25,12 +25,12 @@
 #include "libavutil/log.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/rational.h"
+#include "libavutil/uuid.h"
 
-typedef uint8_t UID[16];
+typedef AVUUID UID;
 
 enum MXFMetadataSetType {
-    AnyType,
-    MaterialPackage,
+    MaterialPackage = 1,
     SourcePackage,
     SourceClip,
     TimecodeComponent,
@@ -53,6 +53,9 @@ enum MXFMetadataSetType {
     AudioChannelLabelSubDescriptor,
     SoundfieldGroupLabelSubDescriptor,
     GroupOfSoundfieldGroupsLabelSubDescriptor,
+    FFV1SubDescriptor,
+    JPEG2000SubDescriptor,
+    MetadataSetTypeNB
 };
 
 enum MXFFrameLayout {

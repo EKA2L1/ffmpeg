@@ -17,7 +17,6 @@ MODULES="\
     --disable-programs \
     --disable-network \
     --disable-avfilter \
-    --disable-postproc \
     --disable-encoders \
     --disable-doc \
     --disable-ffplay \

@@ -29,12 +29,13 @@
 #ifndef AVFORMAT_HLS_SAMPLE_ENCRYPTION_H
 #define AVFORMAT_HLS_SAMPLE_ENCRYPTION_H
 
+#include <stddef.h>
 #include <stdint.h>
 
+#include "libavcodec/codec_id.h"
+#include "libavcodec/packet.h"
 #include "avformat.h"
-#include "libavcodec/avcodec.h"
 
-#include "libavutil/aes.h"
 
 #define HLS_MAX_ID3_TAGS_DATA_LEN       138
 #define HLS_MAX_AUDIO_SETUP_DATA_LEN    10
@@ -51,7 +52,7 @@ typedef struct HLSAudioSetupInfo {
     uint16_t            priming;
     uint8_t             version;
     uint8_t             setup_data_length;
-    uint8_t             setup_data[HLS_MAX_AUDIO_SETUP_DATA_LEN];
+    uint8_t             setup_data[HLS_MAX_AUDIO_SETUP_DATA_LEN + AV_INPUT_BUFFER_PADDING_SIZE];
 } HLSAudioSetupInfo;
 
 
@@ -62,4 +63,3 @@ int ff_hls_senc_parse_audio_setup_info(AVStream *st, HLSAudioSetupInfo *info);
 int ff_hls_senc_decrypt_frame(enum AVCodecID codec_id, HLSCryptoContext *crypto_ctx, AVPacket *pkt);
 
 #endif /* AVFORMAT_HLS_SAMPLE_ENCRYPTION_H */
-

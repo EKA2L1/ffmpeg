@@ -2,15 +2,16 @@
 # common bits used by all libraries
 #
 
-DEFAULT_X86ASMD=.dbg
-
-ifeq ($(DBG),1)
-X86ASMD=$(DEFAULT_X86ASMD)
-else
-X86ASMD=
-endif
-
 ifndef SUBDIR
+
+LINK = $(LD) $(1)
+
+ifeq ($(LD),$(CC))
+ifneq ($(CXX),)
+LDXX := $(CXX)
+LINK = $(if $(filter -lstdc++,$(1)),$(LDXX) $(filter-out -lstdc++,$(1)),$(LD) $(1))
+endif
+endif
 
 BIN2CEXE = ffbuild/bin2c$(HOSTEXESUF)
 BIN2C = $(BIN2CEXE)
@@ -18,8 +19,8 @@ BIN2C = $(BIN2CEXE)
 ifndef V
 Q      = @
 ECHO   = printf "$(1)\t%s\n" $(2)
-BRIEF  = CC CXX OBJCC HOSTCC HOSTLD AS X86ASM AR LD STRIP CP WINDRES NVCC BIN2C
-SILENT = DEPCC DEPHOSTCC DEPAS DEPX86ASM RANLIB RM
+BRIEF  = CC CXX OBJCC HOSTCC HOSTLD AS X86ASM AR LD LDXX STRIP CP WINDRES GLSLC NVCC BIN2C METALCC METALLIB
+SILENT = DEPCC DEPCXX DEPHOSTCC DEPAS DEPX86ASM RANLIB RM
 
 MSG    = $@
 M      = @$(call ECHO,$(TAG),$@);
@@ -29,7 +30,8 @@ $(foreach VAR,$(SILENT),$(eval override $(VAR) = @$($(VAR))))
 $(eval INSTALL = @$(call ECHO,INSTALL,$$(^:$(SRC_DIR)/%=%)); $(INSTALL))
 endif
 
-ALLFFLIBS = avcodec avdevice avfilter avformat avutil postproc swscale swresample
+# Prepend to a recursively expanded variable without making it simply expanded.
+PREPEND = $(eval $(1) = $(patsubst %,$$(%), $(2)) $(value $(1)))
 
 # NASM requires -I path terminated with /
 IFLAGS     := -I. -I$(SRC_LINK)/
@@ -39,7 +41,9 @@ CCFLAGS     = $(CPPFLAGS) $(CFLAGS)
 OBJCFLAGS  += $(EOBJCFLAGS)
 OBJCCFLAGS  = $(CPPFLAGS) $(CFLAGS) $(OBJCFLAGS)
 ASFLAGS    := $(CPPFLAGS) $(ASFLAGS)
-CXXFLAGS   := $(CPPFLAGS) $(CFLAGS) $(CXXFLAGS)
+# Use PREPEND here so that later (target-dependent) additions to CPPFLAGS
+# end up in CXXFLAGS.
+$(call PREPEND,CXXFLAGS, CPPFLAGS)
 X86ASMFLAGS += $(IFLAGS:%=%/) -I$(<D)/ -Pconfig.asm
 
 HOSTCCFLAGS = $(IFLAGS) $(HOSTCPPFLAGS) $(HOSTCFLAGS)
@@ -56,6 +60,7 @@ COMPILE_S = $(call COMPILE,AS)
 COMPILE_M = $(call COMPILE,OBJCC)
 COMPILE_X86ASM = $(call COMPILE,X86ASM)
 COMPILE_HOSTC = $(call COMPILE,HOSTCC)
+COMPILE_GLSLC = $(call COMPILE,GLSLC)
 COMPILE_NVCC = $(call COMPILE,NVCC)
 COMPILE_MMI = $(call COMPILE,CC,MMIFLAGS)
 COMPILE_MSA = $(call COMPILE,CC,MSAFLAGS)
@@ -92,10 +97,6 @@ COMPILE_LASX = $(call COMPILE,CC,LASXFLAGS)
 %_host.o: %.c
 	$(COMPILE_HOSTC)
 
-%$(DEFAULT_X86ASMD).asm: %.asm
-	$(DEPX86ASM) $(X86ASMFLAGS) -M -o $@ $< > $(@:.asm=.d)
-	$(X86ASM) $(X86ASMFLAGS) -e $< | sed '/^%/d;/^$$/d;' > $@
-
 %.o: %.asm
 	$(COMPILE_X86ASM)
 	-$(if $(ASMSTRIPFLAGS), $(STRIP) $(ASMSTRIPFLAGS) $@)
@@ -112,6 +113,26 @@ COMPILE_LASX = $(call COMPILE,CC,LASXFLAGS)
 $(BIN2CEXE): ffbuild/bin2c_host.o
 	$(HOSTLD) $(HOSTLDFLAGS) $(HOSTLD_O) $^ $(HOSTEXTRALIBS)
 
+RUN_BIN2C = $(BIN2C) $(patsubst $(SRC_PATH)/%,$(SRC_LINK)/%,$<) $@ $(subst .,_,$(basename $(notdir $@)))
+RUN_GZIP  = $(M)gzip -nc9 $(patsubst $(SRC_PATH)/%,$(SRC_LINK)/%,$<) >$@
+RUN_MINIFY = $(M)sed 's!/\\*.*\\*/!!g' $< | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $$//' > $@
+%.gz: TAG = GZIP
+%.min: TAG = MINIFY
+
+%.spv: %.glsl
+	$(COMPILE_GLSLC)
+
+ifdef CONFIG_SHADER_COMPRESSION
+%.spv.gz: %.spv
+	$(RUN_GZIP)
+
+%.spv.c: %.spv.gz $(BIN2CEXE)
+	$(RUN_BIN2C)
+else
+%.spv.c: %.spv $(BIN2CEXE)
+	$(RUN_BIN2C)
+endif
+
 %.metal.air: %.metal
 	$(METALCC) $< -o $@
 
@@ -119,27 +140,52 @@ $(BIN2CEXE): ffbuild/bin2c_host.o
 	$(METALLIB) --split-module-without-linking $< -o $@
 
 %.metallib.c: %.metallib $(BIN2CEXE)
-	$(BIN2C) $< $@ $(subst .,_,$(basename $(notdir $@)))
+	$(RUN_BIN2C)
 
 %.ptx: %.cu $(SRC_PATH)/compat/cuda/cuda_runtime.h
 	$(COMPILE_NVCC)
 
-ifdef CONFIG_PTX_COMPRESSION
-%.ptx.gz: TAG = GZIP
+ifdef CONFIG_SHADER_COMPRESSION
 %.ptx.gz: %.ptx
-	$(M)gzip -c9 $(patsubst $(SRC_PATH)/%,$(SRC_LINK)/%,$<) >$@
+	$(RUN_GZIP)
 
 %.ptx.c: %.ptx.gz $(BIN2CEXE)
-	$(BIN2C) $(patsubst $(SRC_PATH)/%,$(SRC_LINK)/%,$<) $@ $(subst .,_,$(basename $(notdir $@)))
+	$(RUN_BIN2C)
 else
 %.ptx.c: %.ptx $(BIN2CEXE)
-	$(BIN2C) $(patsubst $(SRC_PATH)/%,$(SRC_LINK)/%,$<) $@ $(subst .,_,$(basename $(notdir $@)))
+	$(RUN_BIN2C)
+endif
+
+%.css.min: %.css
+	$(RUN_MINIFY)
+
+ifdef CONFIG_RESOURCE_COMPRESSION
+
+%.css.min.gz: %.css.min
+	$(RUN_GZIP)
+
+%.css.c: %.css.min.gz $(BIN2CEXE)
+	$(RUN_BIN2C)
+
+%.html.gz: %.html
+	$(RUN_GZIP)
+
+%.html.c: %.html.gz $(BIN2CEXE)
+	$(RUN_BIN2C)
+
+else   # NO COMPRESSION
+
+%.css.c: %.css.min $(BIN2CEXE)
+	$(RUN_BIN2C)
+
+%.html.c: %.html $(BIN2CEXE)
+	$(RUN_BIN2C)
 endif
 
 clean::
-	$(RM) $(BIN2CEXE)
+	$(RM) $(BIN2CEXE) $(CLEANSUFFIXES:%=ffbuild/%)
 
-%.c %.h %.pc %.ver %.version: TAG = GEN
+%.c %.h %.S %.pc %.ver %.version: TAG = GEN
 
 # Dummy rule to stop make trying to rebuild removed or renamed headers
 %.h %_template.c:
@@ -156,7 +202,6 @@ endif
 include $(SRC_PATH)/ffbuild/arch.mak
 
 OBJS      += $(OBJS-yes)
-SLIBOBJS  += $(SLIBOBJS-yes)
 SHLIBOBJS += $(SHLIBOBJS-yes)
 STLIBOBJS += $(STLIBOBJS-yes)
 FFLIBS    := $($(NAME)_FFLIBS) $(FFLIBS-yes) $(FFLIBS)
@@ -166,7 +211,6 @@ LDLIBS       = $(FFLIBS:%=%$(BUILDSUF))
 FFEXTRALIBS := $(LDLIBS:%=$(LD_LIB)) $(foreach lib,EXTRALIBS-$(NAME) $(FFLIBS:%=EXTRALIBS-%),$($(lib))) $(EXTRALIBS)
 
 OBJS      := $(sort $(OBJS:%=$(SUBDIR)%))
-SLIBOBJS  := $(sort $(SLIBOBJS:%=$(SUBDIR)%))
 SHLIBOBJS := $(sort $(SHLIBOBJS:%=$(SUBDIR)%))
 STLIBOBJS := $(sort $(STLIBOBJS:%=$(SUBDIR)%))
 TESTOBJS  := $(TESTOBJS:%=$(SUBDIR)tests/%) $(TESTPROGS:%=$(SUBDIR)tests/%.o)
@@ -187,11 +231,11 @@ ALLHEADERS := $(subst $(SRC_DIR)/,$(SUBDIR),$(wildcard $(SRC_DIR)/*.h $(SRC_DIR)
 SKIPHEADERS += $(ARCH_HEADERS:%=$(ARCH)/%) $(SKIPHEADERS-)
 SKIPHEADERS := $(SKIPHEADERS:%=$(SUBDIR)%)
 HOBJS        = $(filter-out $(SKIPHEADERS:.h=.h.o),$(ALLHEADERS:.h=.h.o))
+SPVOBJS      = $(filter %.spv.o,$(OBJS))
 PTXOBJS      = $(filter %.ptx.o,$(OBJS))
 $(HOBJS):     CCFLAGS += $(CFLAGS_HEADERS)
 checkheaders: $(HOBJS)
-.SECONDARY:   $(HOBJS:.o=.c) $(PTXOBJS:.o=.c) $(PTXOBJS:.o=.gz) $(PTXOBJS:.o=)
-
+.SECONDARY:   $(HOBJS:.o=.c) $(SPVOBJS:.o=.c) $(SPVOBJS:.o=.gz) $(SPVOBJS:.o=) $(PTXOBJS:.o=.c) $(PTXOBJS:.o=.gz) $(PTXOBJS:.o=)
 alltools: $(TOOLS)
 
 $(HOSTOBJS): %.o: %.c
@@ -203,15 +247,14 @@ $(HOSTPROGS): %$(HOSTEXESUF): %.o
 $(OBJS):     | $(sort $(dir $(OBJS)))
 $(HOBJS):    | $(sort $(dir $(HOBJS)))
 $(HOSTOBJS): | $(sort $(dir $(HOSTOBJS)))
-$(SLIBOBJS): | $(sort $(dir $(SLIBOBJS)))
 $(SHLIBOBJS): | $(sort $(dir $(SHLIBOBJS)))
 $(STLIBOBJS): | $(sort $(dir $(STLIBOBJS)))
 $(TESTOBJS): | $(sort $(dir $(TESTOBJS)))
 $(TOOLOBJS): | tools
 
-OUTDIRS := $(OUTDIRS) $(dir $(OBJS) $(HOBJS) $(HOSTOBJS) $(SLIBOBJS) $(SHLIBOBJS) $(STLIBOBJS) $(TESTOBJS))
+OUTDIRS := $(OUTDIRS) $(dir $(OBJS) $(HOBJS) $(HOSTOBJS) $(SHLIBOBJS) $(STLIBOBJS) $(TESTOBJS))
 
-CLEANSUFFIXES     = *.d *.gcda *.gcno *.h.c *.ho *.map *.o *.pc *.ptx *.ptx.gz *.ptx.c *.ver *.version *$(DEFAULT_X86ASMD).asm *~ *.ilk *.pdb
+CLEANSUFFIXES     = *.d *.gcda *.gcno *.h.c *.ho *.map *.o *.objs *.pc *.ptx *.ptx.gz *.ptx.c *.spv *.spv.gz *.spv.c *.gen.asm *.gen.c *.gen.S *.ver *.version *.html.gz *.html.c *.css.min.gz *.css.min *.css.c *~ *.ilk *.pdb
 LIBSUFFIXES       = *.a *.lib *.so *.so.* *.dylib *.dll *.def *.dll.a
 
 define RULES
@@ -221,4 +264,4 @@ endef
 
 $(eval $(RULES))
 
--include $(wildcard $(OBJS:.o=.d) $(HOSTOBJS:.o=.d) $(TESTOBJS:.o=.d) $(HOBJS:.o=.d) $(SHLIBOBJS:.o=.d) $(STLIBOBJS:.o=.d) $(SLIBOBJS:.o=.d)) $(OBJS:.o=$(DEFAULT_X86ASMD).d)
+-include $(wildcard $(OBJS:.o=.d) $(HOSTOBJS:.o=.d) $(TESTOBJS:.o=.d) $(HOBJS:.o=.d) $(SHLIBOBJS:.o=.d) $(STLIBOBJS:.o=.d) $(SPVOBJS:.spv.o=.d))

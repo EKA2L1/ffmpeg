@@ -29,8 +29,11 @@
 
 #include "libavutil/intreadwrite.h"
 #include "libavutil/intfloat.h"
+#include "libavutil/mem.h"
 #include "libavcodec/internal.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 
 #define     RIFF_TAG MKTAG('R', 'I', 'F', 'F')
@@ -190,13 +193,13 @@ static int parse_strk(AVFormatContext *s,
 
     st->codecpar->codec_type            = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_tag             = 0;
-    st->codecpar->channels              = fourxm->tracks[track].channels;
+    st->codecpar->ch_layout.nb_channels = fourxm->tracks[track].channels;
     st->codecpar->sample_rate           = fourxm->tracks[track].sample_rate;
     st->codecpar->bits_per_coded_sample = fourxm->tracks[track].bits;
-    st->codecpar->bit_rate              = (int64_t)st->codecpar->channels *
+    st->codecpar->bit_rate              = (int64_t)st->codecpar->ch_layout.nb_channels *
                                           st->codecpar->sample_rate *
                                           st->codecpar->bits_per_coded_sample;
-    st->codecpar->block_align           = st->codecpar->channels *
+    st->codecpar->block_align           = st->codecpar->ch_layout.nb_channels *
                                           st->codecpar->bits_per_coded_sample;
 
     if (fourxm->tracks[track].adpcm){
@@ -237,9 +240,10 @@ static int fourxm_read_header(AVFormatContext *s)
     header = av_malloc(header_size);
     if (!header)
         return AVERROR(ENOMEM);
-    if (avio_read(pb, header, header_size) != header_size) {
+    ret = ffio_read_size(pb, header, header_size);
+    if (ret < 0) {
         av_free(header);
-        return AVERROR(EIO);
+        return ret;
     }
 
     /* take the lazy approach and search for any and all vtrk and strk chunks */
@@ -310,7 +314,7 @@ static int fourxm_read_packet(AVFormatContext *s,
         fourcc_tag = AV_RL32(&header[0]);
         size       = AV_RL32(&header[4]);
         if (avio_feof(pb))
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         switch (fourcc_tag) {
         case LIST_TAG:
             /* this is a good time to bump the video pts */
@@ -396,11 +400,11 @@ static int fourxm_read_close(AVFormatContext *s)
     return 0;
 }
 
-const AVInputFormat ff_fourxm_demuxer = {
-    .name           = "4xm",
-    .long_name      = NULL_IF_CONFIG_SMALL("4X Technologies"),
+const FFInputFormat ff_fourxm_demuxer = {
+    .p.name         = "4xm",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("4X Technologies"),
     .priv_data_size = sizeof(FourxmDemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = fourxm_probe,
     .read_header    = fourxm_read_header,
     .read_packet    = fourxm_read_packet,

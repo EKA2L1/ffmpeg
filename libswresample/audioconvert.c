@@ -25,9 +25,9 @@
  * @author Michael Niedermayer <michaelni@gmx.at>
  */
 
-#include "libavutil/avstring.h"
 #include "libavutil/avassert.h"
 #include "libavutil/libm.h"
+#include "libavutil/mem.h"
 #include "libavutil/samplefmt.h"
 #include "audioconvert.h"
 
@@ -176,9 +176,13 @@ AudioConvert *swri_audio_convert_alloc(enum AVSampleFormat out_fmt,
         }
     }
 
-    if(HAVE_X86ASM && HAVE_MMX) swri_audio_convert_init_x86(ctx, out_fmt, in_fmt, channels);
-    if(ARCH_ARM)              swri_audio_convert_init_arm(ctx, out_fmt, in_fmt, channels);
-    if(ARCH_AARCH64)          swri_audio_convert_init_aarch64(ctx, out_fmt, in_fmt, channels);
+#if ARCH_X86 && HAVE_X86ASM
+    swri_audio_convert_init_x86(ctx, out_fmt, in_fmt, channels);
+#elif ARCH_ARM
+    swri_audio_convert_init_arm(ctx, out_fmt, in_fmt, channels);
+#elif ARCH_AARCH64
+    swri_audio_convert_init_aarch64(ctx, out_fmt, in_fmt, channels);
+#endif
 
     return ctx;
 }

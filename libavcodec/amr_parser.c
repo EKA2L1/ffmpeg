@@ -28,6 +28,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "parser.h"
+#include "parser_internal.h"
 
 static const uint8_t amrnb_packed_size[16] = {
     13, 14, 16, 18, 20, 21, 27, 32, 6, 1, 1, 1, 1, 1, 1, 1
@@ -63,9 +64,9 @@ static int amr_parse(AVCodecParserContext *s1,
     *poutbuf_size = 0;
     *poutbuf = NULL;
 
-    if (!avctx->channels) {
-        avctx->channels       = 1;
-        avctx->channel_layout = AV_CH_LAYOUT_MONO;
+    if (!avctx->ch_layout.nb_channels) {
+        av_channel_layout_uninit(&avctx->ch_layout);
+        avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     }
 
     if (s1->flags & PARSER_FLAG_COMPLETE_FRAMES) {
@@ -73,7 +74,7 @@ static int amr_parse(AVCodecParserContext *s1,
     } else {
         int ch, offset = 0;
 
-        for (ch = s->current_channel; ch < avctx->channels; ch++) {
+        for (ch = s->current_channel; ch < avctx->ch_layout.nb_channels; ch++) {
             if (s->remaining >= 0) {
                 next = s->remaining;
             } else {
@@ -96,7 +97,7 @@ static int amr_parse(AVCodecParserContext *s1,
             }
         }
 
-        s->current_channel = ch % avctx->channels;
+        s->current_channel = ch % avctx->ch_layout.nb_channels;
         if (s->remaining < 0)
             next = offset;
 
@@ -122,10 +123,10 @@ static int amr_parse(AVCodecParserContext *s1,
     return next;
 }
 
-const AVCodecParser ff_amr_parser = {
-    .codec_ids      = { AV_CODEC_ID_AMR_NB, AV_CODEC_ID_AMR_WB },
+const FFCodecParser ff_amr_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_AMR_NB, AV_CODEC_ID_AMR_WB),
     .priv_data_size = sizeof(AMRParseContext),
-    .parser_init    = amr_parse_init,
-    .parser_parse   = amr_parse,
-    .parser_close   = ff_parse_close,
+    .init           = amr_parse_init,
+    .parse          = amr_parse,
+    .close          = ff_parse_close,
 };

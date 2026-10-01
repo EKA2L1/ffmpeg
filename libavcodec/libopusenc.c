@@ -23,14 +23,15 @@
 #include <opus_multistream.h>
 
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
 #include "encode.h"
-#include "internal.h"
 #include "libopus.h"
-#include "vorbis.h"
 #include "audio_frame_queue.h"
+#include "vorbis_data.h"
 
 typedef struct LibopusEncOpts {
     int vbr;
@@ -42,6 +43,7 @@ typedef struct LibopusEncOpts {
     int packet_size;
     int max_bandwidth;
     int mapping_family;
+    int dtx;
 #ifdef OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST
     int apply_phase_inv;
 #endif
@@ -91,7 +93,7 @@ static void libopus_write_header(AVCodecContext *avctx, int stream_count,
                                  const uint8_t *channel_mapping)
 {
     uint8_t *p   = avctx->extradata;
-    int channels = avctx->channels;
+    int channels = avctx->ch_layout.nb_channels;
 
     bytestream_put_buffer(&p, "OpusHead", 8);
     bytestream_put_byte(&p, 1); /* Version */
@@ -159,6 +161,13 @@ static int libopus_configure_encoder(AVCodecContext *avctx, OpusMSEncoder *enc,
                "Unable to set inband FEC: %s\n",
                opus_strerror(ret));
 
+    ret = opus_multistream_encoder_ctl(enc,
+                                       OPUS_SET_DTX(opts->dtx));
+    if (ret != OPUS_OK)
+        av_log(avctx, AV_LOG_WARNING,
+               "Unable to set DTX: %s\n",
+               opus_strerror(ret));
+
     if (avctx->cutoff) {
         ret = opus_multistream_encoder_ctl(enc,
                                            OPUS_SET_MAX_BANDWIDTH(opts->max_bandwidth));
@@ -180,9 +189,9 @@ static int libopus_configure_encoder(AVCodecContext *avctx, OpusMSEncoder *enc,
 
 static int libopus_check_max_channels(AVCodecContext *avctx,
                                       int max_channels) {
-    if (avctx->channels > max_channels) {
+    if (avctx->ch_layout.nb_channels > max_channels) {
         av_log(avctx, AV_LOG_ERROR, "Opus mapping family undefined for %d channels.\n",
-               avctx->channels);
+               avctx->ch_layout.nb_channels);
         return AVERROR(EINVAL);
     }
 
@@ -190,16 +199,16 @@ static int libopus_check_max_channels(AVCodecContext *avctx,
 }
 
 static int libopus_check_vorbis_layout(AVCodecContext *avctx, int mapping_family) {
-    av_assert2(avctx->channels < FF_ARRAY_ELEMS(ff_vorbis_channel_layouts));
+    av_assert2(avctx->ch_layout.nb_channels < FF_ARRAY_ELEMS(ff_vorbis_ch_layouts));
 
-    if (!avctx->channel_layout) {
+    if (avctx->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC) {
         av_log(avctx, AV_LOG_WARNING,
                "No channel layout specified. Opus encoder will use Vorbis "
-               "channel layout for %d channels.\n", avctx->channels);
-    } else if (avctx->channel_layout != ff_vorbis_channel_layouts[avctx->channels - 1]) {
+               "channel layout for %d channels.\n", avctx->ch_layout.nb_channels);
+    } else if (av_channel_layout_compare(&avctx->ch_layout, &ff_vorbis_ch_layouts[avctx->ch_layout.nb_channels - 1])) {
         char name[32];
-        av_get_channel_layout_string(name, sizeof(name), avctx->channels,
-                                     avctx->channel_layout);
+
+        av_channel_layout_describe(&avctx->ch_layout, name, sizeof(name));
         av_log(avctx, AV_LOG_ERROR,
                "Invalid channel layout %s for specified mapping family %d.\n",
                name, mapping_family);
@@ -238,7 +247,7 @@ static int libopus_validate_layout_and_get_channel_map(
         ret = libopus_check_max_channels(avctx, 8);
         if (ret == 0) {
             ret = libopus_check_vorbis_layout(avctx, mapping_family);
-            channel_map = ff_vorbis_channel_layout_offsets[avctx->channels - 1];
+            channel_map = ff_vorbis_channel_layout_offsets[avctx->ch_layout.nb_channels - 1];
         }
         break;
     case 255:
@@ -261,6 +270,7 @@ static av_cold int libopus_encode_init(AVCodecContext *avctx)
     OpusMSEncoder *enc;
     uint8_t libopus_channel_mapping[255];
     int ret = OPUS_OK;
+    int channels = avctx->ch_layout.nb_channels;
     int av_ret;
     int coupled_stream_count, header_size, frame_size;
     int mapping_family;
@@ -277,6 +287,7 @@ static av_cold int libopus_encode_init(AVCodecContext *avctx)
         /* Frame sizes less than 10 ms can only use MDCT mode, so switching to
          * RESTRICTED_LOWDELAY avoids an unnecessary extra 2.5ms lookahead. */
         opus->opts.application = OPUS_APPLICATION_RESTRICTED_LOWDELAY;
+        av_fallthrough;
     case 480:
     case 960:
     case 1920:
@@ -348,17 +359,17 @@ static av_cold int libopus_encode_init(AVCodecContext *avctx)
          * libopus multistream API to avoid surround masking. */
 
         /* Set the mapping family so that the value is correct in the header */
-        mapping_family = avctx->channels > 2 ? 1 : 0;
-        coupled_stream_count = opus_coupled_streams[avctx->channels - 1];
-        opus->stream_count   = avctx->channels - coupled_stream_count;
+        mapping_family = channels > 2 ? 1 : 0;
+        coupled_stream_count = opus_coupled_streams[channels - 1];
+        opus->stream_count   = channels - coupled_stream_count;
         memcpy(libopus_channel_mapping,
-               opus_vorbis_channel_map[avctx->channels - 1],
-               avctx->channels * sizeof(*libopus_channel_mapping));
+               opus_vorbis_channel_map[channels - 1],
+               channels * sizeof(*libopus_channel_mapping));
 
         enc = opus_multistream_encoder_create(
-            avctx->sample_rate, avctx->channels, opus->stream_count,
+            avctx->sample_rate, channels, opus->stream_count,
             coupled_stream_count,
-            libavcodec_libopus_channel_map[avctx->channels - 1],
+            libavcodec_libopus_channel_map[channels - 1],
             opus->opts.application, &ret);
     } else {
         /* Use the newer multistream API. The encoder will set the channel
@@ -366,7 +377,7 @@ static av_cold int libopus_encode_init(AVCodecContext *avctx)
          * use surround masking analysis to save bits. */
         mapping_family = opus->opts.mapping_family;
         enc = opus_multistream_surround_encoder_create(
-            avctx->sample_rate, avctx->channels, mapping_family,
+            avctx->sample_rate, channels, mapping_family,
             &opus->stream_count, &coupled_stream_count, libopus_channel_mapping,
             opus->opts.application, &ret);
     }
@@ -385,10 +396,10 @@ static av_cold int libopus_encode_init(AVCodecContext *avctx)
                "No bit rate set. Defaulting to %"PRId64" bps.\n", avctx->bit_rate);
     }
 
-    if (avctx->bit_rate < 500 || avctx->bit_rate > 256000 * avctx->channels) {
+    if (avctx->bit_rate < 500 || avctx->bit_rate > 256000 * channels) {
         av_log(avctx, AV_LOG_ERROR, "The bit rate %"PRId64" bps is unsupported. "
                "Please choose a value between 500 and %d.\n", avctx->bit_rate,
-               256000 * avctx->channels);
+               256000 * channels);
         ret = AVERROR(EINVAL);
         goto fail;
     }
@@ -400,7 +411,7 @@ static av_cold int libopus_encode_init(AVCodecContext *avctx)
     }
 
     /* Header includes channel mapping table if and only if mapping family is NOT 0 */
-    header_size = 19 + (mapping_family == 0 ? 0 : 2 + avctx->channels);
+    header_size = 19 + (mapping_family == 0 ? 0 : 2 + channels);
     avctx->extradata = av_malloc(header_size + AV_INPUT_BUFFER_PADDING_SIZE);
     if (!avctx->extradata) {
         av_log(avctx, AV_LOG_ERROR, "Failed to allocate extradata.\n");
@@ -409,7 +420,7 @@ static av_cold int libopus_encode_init(AVCodecContext *avctx)
     }
     avctx->extradata_size = header_size;
 
-    opus->samples = av_calloc(frame_size, avctx->channels *
+    opus->samples = av_calloc(frame_size, channels *
                                av_get_bytes_per_sample(avctx->sample_fmt));
     if (!opus->samples) {
         av_log(avctx, AV_LOG_ERROR, "Failed to allocate samples buffer.\n");
@@ -456,8 +467,9 @@ static int libopus_encode(AVCodecContext *avctx, AVPacket *avpkt,
 {
     LibopusEncContext *opus = avctx->priv_data;
     const int bytes_per_sample = av_get_bytes_per_sample(avctx->sample_fmt);
-    const int sample_size      = avctx->channels * bytes_per_sample;
-    uint8_t *audio;
+    const int channels         = avctx->ch_layout.nb_channels;
+    const int sample_size      = channels * bytes_per_sample;
+    const uint8_t *audio;
     int ret;
     int discard_padding;
 
@@ -468,18 +480,18 @@ static int libopus_encode(AVCodecContext *avctx, AVPacket *avpkt,
         if (opus->encoder_channel_map != NULL) {
             audio = opus->samples;
             libopus_copy_samples_with_channel_map(
-                audio, frame->data[0], opus->encoder_channel_map,
-                avctx->channels, frame->nb_samples, bytes_per_sample);
+                opus->samples, frame->data[0], opus->encoder_channel_map,
+                channels, frame->nb_samples, bytes_per_sample);
         } else if (frame->nb_samples < opus->opts.packet_size) {
             audio = opus->samples;
-            memcpy(audio, frame->data[0], frame->nb_samples * sample_size);
+            memcpy(opus->samples, frame->data[0], frame->nb_samples * sample_size);
         } else
             audio = frame->data[0];
     } else {
         if (!opus->afq.remaining_samples || (!opus->afq.frame_alloc && !opus->afq.frame_count))
             return 0;
         audio = opus->samples;
-        memset(audio, 0, opus->opts.packet_size * sample_size);
+        memset(opus->samples, 0, opus->opts.packet_size * sample_size);
     }
 
     /* Maximum packet size taken from opusenc in opus-tools. 120ms packets
@@ -489,11 +501,11 @@ static int libopus_encode(AVCodecContext *avctx, AVPacket *avpkt,
         return ret;
 
     if (avctx->sample_fmt == AV_SAMPLE_FMT_FLT)
-        ret = opus_multistream_encode_float(opus->enc, (float *)audio,
+        ret = opus_multistream_encode_float(opus->enc, (const float *)audio,
                                             opus->opts.packet_size,
                                             avpkt->data, avpkt->size);
     else
-        ret = opus_multistream_encode(opus->enc, (opus_int16 *)audio,
+        ret = opus_multistream_encode(opus->enc, (const opus_int16 *)audio,
                                       opus->opts.packet_size,
                                       avpkt->data, avpkt->size);
 
@@ -508,20 +520,16 @@ static int libopus_encode(AVCodecContext *avctx, AVPacket *avpkt,
     ff_af_queue_remove(&opus->afq, opus->opts.packet_size,
                        &avpkt->pts, &avpkt->duration);
 
-    discard_padding = opus->opts.packet_size - avpkt->duration;
+    discard_padding = opus->opts.packet_size - ff_samples_from_time_base(avctx, avpkt->duration);
     // Check if subtraction resulted in an overflow
-    if ((discard_padding < opus->opts.packet_size) != (avpkt->duration > 0)) {
-        av_packet_unref(avpkt);
+    if ((discard_padding < opus->opts.packet_size) != (avpkt->duration > 0))
         return AVERROR(EINVAL);
-    }
     if (discard_padding > 0) {
         uint8_t* side_data = av_packet_new_side_data(avpkt,
                                                      AV_PKT_DATA_SKIP_SAMPLES,
                                                      10);
-        if(!side_data) {
-            av_packet_unref(avpkt);
+        if (!side_data)
             return AVERROR(ENOMEM);
-        }
         AV_WL32(side_data + 4, discard_padding);
     }
 
@@ -546,18 +554,19 @@ static av_cold int libopus_encode_close(AVCodecContext *avctx)
 #define OFFSET(x) offsetof(LibopusEncContext, opts.x)
 #define FLAGS AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption libopus_options[] = {
-    { "application",    "Intended application type",           OFFSET(application),    AV_OPT_TYPE_INT,   { .i64 = OPUS_APPLICATION_AUDIO }, OPUS_APPLICATION_VOIP, OPUS_APPLICATION_RESTRICTED_LOWDELAY, FLAGS, "application" },
-        { "voip",           "Favor improved speech intelligibility",   0, AV_OPT_TYPE_CONST, { .i64 = OPUS_APPLICATION_VOIP },                0, 0, FLAGS, "application" },
-        { "audio",          "Favor faithfulness to the input",         0, AV_OPT_TYPE_CONST, { .i64 = OPUS_APPLICATION_AUDIO },               0, 0, FLAGS, "application" },
-        { "lowdelay",       "Restrict to only the lowest delay modes", 0, AV_OPT_TYPE_CONST, { .i64 = OPUS_APPLICATION_RESTRICTED_LOWDELAY }, 0, 0, FLAGS, "application" },
+    { "application",    "Intended application type",           OFFSET(application),    AV_OPT_TYPE_INT,   { .i64 = OPUS_APPLICATION_AUDIO }, OPUS_APPLICATION_VOIP, OPUS_APPLICATION_RESTRICTED_LOWDELAY, FLAGS, .unit = "application" },
+        { "voip",           "Favor improved speech intelligibility",   0, AV_OPT_TYPE_CONST, { .i64 = OPUS_APPLICATION_VOIP },                0, 0, FLAGS, .unit = "application" },
+        { "audio",          "Favor faithfulness to the input",         0, AV_OPT_TYPE_CONST, { .i64 = OPUS_APPLICATION_AUDIO },               0, 0, FLAGS, .unit = "application" },
+        { "lowdelay",       "Restrict to only the lowest delay modes, disable voice-optimized modes", 0, AV_OPT_TYPE_CONST, { .i64 = OPUS_APPLICATION_RESTRICTED_LOWDELAY }, 0, 0, FLAGS, .unit = "application" },
     { "frame_duration", "Duration of a frame in milliseconds", OFFSET(frame_duration), AV_OPT_TYPE_FLOAT, { .dbl = 20.0 }, 2.5, 120.0, FLAGS },
     { "packet_loss",    "Expected packet loss percentage",     OFFSET(packet_loss),    AV_OPT_TYPE_INT,   { .i64 = 0 },    0,   100,  FLAGS },
     { "fec",             "Enable inband FEC. Expected packet loss must be non-zero",     OFFSET(fec),    AV_OPT_TYPE_BOOL,   { .i64 = 0 }, 0, 1, FLAGS },
-    { "vbr",            "Variable bit rate mode",              OFFSET(vbr),            AV_OPT_TYPE_INT,   { .i64 = 1 },    0,   2,    FLAGS, "vbr" },
-        { "off",            "Use constant bit rate", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, FLAGS, "vbr" },
-        { "on",             "Use variable bit rate", 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, FLAGS, "vbr" },
-        { "constrained",    "Use constrained VBR",   0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, FLAGS, "vbr" },
-    { "mapping_family", "Channel Mapping Family",              OFFSET(mapping_family), AV_OPT_TYPE_INT,   { .i64 = -1 },   -1,  255,  FLAGS, "mapping_family" },
+    { "vbr",            "Variable bit rate mode",              OFFSET(vbr),            AV_OPT_TYPE_INT,   { .i64 = 1 },    0,   2,    FLAGS, .unit = "vbr" },
+        { "off",            "Use constant bit rate", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, FLAGS, .unit = "vbr" },
+        { "on",             "Use variable bit rate", 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, FLAGS, .unit = "vbr" },
+        { "constrained",    "Use constrained VBR",   0, AV_OPT_TYPE_CONST, { .i64 = 2 }, 0, 0, FLAGS, .unit = "vbr" },
+    { "mapping_family", "Channel Mapping Family",              OFFSET(mapping_family), AV_OPT_TYPE_INT,   { .i64 = -1 },   -1,  255,  FLAGS, .unit = "mapping_family" },
+    { "dtx", "Enable DTX (Discontinuous transmission)", OFFSET(dtx), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
 #ifdef OPUS_SET_PHASE_INVERSION_DISABLED_REQUEST
     { "apply_phase_inv", "Apply intensity stereo phase inversion", OFFSET(apply_phase_inv), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
 #endif
@@ -571,7 +580,7 @@ static const AVClass libopus_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-static const AVCodecDefault libopus_defaults[] = {
+static const FFCodecDefault libopus_defaults[] = {
     { "b",                 "0" },
     { "compression_level", "10" },
     { NULL },
@@ -581,21 +590,21 @@ static const int libopus_sample_rates[] = {
     48000, 24000, 16000, 12000, 8000, 0,
 };
 
-const AVCodec ff_libopus_encoder = {
-    .name            = "libopus",
-    .long_name       = NULL_IF_CONFIG_SMALL("libopus Opus"),
-    .type            = AVMEDIA_TYPE_AUDIO,
-    .id              = AV_CODEC_ID_OPUS,
+const FFCodec ff_libopus_encoder = {
+    .p.name          = "libopus",
+    CODEC_LONG_NAME("libopus Opus"),
+    .p.type          = AVMEDIA_TYPE_AUDIO,
+    .p.id            = AV_CODEC_ID_OPUS,
+    .p.capabilities  = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                       AV_CODEC_CAP_SMALL_LAST_FRAME,
+    .caps_internal   = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
     .priv_data_size  = sizeof(LibopusEncContext),
     .init            = libopus_encode_init,
-    .encode2         = libopus_encode,
+    FF_CODEC_ENCODE_CB(libopus_encode),
     .close           = libopus_encode_close,
-    .capabilities    = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_SMALL_LAST_FRAME,
-    .sample_fmts     = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
-                                                      AV_SAMPLE_FMT_FLT,
-                                                      AV_SAMPLE_FMT_NONE },
-    .supported_samplerates = libopus_sample_rates,
-    .priv_class      = &libopus_class,
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_FLT),
+    CODEC_SAMPLERATES_ARRAY(libopus_sample_rates),
+    .p.priv_class    = &libopus_class,
     .defaults        = libopus_defaults,
-    .wrapper_name    = "libopus",
+    .p.wrapper_name  = "libopus",
 };

@@ -19,6 +19,7 @@
 #include <stdint.h>
 
 #include "config.h"
+#include "config_components.h"
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/common.h"
@@ -29,7 +30,8 @@
 
 #include "audio.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
 typedef struct TrimContext {
     const AVClass *class;
@@ -67,6 +69,8 @@ typedef struct TrimContext {
     int64_t next_pts;
 
     int eof;
+
+    int (*filter_frame)(AVFilterLink *inlink, AVFrame *frame);
 } TrimContext;
 
 static av_cold int init(AVFilterContext *ctx)
@@ -78,47 +82,6 @@ static av_cold int init(AVFilterContext *ctx)
     return 0;
 }
 
-static int config_input(AVFilterLink *inlink)
-{
-    AVFilterContext *ctx = inlink->dst;
-    TrimContext       *s = ctx->priv;
-    AVRational tb = (inlink->type == AVMEDIA_TYPE_VIDEO) ?
-                     inlink->time_base : (AVRational){ 1, inlink->sample_rate };
-
-    if (s->start_time != INT64_MAX) {
-        int64_t start_pts = av_rescale_q(s->start_time, AV_TIME_BASE_Q, tb);
-        if (s->start_pts == AV_NOPTS_VALUE || start_pts < s->start_pts)
-            s->start_pts = start_pts;
-    }
-    if (s->end_time != INT64_MAX) {
-        int64_t end_pts = av_rescale_q(s->end_time, AV_TIME_BASE_Q, tb);
-        if (s->end_pts == AV_NOPTS_VALUE || end_pts > s->end_pts)
-            s->end_pts = end_pts;
-    }
-    if (s->duration)
-        s->duration_tb = av_rescale_q(s->duration, AV_TIME_BASE_Q, tb);
-
-    return 0;
-}
-
-#define OFFSET(x) offsetof(TrimContext, x)
-#define COMMON_OPTS                                                                                                                                                         \
-    { "start",       "Timestamp of the first frame that "                                                                                                        \
-        "should be passed",                                              OFFSET(start_time),  AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX },    INT64_MIN, INT64_MAX, FLAGS }, \
-    { "starti",      "Timestamp of the first frame that "                                                                                                        \
-        "should be passed",                                              OFFSET(start_time),  AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX },    INT64_MIN, INT64_MAX, FLAGS }, \
-    { "end",         "Timestamp of the first frame that "                                                                                                        \
-        "should be dropped again",                                       OFFSET(end_time),    AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX },    INT64_MIN, INT64_MAX, FLAGS }, \
-    { "endi",        "Timestamp of the first frame that "                                                                                                        \
-        "should be dropped again",                                       OFFSET(end_time),    AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX },    INT64_MIN, INT64_MAX, FLAGS }, \
-    { "start_pts",   "Timestamp of the first frame that should be "                                                                                                         \
-       " passed",                                                        OFFSET(start_pts),   AV_OPT_TYPE_INT64,  { .i64 = AV_NOPTS_VALUE }, INT64_MIN, INT64_MAX, FLAGS }, \
-    { "end_pts",     "Timestamp of the first frame that should be "                                                                                                         \
-        "dropped again",                                                 OFFSET(end_pts),     AV_OPT_TYPE_INT64,  { .i64 = AV_NOPTS_VALUE }, INT64_MIN, INT64_MAX, FLAGS }, \
-    { "duration",    "Maximum duration of the output",                   OFFSET(duration),    AV_OPT_TYPE_DURATION, { .i64 = 0 },                    0, INT64_MAX, FLAGS }, \
-    { "durationi",   "Maximum duration of the output",                   OFFSET(duration),    AV_OPT_TYPE_DURATION, { .i64 = 0 },                    0, INT64_MAX, FLAGS },
-
-
 #if CONFIG_TRIM_FILTER
 static int trim_filter_frame(AVFilterLink *inlink, AVFrame *frame)
 {
@@ -127,10 +90,8 @@ static int trim_filter_frame(AVFilterLink *inlink, AVFrame *frame)
     int drop;
 
     /* drop everything if EOF has already been returned */
-    if (s->eof) {
-        av_frame_free(&frame);
+    if (s->eof)
         return 0;
-    }
 
     if (s->start_frame >= 0 || s->start_pts != AV_NOPTS_VALUE) {
         drop = 1;
@@ -160,59 +121,20 @@ static int trim_filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
         if (drop) {
             s->eof = 1;
-            ff_avfilter_link_set_out_status(inlink, AVERROR_EOF, AV_NOPTS_VALUE);
+            ff_inlink_set_status(inlink, AVERROR_EOF);
+            ff_outlink_set_status(ctx->outputs[0], AVERROR_EOF, frame->pts);
             goto drop;
         }
     }
 
     s->nb_frames++;
 
-    return ff_filter_frame(ctx->outputs[0], frame);
+    return 1;
 
 drop:
     s->nb_frames++;
-    av_frame_free(&frame);
     return 0;
 }
-
-#define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
-static const AVOption trim_options[] = {
-    COMMON_OPTS
-    { "start_frame", "Number of the first frame that should be passed "
-        "to the output",                                                 OFFSET(start_frame), AV_OPT_TYPE_INT64,  { .i64 = -1 },       -1, INT64_MAX, FLAGS },
-    { "end_frame",   "Number of the first frame that should be dropped "
-        "again",                                                         OFFSET(end_frame),   AV_OPT_TYPE_INT64,  { .i64 = INT64_MAX }, 0, INT64_MAX, FLAGS },
-    { NULL }
-};
-#undef FLAGS
-
-AVFILTER_DEFINE_CLASS(trim);
-
-static const AVFilterPad trim_inputs[] = {
-    {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_VIDEO,
-        .filter_frame = trim_filter_frame,
-        .config_props = config_input,
-    },
-};
-
-static const AVFilterPad trim_outputs[] = {
-    {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_trim = {
-    .name        = "trim",
-    .description = NULL_IF_CONFIG_SMALL("Pick one continuous section from the input, drop the rest."),
-    .init        = init,
-    .priv_size   = sizeof(TrimContext),
-    .priv_class  = &trim_class,
-    FILTER_INPUTS(trim_inputs),
-    FILTER_OUTPUTS(trim_outputs),
-};
 #endif // CONFIG_TRIM_FILTER
 
 #if CONFIG_ATRIM_FILTER
@@ -225,10 +147,8 @@ static int atrim_filter_frame(AVFilterLink *inlink, AVFrame *frame)
     int drop;
 
     /* drop everything if EOF has already been returned */
-    if (s->eof) {
-        av_frame_free(&frame);
+    if (s->eof)
         return 0;
-    }
 
     if (frame->pts != AV_NOPTS_VALUE)
         pts = av_rescale_q(frame->pts, inlink->time_base,
@@ -289,7 +209,8 @@ static int atrim_filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
         if (drop) {
             s->eof = 1;
-            ff_avfilter_link_set_out_status(inlink, AVERROR_EOF, AV_NOPTS_VALUE);
+            ff_inlink_set_status(inlink, AVERROR_EOF);
+            ff_outlink_set_status(ctx->outputs[0], AVERROR_EOF, frame->pts);
             goto drop;
         }
     }
@@ -302,31 +223,145 @@ static int atrim_filter_frame(AVFilterLink *inlink, AVFrame *frame)
 
     if (start_sample) {
         AVFrame *out = ff_get_audio_buffer(ctx->outputs[0], end_sample - start_sample);
-        if (!out) {
-            av_frame_free(&frame);
+        if (!out)
             return AVERROR(ENOMEM);
-        }
 
         av_frame_copy_props(out, frame);
         av_samples_copy(out->extended_data, frame->extended_data, 0, start_sample,
-                        out->nb_samples, inlink->channels,
+                        out->nb_samples, inlink->ch_layout.nb_channels,
                         frame->format);
         if (out->pts != AV_NOPTS_VALUE)
             out->pts += av_rescale_q(start_sample, (AVRational){ 1, out->sample_rate },
                                      inlink->time_base);
 
-        av_frame_free(&frame);
-        frame = out;
+        av_frame_unref(frame);
+        av_frame_move_ref(frame, out);
+        av_frame_free(&out);
     } else
         frame->nb_samples = end_sample;
 
-    return ff_filter_frame(ctx->outputs[0], frame);
+    return 1;
 
 drop:
     s->nb_samples += frame->nb_samples;
-    av_frame_free(&frame);
     return 0;
 }
+#endif // CONFIG_ATRIM_FILTER
+
+static int config_input(AVFilterLink *inlink)
+{
+    AVFilterContext *ctx = inlink->dst;
+    TrimContext       *s = ctx->priv;
+    AVRational tb = (inlink->type == AVMEDIA_TYPE_VIDEO) ?
+                     inlink->time_base : (AVRational){ 1, inlink->sample_rate };
+
+#if CONFIG_TRIM_FILTER
+    if (inlink->type == AVMEDIA_TYPE_VIDEO)
+        s->filter_frame = trim_filter_frame;
+#endif
+#if CONFIG_ATRIM_FILTER
+    if (inlink->type == AVMEDIA_TYPE_AUDIO)
+        s->filter_frame = atrim_filter_frame;
+#endif
+    if (s->start_time != INT64_MAX) {
+        int64_t start_pts = av_rescale_q(s->start_time, AV_TIME_BASE_Q, tb);
+        if (s->start_pts == AV_NOPTS_VALUE || start_pts < s->start_pts)
+            s->start_pts = start_pts;
+    }
+    if (s->end_time != INT64_MAX) {
+        int64_t end_pts = av_rescale_q(s->end_time, AV_TIME_BASE_Q, tb);
+        if (s->end_pts == AV_NOPTS_VALUE || end_pts > s->end_pts)
+            s->end_pts = end_pts;
+    }
+    if (s->duration)
+        s->duration_tb = av_rescale_q(s->duration, AV_TIME_BASE_Q, tb);
+
+    return 0;
+}
+
+static int activate(AVFilterContext *ctx)
+{
+    TrimContext *s = ctx->priv;
+    AVFilterLink *inlink = ctx->inputs[0];
+    AVFilterLink *outlink = ctx->outputs[0];
+    AVFrame *frame = NULL;
+    int ret;
+
+    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+
+    while ((ret = ff_inlink_consume_frame(inlink, &frame))) {
+        if (ret < 0)
+            return ret;
+
+        ret = s->filter_frame(inlink, frame);
+        if (ret > 0)
+            return ff_filter_frame(outlink, frame);
+        av_frame_free(&frame);
+        if (ret < 0)
+            return ret;
+    }
+
+    FF_FILTER_FORWARD_STATUS(inlink, outlink);
+    FF_FILTER_FORWARD_WANTED(outlink, inlink);
+
+    return FFERROR_NOT_READY;
+}
+
+#define OFFSET(x) offsetof(TrimContext, x)
+#define COMMON_OPTS                                                                                                                                                         \
+    { "start",       "Timestamp of the first frame that "                                                                                                        \
+        "should be passed",                                              OFFSET(start_time),  AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX },    INT64_MIN, INT64_MAX, FLAGS }, \
+    { "starti",      "Timestamp of the first frame that "                                                                                                        \
+        "should be passed",                                              OFFSET(start_time),  AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX },    INT64_MIN, INT64_MAX, FLAGS }, \
+    { "end",         "Timestamp of the first frame that "                                                                                                        \
+        "should be dropped again",                                       OFFSET(end_time),    AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX },    INT64_MIN, INT64_MAX, FLAGS }, \
+    { "endi",        "Timestamp of the first frame that "                                                                                                        \
+        "should be dropped again",                                       OFFSET(end_time),    AV_OPT_TYPE_DURATION, { .i64 = INT64_MAX },    INT64_MIN, INT64_MAX, FLAGS }, \
+    { "start_pts",   "Timestamp of the first frame that should be "                                                                                                         \
+       " passed",                                                        OFFSET(start_pts),   AV_OPT_TYPE_INT64,  { .i64 = AV_NOPTS_VALUE }, INT64_MIN, INT64_MAX, FLAGS }, \
+    { "end_pts",     "Timestamp of the first frame that should be "                                                                                                         \
+        "dropped again",                                                 OFFSET(end_pts),     AV_OPT_TYPE_INT64,  { .i64 = AV_NOPTS_VALUE }, INT64_MIN, INT64_MAX, FLAGS }, \
+    { "duration",    "Maximum duration of the output",                   OFFSET(duration),    AV_OPT_TYPE_DURATION, { .i64 = 0 },                    0, INT64_MAX, FLAGS }, \
+    { "durationi",   "Maximum duration of the output",                   OFFSET(duration),    AV_OPT_TYPE_DURATION, { .i64 = 0 },                    0, INT64_MAX, FLAGS },
+
+
+#if CONFIG_TRIM_FILTER
+
+#define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
+static const AVOption trim_options[] = {
+    COMMON_OPTS
+    { "start_frame", "Number of the first frame that should be passed "
+        "to the output",                                                 OFFSET(start_frame), AV_OPT_TYPE_INT64,  { .i64 = -1 },       -1, INT64_MAX, FLAGS },
+    { "end_frame",   "Number of the first frame that should be dropped "
+        "again",                                                         OFFSET(end_frame),   AV_OPT_TYPE_INT64,  { .i64 = INT64_MAX }, 0, INT64_MAX, FLAGS },
+    { NULL }
+};
+#undef FLAGS
+
+AVFILTER_DEFINE_CLASS(trim);
+
+static const AVFilterPad trim_inputs[] = {
+    {
+        .name         = "default",
+        .type         = AVMEDIA_TYPE_VIDEO,
+        .config_props = config_input,
+    },
+};
+
+const FFFilter ff_vf_trim = {
+    .p.name        = "trim",
+    .p.description = NULL_IF_CONFIG_SMALL("Pick one continuous section from the input, drop the rest."),
+    .p.priv_class  = &trim_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
+    .init        = init,
+    .activate    = activate,
+    .priv_size   = sizeof(TrimContext),
+    FILTER_INPUTS(trim_inputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
+};
+#endif // CONFIG_TRIM_FILTER
+
+#if CONFIG_ATRIM_FILTER
 
 #define FLAGS AV_OPT_FLAG_AUDIO_PARAM | AV_OPT_FLAG_FILTERING_PARAM
 static const AVOption atrim_options[] = {
@@ -345,26 +380,19 @@ static const AVFilterPad atrim_inputs[] = {
     {
         .name         = "default",
         .type         = AVMEDIA_TYPE_AUDIO,
-        .filter_frame = atrim_filter_frame,
         .config_props = config_input,
     },
 };
 
-static const AVFilterPad atrim_outputs[] = {
-    {
-        .name         = "default",
-        .type         = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
-const AVFilter ff_af_atrim = {
-    .name        = "atrim",
-    .description = NULL_IF_CONFIG_SMALL("Pick one continuous section from the input, drop the rest."),
+const FFFilter ff_af_atrim = {
+    .p.name        = "atrim",
+    .p.description = NULL_IF_CONFIG_SMALL("Pick one continuous section from the input, drop the rest."),
+    .p.priv_class  = &atrim_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .init        = init,
+    .activate    = activate,
     .priv_size   = sizeof(TrimContext),
-    .priv_class  = &atrim_class,
-    .flags       = AVFILTER_FLAG_METADATA_ONLY,
     FILTER_INPUTS(atrim_inputs),
-    FILTER_OUTPUTS(atrim_outputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
 };
 #endif // CONFIG_ATRIM_FILTER

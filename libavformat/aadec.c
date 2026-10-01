@@ -24,10 +24,12 @@
  */
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "libavutil/avstring.h"
 #include "libavutil/dict.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/tea.h"
 #include "libavutil/opt.h"
 
@@ -178,7 +180,7 @@ static int aa_read_header(AVFormatContext *s)
     } else if (!strcmp(codec_name, "acelp85")) {
         st->codecpar->codec_id = AV_CODEC_ID_SIPR;
         st->codecpar->block_align = 19;
-        st->codecpar->channels = 1;
+        st->codecpar->ch_layout.nb_channels = 1;
         st->codecpar->sample_rate = 8500;
         st->codecpar->bit_rate = 8500;
         sti->need_parsing = AVSTREAM_PARSE_FULL_RAW;
@@ -186,7 +188,7 @@ static int aa_read_header(AVFormatContext *s)
     } else if (!strcmp(codec_name, "acelp16")) {
         st->codecpar->codec_id = AV_CODEC_ID_SIPR;
         st->codecpar->block_align = 20;
-        st->codecpar->channels = 1;
+        st->codecpar->ch_layout.nb_channels = 1;
         st->codecpar->sample_rate = 16000;
         st->codecpar->bit_rate = 16000;
         sti->need_parsing = AVSTREAM_PARSE_FULL_RAW;
@@ -370,17 +372,17 @@ static const AVClass aa_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVInputFormat ff_aa_demuxer = {
-    .name           = "aa",
-    .long_name      = NULL_IF_CONFIG_SMALL("Audible AA format files"),
-    .priv_class     = &aa_class,
+const FFInputFormat ff_aa_demuxer = {
+    .p.name         = "aa",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Audible AA format files"),
+    .p.priv_class   = &aa_class,
+    .p.extensions   = "aa",
+    .p.flags        = AVFMT_NO_BYTE_SEEK | AVFMT_NOGENSEARCH,
     .priv_data_size = sizeof(AADemuxContext),
-    .extensions     = "aa",
     .read_probe     = aa_probe,
     .read_header    = aa_read_header,
     .read_packet    = aa_read_packet,
     .read_seek      = aa_read_seek,
     .read_close     = aa_read_close,
-    .flags          = AVFMT_NO_BYTE_SEEK | AVFMT_NOGENSEARCH,
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
 };

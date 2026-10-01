@@ -21,6 +21,7 @@
 
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "mpeg.h"
 
@@ -102,18 +103,18 @@ recover:
 
     if (syncword != PVA_MAGIC) {
         pva_log(s, AV_LOG_ERROR, "invalid syncword\n");
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
     if (streamid != PVA_VIDEO_PAYLOAD && streamid != PVA_AUDIO_PAYLOAD) {
         pva_log(s, AV_LOG_ERROR, "invalid streamid\n");
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
     if (reserved != 0x55) {
         pva_log(s, AV_LOG_WARNING, "expected reserved byte to be 0x55\n");
     }
     if (length > PVA_MAX_PAYLOAD_LENGTH) {
         pva_log(s, AV_LOG_ERROR, "invalid payload length %u\n", length);
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
 
     if (streamid == PVA_VIDEO_PAYLOAD && pts_flag) {
@@ -144,7 +145,7 @@ recover:
                                           "trying to recover\n");
                 avio_skip(pb, length - 9);
                 if (!read_packet)
-                    return AVERROR(EIO);
+                    return AVERROR_INVALIDDATA;
                 goto recover;
             }
 
@@ -191,7 +192,7 @@ static int pva_read_packet(AVFormatContext *s, AVPacket *pkt) {
 
     if (read_part_of_packet(s, &pva_pts, &length, &streamid, 1) < 0 ||
        (ret = av_get_packet(pb, pkt, length)) <= 0)
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
 
     pkt->stream_index = streamid - 1;
     pkt->pts = pva_pts;
@@ -228,9 +229,9 @@ static int64_t pva_read_timestamp(struct AVFormatContext *s, int stream_index,
     return res;
 }
 
-const AVInputFormat ff_pva_demuxer = {
-    .name           = "pva",
-    .long_name      = NULL_IF_CONFIG_SMALL("TechnoTrend PVA"),
+const FFInputFormat ff_pva_demuxer = {
+    .p.name         = "pva",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("TechnoTrend PVA"),
     .priv_data_size = sizeof(PVAContext),
     .read_probe     = pva_probe,
     .read_header    = pva_read_header,

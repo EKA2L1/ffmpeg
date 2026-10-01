@@ -30,17 +30,16 @@
  * @see http://www.w3.org/Graphics/GIF/spec-gif89a.txt
  */
 
-#define BITSTREAM_WRITER_LE
+#include "libavutil/attributes.h"
+#include "libavutil/imgutils_internal.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
 #include "encode.h"
-#include "internal.h"
 #include "lzw.h"
 #include "gif.h"
-
-#include "put_bits.h"
 
 #define DEFAULT_TRANSPARENCY_INDEX 0x1f
 
@@ -322,7 +321,7 @@ static int gif_image_write_image(AVCodecContext *avctx,
         disposal = GCE_DISPOSAL_INPLACE;
     }
 
-    if (s->image || !avctx->frame_number) { /* GIF header */
+    if (s->image || !avctx->frame_num) { /* GIF header */
         const uint32_t *global_palette = palette ? palette : s->palette;
         const AVRational sar = avctx->sample_aspect_ratio;
         int64_t aspect = 0;
@@ -481,7 +480,7 @@ static int gif_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     const uint32_t *palette = NULL;
     int ret;
 
-    if ((ret = ff_alloc_packet(avctx, pkt, avctx->width*avctx->height*7/5 + AV_INPUT_BUFFER_MIN_SIZE)) < 0)
+    if ((ret = ff_alloc_packet(avctx, pkt, avctx->width*avctx->height*7/5 + FF_INPUT_BUFFER_MIN_SIZE)) < 0)
         return ret;
     outbuf_ptr = pkt->data;
     end        = pkt->data + pkt->size;
@@ -493,6 +492,8 @@ static int gif_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
             memcpy(s->palette, palette, AVPALETTE_SIZE);
             s->transparent_index = get_palette_transparency_index(palette);
             s->palette_loaded = 1;
+            if (s->use_global_palette)
+                palette = NULL;
         } else if (!memcmp(s->palette, palette, AVPALETTE_SIZE)) {
             palette = NULL;
         }
@@ -507,21 +508,20 @@ static int gif_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     }
 
     if (!s->image) {
-        av_frame_unref(s->last_frame);
-        ret = av_frame_ref(s->last_frame, (AVFrame*)pict);
+        ret = av_frame_replace(s->last_frame, pict);
         if (ret < 0)
             return ret;
     }
 
     pkt->size   = outbuf_ptr - pkt->data;
-    if (s->image || !avctx->frame_number)
+    if (s->image || !avctx->frame_num)
         pkt->flags |= AV_PKT_FLAG_KEY;
     *got_packet = 1;
 
     return 0;
 }
 
-static int gif_encode_close(AVCodecContext *avctx)
+static av_cold int gif_encode_close(AVCodecContext *avctx)
 {
     GIFContext *s = avctx->priv_data;
 
@@ -537,9 +537,9 @@ static int gif_encode_close(AVCodecContext *avctx)
 #define OFFSET(x) offsetof(GIFContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption gif_options[] = {
-    { "gifflags", "set GIF flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64 = GF_OFFSETTING|GF_TRANSDIFF}, 0, INT_MAX, FLAGS, "flags" },
-        { "offsetting", "enable picture offsetting", 0, AV_OPT_TYPE_CONST, {.i64=GF_OFFSETTING}, INT_MIN, INT_MAX, FLAGS, "flags" },
-        { "transdiff", "enable transparency detection between frames", 0, AV_OPT_TYPE_CONST, {.i64=GF_TRANSDIFF}, INT_MIN, INT_MAX, FLAGS, "flags" },
+    { "gifflags", "set GIF flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64 = GF_OFFSETTING|GF_TRANSDIFF}, 0, INT_MAX, FLAGS, .unit = "flags" },
+        { "offsetting", "enable picture offsetting", 0, AV_OPT_TYPE_CONST, {.i64=GF_OFFSETTING}, INT_MIN, INT_MAX, FLAGS, .unit = "flags" },
+        { "transdiff", "enable transparency detection between frames", 0, AV_OPT_TYPE_CONST, {.i64=GF_TRANSDIFF}, INT_MIN, INT_MAX, FLAGS, .unit = "flags" },
     { "gifimage", "enable encoding only images per frame", OFFSET(image), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
     { "global_palette", "write a palette to the global gif header where feasible", OFFSET(use_global_palette), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, FLAGS },
     { NULL }
@@ -552,19 +552,18 @@ static const AVClass gif_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_gif_encoder = {
-    .name           = "gif",
-    .long_name      = NULL_IF_CONFIG_SMALL("GIF (Graphics Interchange Format)"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_GIF,
+const FFCodec ff_gif_encoder = {
+    .p.name         = "gif",
+    CODEC_LONG_NAME("GIF (Graphics Interchange Format)"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_GIF,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(GIFContext),
     .init           = gif_encode_init,
-    .encode2        = gif_encode_frame,
+    FF_CODEC_ENCODE_CB(gif_encode_frame),
     .close          = gif_encode_close,
-    .pix_fmts       = (const enum AVPixelFormat[]){
-        AV_PIX_FMT_RGB8, AV_PIX_FMT_BGR8, AV_PIX_FMT_RGB4_BYTE, AV_PIX_FMT_BGR4_BYTE,
-        AV_PIX_FMT_GRAY8, AV_PIX_FMT_PAL8, AV_PIX_FMT_NONE
-    },
-    .priv_class     = &gif_class,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
+    CODEC_PIXFMTS(AV_PIX_FMT_RGB8, AV_PIX_FMT_BGR8, AV_PIX_FMT_RGB4_BYTE,
+                  AV_PIX_FMT_BGR4_BYTE, AV_PIX_FMT_GRAY8, AV_PIX_FMT_PAL8),
+    .p.priv_class   = &gif_class,
+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 };

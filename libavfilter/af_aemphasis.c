@@ -20,7 +20,7 @@
 
 #include "libavutil/opt.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 #include "audio.h"
 
 typedef struct BiquadCoeffs {
@@ -49,19 +49,19 @@ typedef struct AudioEmphasisContext {
 static const AVOption aemphasis_options[] = {
     { "level_in",      "set input gain", OFFSET(level_in),  AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 64, FLAGS },
     { "level_out",    "set output gain", OFFSET(level_out), AV_OPT_TYPE_DOUBLE, {.dbl=1}, 0, 64, FLAGS },
-    { "mode",         "set filter mode", OFFSET(mode), AV_OPT_TYPE_INT,   {.i64=0}, 0, 1, FLAGS, "mode" },
-    { "reproduction",              NULL,            0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "mode" },
-    { "production",                NULL,            0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "mode" },
-    { "type",         "set filter type", OFFSET(type), AV_OPT_TYPE_INT,   {.i64=4}, 0, 8, FLAGS, "type" },
-    { "col",                 "Columbia",            0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "type" },
-    { "emi",                      "EMI",            0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "type" },
-    { "bsi",              "BSI (78RPM)",            0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, "type" },
-    { "riaa",                    "RIAA",            0, AV_OPT_TYPE_CONST, {.i64=3}, 0, 0, FLAGS, "type" },
-    { "cd",         "Compact Disc (CD)",            0, AV_OPT_TYPE_CONST, {.i64=4}, 0, 0, FLAGS, "type" },
-    { "50fm",               "50µs (FM)",            0, AV_OPT_TYPE_CONST, {.i64=5}, 0, 0, FLAGS, "type" },
-    { "75fm",               "75µs (FM)",            0, AV_OPT_TYPE_CONST, {.i64=6}, 0, 0, FLAGS, "type" },
-    { "50kf",            "50µs (FM-KF)",            0, AV_OPT_TYPE_CONST, {.i64=7}, 0, 0, FLAGS, "type" },
-    { "75kf",            "75µs (FM-KF)",            0, AV_OPT_TYPE_CONST, {.i64=8}, 0, 0, FLAGS, "type" },
+    { "mode",         "set filter mode", OFFSET(mode), AV_OPT_TYPE_INT,   {.i64=0}, 0, 1, FLAGS, .unit = "mode" },
+    { "reproduction",              NULL,            0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, .unit = "mode" },
+    { "production",                NULL,            0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, .unit = "mode" },
+    { "type",         "set filter type", OFFSET(type), AV_OPT_TYPE_INT,   {.i64=4}, 0, 8, FLAGS, .unit = "type" },
+    { "col",                 "Columbia",            0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, .unit = "type" },
+    { "emi",                      "EMI",            0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, .unit = "type" },
+    { "bsi",              "BSI (78RPM)",            0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, .unit = "type" },
+    { "riaa",                    "RIAA",            0, AV_OPT_TYPE_CONST, {.i64=3}, 0, 0, FLAGS, .unit = "type" },
+    { "cd",         "Compact Disc (CD)",            0, AV_OPT_TYPE_CONST, {.i64=4}, 0, 0, FLAGS, .unit = "type" },
+    { "50fm",               "50µs (FM)",            0, AV_OPT_TYPE_CONST, {.i64=5}, 0, 0, FLAGS, .unit = "type" },
+    { "75fm",               "75µs (FM)",            0, AV_OPT_TYPE_CONST, {.i64=6}, 0, 0, FLAGS, .unit = "type" },
+    { "50kf",            "50µs (FM-KF)",            0, AV_OPT_TYPE_CONST, {.i64=7}, 0, 0, FLAGS, .unit = "type" },
+    { "75kf",            "75µs (FM-KF)",            0, AV_OPT_TYPE_CONST, {.i64=8}, 0, 0, FLAGS, .unit = "type" },
     { NULL }
 };
 
@@ -105,8 +105,8 @@ static int filter_channels(AVFilterContext *ctx, void *arg, int jobnr, int nb_jo
     ThreadData *td = arg;
     AVFrame *out = td->out;
     AVFrame *in = td->in;
-    const int start = (in->channels * jobnr) / nb_jobs;
-    const int end = (in->channels * (jobnr+1)) / nb_jobs;
+    const int start = ff_slice_pos(in->ch_layout.nb_channels, jobnr, nb_jobs);
+    const int end = ff_slice_pos(in->ch_layout.nb_channels, jobnr + 1, nb_jobs);
 
     for (int ch = start; ch < end; ch++) {
         const double *src = (const double *)in->extended_data[ch];
@@ -144,7 +144,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     td.in = in; td.out = out;
     ff_filter_execute(ctx, filter_channels, &td, NULL,
-                      FFMIN(inlink->channels, ff_filter_get_nb_threads(ctx)));
+                      FFMIN(inlink->ch_layout.nb_channels, ff_filter_get_nb_threads(ctx)));
 
     if (in != out)
         av_frame_free(&in);
@@ -361,23 +361,16 @@ static const AVFilterPad avfilter_af_aemphasis_inputs[] = {
     },
 };
 
-static const AVFilterPad avfilter_af_aemphasis_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
-const AVFilter ff_af_aemphasis = {
-    .name          = "aemphasis",
-    .description   = NULL_IF_CONFIG_SMALL("Audio emphasis."),
+const FFFilter ff_af_aemphasis = {
+    .p.name        = "aemphasis",
+    .p.description = NULL_IF_CONFIG_SMALL("Audio emphasis."),
+    .p.priv_class  = &aemphasis_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(AudioEmphasisContext),
-    .priv_class    = &aemphasis_class,
     .uninit        = uninit,
     FILTER_INPUTS(avfilter_af_aemphasis_inputs),
-    FILTER_OUTPUTS(avfilter_af_aemphasis_outputs),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
     FILTER_SINGLE_SAMPLEFMT(AV_SAMPLE_FMT_DBLP),
     .process_command = process_command,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC |
-                     AVFILTER_FLAG_SLICE_THREADS,
 };

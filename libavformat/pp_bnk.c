@@ -20,11 +20,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/avassert.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/internal.h"
+#include "libavutil/mem.h"
 
 #define PP_BNK_MAX_READ_SIZE    4096
 #define PP_BNK_FILE_HEADER_SIZE 20
@@ -115,10 +118,8 @@ static int pp_bnk_read_header(AVFormatContext *s)
     uint8_t buf[FFMAX(PP_BNK_FILE_HEADER_SIZE, PP_BNK_TRACK_SIZE)];
     PPBnkHeader hdr;
 
-    if ((ret = avio_read(s->pb, buf, PP_BNK_FILE_HEADER_SIZE)) < 0)
+    if ((ret = ffio_read_size(s->pb, buf, PP_BNK_FILE_HEADER_SIZE)) < 0)
         return ret;
-    else if (ret != PP_BNK_FILE_HEADER_SIZE)
-        return AVERROR(EIO);
 
     pp_bnk_parse_header(&hdr, buf);
 
@@ -205,18 +206,12 @@ static int pp_bnk_read_header(AVFormatContext *s)
         par->codec_id               = AV_CODEC_ID_ADPCM_IMA_CUNNING;
         par->format                 = AV_SAMPLE_FMT_S16P;
 
-        if (ctx->is_music) {
-            par->channel_layout     = AV_CH_LAYOUT_STEREO;
-            par->channels           = 2;
-        } else {
-            par->channel_layout     = AV_CH_LAYOUT_MONO;
-            par->channels           = 1;
-        }
-
+        av_channel_layout_default(&par->ch_layout, ctx->is_music + 1);
         par->sample_rate            = hdr.sample_rate;
         par->bits_per_coded_sample  = 4;
         par->block_align            = 1;
-        par->bit_rate               = par->sample_rate * (int64_t)par->bits_per_coded_sample * par->channels;
+        par->bit_rate               = par->sample_rate * (int64_t)par->bits_per_coded_sample *
+                                      par->ch_layout.nb_channels;
 
         avpriv_set_pts_info(st, 64, 1, par->sample_rate);
         st->start_time              = 0;
@@ -250,7 +245,7 @@ static int pp_bnk_read_packet(AVFormatContext *s, AVPacket *pkt)
         if ((ret = avio_seek(s->pb, trk->data_offset + trk->bytes_read, SEEK_SET)) < 0)
             return ret;
         else if (ret != trk->data_offset + trk->bytes_read)
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
 
         size = FFMIN(trk->data_size - trk->bytes_read, PP_BNK_MAX_READ_SIZE);
 
@@ -321,11 +316,11 @@ static int pp_bnk_seek(AVFormatContext *s, int stream_index,
     return 0;
 }
 
-const AVInputFormat ff_pp_bnk_demuxer = {
-    .name           = "pp_bnk",
-    .long_name      = NULL_IF_CONFIG_SMALL("Pro Pinball Series Soundbank"),
+const FFInputFormat ff_pp_bnk_demuxer = {
+    .p.name         = "pp_bnk",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Pro Pinball Series Soundbank"),
     .priv_data_size = sizeof(PPBnkCtx),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = pp_bnk_probe,
     .read_header    = pp_bnk_read_header,
     .read_packet    = pp_bnk_read_packet,

@@ -29,6 +29,7 @@
 #include "dca_syncwords.h"
 #include "get_bits.h"
 #include "parser.h"
+#include "parser_internal.h"
 
 typedef struct DCAParseContext {
     ParseContext pc;
@@ -217,6 +218,7 @@ static int dca_parse_params(DCAParseContext *pc1, const uint8_t *buf,
             switch (get_bits(&gb, 8)) {
             case DCA_LBR_HEADER_DECODER_INIT:
                 pc1->sr_code = get_bits(&gb, 8);
+                break;
             case DCA_LBR_HEADER_SYNC_ONLY:
                 break;
             default:
@@ -228,7 +230,7 @@ static int dca_parse_params(DCAParseContext *pc1, const uint8_t *buf,
 
             *sample_rate = ff_dca_sampling_freqs[pc1->sr_code];
             *duration = 1024 << ff_dca_freq_ranges[pc1->sr_code];
-            *profile = FF_PROFILE_DTS_EXPRESS;
+            *profile = AV_PROFILE_DTS_EXPRESS;
             return 0;
         }
 
@@ -253,7 +255,7 @@ static int dca_parse_params(DCAParseContext *pc1, const uint8_t *buf,
 
             *sample_rate = asset->max_sample_rate;
             *duration = (1 + (*sample_rate > 96000)) << nsamples_log2;
-            *profile = FF_PROFILE_DTS_HD_MA;
+            *profile = AV_PROFILE_DTS_HD_MA;
             return 0;
         }
 
@@ -268,18 +270,18 @@ static int dca_parse_params(DCAParseContext *pc1, const uint8_t *buf,
 
     *duration = h.npcmblocks * DCA_PCMBLOCK_SAMPLES;
     *sample_rate = ff_dca_sample_rates[h.sr_code];
-    if (*profile != FF_PROFILE_UNKNOWN)
+    if (*profile != AV_PROFILE_UNKNOWN)
         return 0;
 
-    *profile = FF_PROFILE_DTS;
+    *profile = AV_PROFILE_DTS;
     if (h.ext_audio_present) {
         switch (h.ext_audio_type) {
         case DCA_EXT_AUDIO_XCH:
         case DCA_EXT_AUDIO_XXCH:
-            *profile = FF_PROFILE_DTS_ES;
+            *profile = AV_PROFILE_DTS_ES;
             break;
         case DCA_EXT_AUDIO_X96:
-            *profile = FF_PROFILE_DTS_96_24;
+            *profile = AV_PROFILE_DTS_96_24;
             break;
         }
     }
@@ -296,9 +298,9 @@ static int dca_parse_params(DCAParseContext *pc1, const uint8_t *buf,
         return 0;
 
     if (asset->extension_mask & DCA_EXSS_XLL)
-        *profile = FF_PROFILE_DTS_HD_MA;
+        *profile = AV_PROFILE_DTS_HD_MA;
     else if (asset->extension_mask & (DCA_EXSS_XBR | DCA_EXSS_XXCH | DCA_EXSS_X96))
-        *profile = FF_PROFILE_DTS_HD_HRA;
+        *profile = AV_PROFILE_DTS_HD_HRA;
 
     return 0;
 }
@@ -343,10 +345,10 @@ static int dca_parse(AVCodecParserContext *s, AVCodecContext *avctx,
     return next;
 }
 
-const AVCodecParser ff_dca_parser = {
-    .codec_ids      = { AV_CODEC_ID_DTS },
+const FFCodecParser ff_dca_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_DTS),
     .priv_data_size = sizeof(DCAParseContext),
-    .parser_init    = dca_parse_init,
-    .parser_parse   = dca_parse,
-    .parser_close   = ff_parse_close,
+    .init           = dca_parse_init,
+    .parse          = dca_parse,
+    .close          = ff_parse_close,
 };

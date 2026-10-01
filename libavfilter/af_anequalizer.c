@@ -22,11 +22,14 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/avstring.h"
 #include "libavutil/ffmath.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
+#include "formats.h"
 #include "audio.h"
+#include "video.h"
 
 #define FILTER_ORDER 4
 
@@ -82,9 +85,9 @@ static const AVOption anequalizer_options[] = {
     { "curves", "draw frequency response curves", OFFSET(draw_curves), AV_OPT_TYPE_BOOL,       {.i64=0}, 0, 1, V|F },
     { "size",   "set video size",                 OFFSET(w),           AV_OPT_TYPE_IMAGE_SIZE, {.str = "hd720"}, 0, 0, V|F },
     { "mgain",  "set max gain",                   OFFSET(mag),         AV_OPT_TYPE_DOUBLE,     {.dbl=60}, -900, 900, V|F },
-    { "fscale", "set frequency scale",            OFFSET(fscale),      AV_OPT_TYPE_INT,        {.i64=1}, 0, 1, V|F, "fscale" },
-        { "lin",  "linear",                       0,                   AV_OPT_TYPE_CONST,      {.i64=0}, 0, 0, V|F, "fscale" },
-        { "log",  "logarithmic",                  0,                   AV_OPT_TYPE_CONST,      {.i64=1}, 0, 0, V|F, "fscale" },
+    { "fscale", "set frequency scale",            OFFSET(fscale),      AV_OPT_TYPE_INT,        {.i64=1}, 0, 1, V|F, .unit = "fscale" },
+        { "lin",  "linear",                       0,                   AV_OPT_TYPE_CONST,      {.i64=0}, 0, 0, V|F, .unit = "fscale" },
+        { "log",  "logarithmic",                  0,                   AV_OPT_TYPE_CONST,      {.i64=1}, 0, 0, V|F, .unit = "fscale" },
     { "colors", "set channels curves colors",     OFFSET(colors),      AV_OPT_TYPE_STRING,     {.str = "red|green|blue|yellow|orange|lime|pink|magenta|brown" }, 0, 0, V|F },
     { NULL }
 };
@@ -103,7 +106,7 @@ static void draw_curves(AVFilterContext *ctx, AVFilterLink *inlink, AVFrame *out
 
     memset(out->data[0], 0, s->h * out->linesize[0]);
 
-    for (ch = 0; ch < inlink->channels; ch++) {
+    for (ch = 0; ch < inlink->ch_layout.nb_channels; ch++) {
         uint8_t fg[4] = { 0xff, 0xff, 0xff, 0xff };
         int prev_v = -1;
         double f;
@@ -214,13 +217,11 @@ static av_cold int init(AVFilterContext *ctx)
     return 0;
 }
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    AVFilterLink *inlink = ctx->inputs[0];
-    AVFilterLink *outlink = ctx->outputs[0];
-    AudioNEqualizerContext *s = ctx->priv;
-    AVFilterFormats *formats;
-    AVFilterChannelLayouts *layouts;
+    const AudioNEqualizerContext *s = ctx->priv;
     static const enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_RGBA, AV_PIX_FMT_NONE };
     static const enum AVSampleFormat sample_fmts[] = {
         AV_SAMPLE_FMT_DBLP,
@@ -229,25 +230,13 @@ static int query_formats(AVFilterContext *ctx)
     int ret;
 
     if (s->draw_curves) {
-        AVFilterLink *videolink = ctx->outputs[1];
-        formats = ff_make_format_list(pix_fmts);
-        if ((ret = ff_formats_ref(formats, &videolink->incfg.formats)) < 0)
+        ret = ff_set_pixel_formats_from_list2(ctx, cfg_in, cfg_out, pix_fmts);
+        if (ret < 0)
             return ret;
     }
 
-    formats = ff_make_format_list(sample_fmts);
-    if ((ret = ff_formats_ref(formats, &inlink->outcfg.formats)) < 0 ||
-        (ret = ff_formats_ref(formats, &outlink->incfg.formats)) < 0)
-        return ret;
-
-    layouts = ff_all_channel_counts();
-    if ((ret = ff_channel_layouts_ref(layouts, &inlink->outcfg.channel_layouts)) < 0 ||
-        (ret = ff_channel_layouts_ref(layouts, &outlink->incfg.channel_layouts)) < 0)
-        return ret;
-
-    formats = ff_all_samplerates();
-    if ((ret = ff_formats_ref(formats, &inlink->outcfg.samplerates)) < 0 ||
-        (ret = ff_formats_ref(formats, &outlink->incfg.samplerates)) < 0)
+    ret = ff_set_sample_formats_from_list2(ctx, cfg_in, cfg_out, sample_fmts);
+    if (ret < 0)
         return ret;
 
     return 0;
@@ -577,8 +566,8 @@ static int config_input(AVFilterLink *inlink)
     if (!args)
         return AVERROR(ENOMEM);
 
-    s->nb_allocated = 32 * inlink->channels;
-    s->filters = av_calloc(inlink->channels, 32 * sizeof(*s->filters));
+    s->nb_allocated = 32 * inlink->ch_layout.nb_channels;
+    s->filters = av_calloc(inlink->ch_layout.nb_channels, 32 * sizeof(*s->filters));
     if (!s->filters) {
         s->nb_allocated = 0;
         av_free(args);
@@ -610,7 +599,7 @@ static int config_input(AVFilterLink *inlink)
             s->filters[s->nb_filters].ignore = 1;
 
         if (s->filters[s->nb_filters].channel < 0 ||
-            s->filters[s->nb_filters].channel >= inlink->channels)
+            s->filters[s->nb_filters].channel >= inlink->ch_layout.nb_channels)
             s->filters[s->nb_filters].ignore = 1;
 
         s->filters[s->nb_filters].type = av_clip(s->filters[s->nb_filters].type, 0, NB_TYPES - 1);
@@ -698,8 +687,8 @@ static int filter_channels(AVFilterContext *ctx, void *arg,
 {
     AudioNEqualizerContext *s = ctx->priv;
     AVFrame *buf = arg;
-    const int start = (buf->channels * jobnr) / nb_jobs;
-    const int end = (buf->channels * (jobnr+1)) / nb_jobs;
+    const int start = ff_slice_pos(buf->ch_layout.nb_channels, jobnr, nb_jobs);
+    const int end = ff_slice_pos(buf->ch_layout.nb_channels, jobnr + 1, nb_jobs);
 
     for (int i = 0; i < s->nb_filters; i++) {
         EqualizatorFilter *f = &s->filters[i];
@@ -731,7 +720,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *buf)
 
     if (!ctx->is_disabled)
         ff_filter_execute(ctx, filter_channels, buf, NULL,
-                          FFMIN(inlink->channels, ff_filter_get_nb_threads(ctx)));
+                          FFMIN(inlink->ch_layout.nb_channels, ff_filter_get_nb_threads(ctx)));
 
     if (s->draw_curves) {
         AVFrame *clone;
@@ -763,18 +752,18 @@ static const AVFilterPad inputs[] = {
     },
 };
 
-const AVFilter ff_af_anequalizer = {
-    .name          = "anequalizer",
-    .description   = NULL_IF_CONFIG_SMALL("Apply high-order audio parametric multi band equalizer."),
+const FFFilter ff_af_anequalizer = {
+    .p.name        = "anequalizer",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply high-order audio parametric multi band equalizer."),
+    .p.priv_class  = &anequalizer_class,
+    .p.outputs     = NULL,
+    .p.flags       = AVFILTER_FLAG_DYNAMIC_OUTPUTS |
+                     AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(AudioNEqualizerContext),
-    .priv_class    = &anequalizer_class,
     .init          = init,
     .uninit        = uninit,
     FILTER_INPUTS(inputs),
-    .outputs       = NULL,
-    FILTER_QUERY_FUNC(query_formats),
+    FILTER_QUERY_FUNC2(query_formats),
     .process_command = process_command,
-    .flags         = AVFILTER_FLAG_DYNAMIC_OUTPUTS |
-                     AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
-                     AVFILTER_FLAG_SLICE_THREADS,
 };

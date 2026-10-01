@@ -29,6 +29,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/parseutils.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct VivoContext {
@@ -208,7 +209,7 @@ static int vivo_read_header(AVFormatContext *s)
                 value_used = 1;
             } else if (!strcmp(key, "FPS")) {
                 double d;
-                if (av_sscanf(value, "%f", &d) != 1)
+                if (av_sscanf(value, "%lf", &d) != 1)
                     return AVERROR_INVALIDDATA;
 
                 value_used = 1;
@@ -249,7 +250,7 @@ static int vivo_read_header(AVFormatContext *s)
     ast->start_time        = 0;
     ast->codecpar->codec_tag  = 0;
     ast->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
-    ast->codecpar->channels = 1;
+    ast->codecpar->ch_layout.nb_channels = 1;
 
     return 0;
 }
@@ -314,12 +315,12 @@ restart:
     return ret;
 }
 
-const AVInputFormat ff_vivo_demuxer = {
-    .name           = "vivo",
-    .long_name      = NULL_IF_CONFIG_SMALL("Vivo"),
+const FFInputFormat ff_vivo_demuxer = {
+    .p.name         = "vivo",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Vivo"),
+    .p.extensions   = "viv",
     .priv_data_size = sizeof(VivoContext),
     .read_probe     = vivo_probe,
     .read_header    = vivo_read_header,
     .read_packet    = vivo_read_packet,
-    .extensions     = "viv",
 };

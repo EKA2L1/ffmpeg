@@ -22,14 +22,15 @@
 
 #include <inttypes.h>
 
+#include "libavutil/attributes.h"
 #include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 
 #define BITSTREAM_READER_LE
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
 #include "get_bits.h"
-#include "internal.h"
 #include "unary.h"
 #include "thread.h"
 
@@ -63,6 +64,7 @@ static void do_vflip(AVCodecContext *avctx, AVFrame *pic, int vflip)
         pic->linesize[1] = -pic->linesize[1];
         pic->data[2] += (avctx->height - 1) * pic->linesize[2];
         pic->linesize[2] = -pic->linesize[2];
+        av_fallthrough;
     case AV_PIX_FMT_RGB555LE:
     case AV_PIX_FMT_RGB565LE:
     case AV_PIX_FMT_BGR24:
@@ -93,7 +95,6 @@ static int dxtory_decode_v1_rgb(AVCodecContext *avctx, AVFrame *pic,
                                 const uint8_t *src, int src_size,
                                 int id, int bpp, uint32_t vflipped)
 {
-    ThreadFrame frame = { .f = pic };
     int h;
     uint8_t *dst;
     int ret;
@@ -104,7 +105,7 @@ static int dxtory_decode_v1_rgb(AVCodecContext *avctx, AVFrame *pic,
     }
 
     avctx->pix_fmt = id;
-    if ((ret = ff_thread_get_buffer(avctx, &frame, 0)) < 0)
+    if ((ret = ff_thread_get_buffer(avctx, pic, 0)) < 0)
         return ret;
 
     do_vflip(avctx, pic, vflipped);
@@ -125,7 +126,6 @@ static int dxtory_decode_v1_410(AVCodecContext *avctx, AVFrame *pic,
                                 const uint8_t *src, int src_size,
                                 uint32_t vflipped)
 {
-    ThreadFrame frame = { .f = pic };
     int h, w;
     uint8_t *Y1, *Y2, *Y3, *Y4, *U, *V;
     int height, width, hmargin, vmargin;
@@ -138,7 +138,7 @@ static int dxtory_decode_v1_410(AVCodecContext *avctx, AVFrame *pic,
     }
 
     avctx->pix_fmt = AV_PIX_FMT_YUV410P;
-    if ((ret = ff_thread_get_buffer(avctx, &frame, 0)) < 0)
+    if ((ret = ff_thread_get_buffer(avctx, pic, 0)) < 0)
         return ret;
 
     do_vflip(avctx, pic, vflipped);
@@ -221,7 +221,6 @@ static int dxtory_decode_v1_420(AVCodecContext *avctx, AVFrame *pic,
                                 const uint8_t *src, int src_size,
                                 uint32_t vflipped)
 {
-    ThreadFrame frame = { .f = pic };
     int h, w;
     uint8_t *Y1, *Y2, *U, *V;
     int height, width, hmargin, vmargin;
@@ -234,7 +233,7 @@ static int dxtory_decode_v1_420(AVCodecContext *avctx, AVFrame *pic,
     }
 
     avctx->pix_fmt = AV_PIX_FMT_YUV420P;
-    if ((ret = ff_thread_get_buffer(avctx, &frame, 0)) < 0)
+    if ((ret = ff_thread_get_buffer(avctx, pic, 0)) < 0)
         return ret;
 
     do_vflip(avctx, pic, vflipped);
@@ -294,7 +293,6 @@ static int dxtory_decode_v1_444(AVCodecContext *avctx, AVFrame *pic,
                                 const uint8_t *src, int src_size,
                                 uint32_t vflipped)
 {
-    ThreadFrame frame = { .f = pic };
     int h, w;
     uint8_t *Y, *U, *V;
     int ret;
@@ -305,7 +303,7 @@ static int dxtory_decode_v1_444(AVCodecContext *avctx, AVFrame *pic,
     }
 
     avctx->pix_fmt = AV_PIX_FMT_YUV444P;
-    if ((ret = ff_thread_get_buffer(avctx, &frame, 0)) < 0)
+    if ((ret = ff_thread_get_buffer(avctx, pic, 0)) < 0)
         return ret;
 
     do_vflip(avctx, pic, vflipped);
@@ -430,7 +428,6 @@ static int dxtory_decode_v2(AVCodecContext *avctx, AVFrame *pic,
                             enum AVPixelFormat fmt,
                             uint32_t vflipped)
 {
-    ThreadFrame frame = { .f = pic };
     GetByteContext gb, gb_check;
     GetBitContext  gb2;
     int nslices, slice, line = 0;
@@ -457,7 +454,7 @@ static int dxtory_decode_v2(AVCodecContext *avctx, AVFrame *pic,
         return AVERROR_INVALIDDATA;
 
     avctx->pix_fmt = fmt;
-    if ((ret = ff_thread_get_buffer(avctx, &frame, 0)) < 0)
+    if ((ret = ff_thread_get_buffer(avctx, pic, 0)) < 0)
         return ret;
 
     do_vflip(avctx, pic, vflipped);
@@ -789,10 +786,9 @@ static int dxtory_decode_v2_444(AVCodecContext *avctx, AVFrame *pic,
                             AV_PIX_FMT_YUV444P, vflipped);
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
-                        AVPacket *avpkt)
+static int decode_frame(AVCodecContext *avctx, AVFrame *pic,
+                        int *got_frame, AVPacket *avpkt)
 {
-    AVFrame *pic = data;
     const uint8_t *src = avpkt->data;
     uint32_t type;
     int vflipped, ret;
@@ -869,18 +865,16 @@ static int decode_frame(AVCodecContext *avctx, void *data, int *got_frame,
     if (ret)
         return ret;
 
-    pic->pict_type = AV_PICTURE_TYPE_I;
-    pic->key_frame = 1;
     *got_frame = 1;
 
     return avpkt->size;
 }
 
-const AVCodec ff_dxtory_decoder = {
-    .name           = "dxtory",
-    .long_name      = NULL_IF_CONFIG_SMALL("Dxtory"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_DXTORY,
-    .decode         = decode_frame,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
+const FFCodec ff_dxtory_decoder = {
+    .p.name         = "dxtory",
+    CODEC_LONG_NAME("Dxtory"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_DXTORY,
+    FF_CODEC_DECODE_CB(decode_frame),
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
 };

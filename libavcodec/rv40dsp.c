@@ -24,6 +24,7 @@
  * RV40 decoder motion compensation functions
  */
 
+#include "libavutil/attributes_internal.h"
 #include "libavutil/common.h"
 #include "libavutil/intreadwrite.h"
 #include "h264qpel.h"
@@ -283,7 +284,7 @@ static void avg_rv40_qpel8_mc33_c(uint8_t *dst, const uint8_t *src, ptrdiff_t st
     avg_pixels8_xy2_8_c(dst, src, stride, 8);
 }
 
-static const int rv40_bias[4][4] = {
+attribute_visibility_hidden const int ff_rv40_bias[4][4] = {
     {  0, 16, 32, 16 },
     { 32, 28, 32, 28 },
     {  0, 32, 16, 32 },
@@ -292,7 +293,7 @@ static const int rv40_bias[4][4] = {
 
 #define RV40_CHROMA_MC(OPNAME, OP)\
 static void OPNAME ## rv40_chroma_mc4_c(uint8_t *dst /*align 8*/,\
-                                        uint8_t *src /*align 1*/,\
+                                        const uint8_t *src /*align 1*/,\
                                         ptrdiff_t stride, int h, int x, int y)\
 {\
     const int A = (8-x) * (8-y);\
@@ -300,7 +301,7 @@ static void OPNAME ## rv40_chroma_mc4_c(uint8_t *dst /*align 8*/,\
     const int C = (8-x) * (  y);\
     const int D = (  x) * (  y);\
     int i;\
-    int bias = rv40_bias[y>>1][x>>1];\
+    int bias = ff_rv40_bias[y>>1][x>>1];\
     \
     av_assert2(x<8 && y<8 && x>=0 && y>=0);\
 \
@@ -328,7 +329,7 @@ static void OPNAME ## rv40_chroma_mc4_c(uint8_t *dst /*align 8*/,\
 }\
 \
 static void OPNAME ## rv40_chroma_mc8_c(uint8_t *dst/*align 8*/,\
-                                        uint8_t *src/*align 1*/,\
+                                        const uint8_t *src/*align 1*/,\
                                         ptrdiff_t stride, int h, int x, int y)\
 {\
     const int A = (8-x) * (8-y);\
@@ -336,7 +337,7 @@ static void OPNAME ## rv40_chroma_mc8_c(uint8_t *dst/*align 8*/,\
     const int C = (8-x) * (  y);\
     const int D = (  x) * (  y);\
     int i;\
-    int bias = rv40_bias[y>>1][x>>1];\
+    int bias = ff_rv40_bias[y>>1][x>>1];\
     \
     av_assert2(x<8 && y<8 && x>=0 && y>=0);\
 \
@@ -705,10 +706,13 @@ av_cold void ff_rv40dsp_init(RV34DSPContext *c)
     c->rv40_loop_filter_strength[0] = rv40_h_loop_filter_strength;
     c->rv40_loop_filter_strength[1] = rv40_v_loop_filter_strength;
 
-    if (ARCH_AARCH64)
-        ff_rv40dsp_init_aarch64(c);
-    if (ARCH_ARM)
-        ff_rv40dsp_init_arm(c);
-    if (ARCH_X86)
-        ff_rv40dsp_init_x86(c);
+#if ARCH_AARCH64
+    ff_rv40dsp_init_aarch64(c);
+#elif ARCH_ARM
+    ff_rv40dsp_init_arm(c);
+#elif ARCH_RISCV
+    ff_rv40dsp_init_riscv(c);
+#elif ARCH_X86 && HAVE_X86ASM
+    ff_rv40dsp_init_x86(c);
+#endif
 }

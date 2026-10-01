@@ -20,13 +20,15 @@
  */
 
 #include "libavcodec/bytestream.h"
-#include "libavutil/avstring.h"
+#include "libavutil/attributes.h"
 #include "libavutil/intfloat.h"
-#include "avformat.h"
+#include "libavutil/mem.h"
 
 #include "rtmppkt.h"
 #include "flv.h"
 #include "url.h"
+
+#define MAX_DEPTH 16      ///< arbitrary limit to prevent unbounded recursion
 
 void ff_amf_write_bool(uint8_t **dst, int val)
 {
@@ -38,6 +40,12 @@ void ff_amf_write_number(uint8_t **dst, double val)
 {
     bytestream_put_byte(dst, AMF_DATA_TYPE_NUMBER);
     bytestream_put_be64(dst, av_double2int(val));
+}
+
+void ff_amf_write_array_start(uint8_t **dst, uint32_t length)
+{
+    bytestream_put_byte(dst, AMF_DATA_TYPE_ARRAY);
+    bytestream_put_be32(dst, length);
 }
 
 void ff_amf_write_string(uint8_t **dst, const char *str)
@@ -431,14 +439,18 @@ void ff_rtmp_packet_destroy(RTMPPacket *pkt)
     pkt->size = 0;
 }
 
-static int amf_tag_skip(GetByteContext *gb)
+static int amf_tag_skip(GetByteContext *gb, int depth)
 {
     AMFDataType type;
     unsigned nb   = -1;
-    int parse_key = 1;
 
     if (bytestream2_get_bytes_left(gb) < 1)
         return -1;
+
+    if (depth > MAX_DEPTH) {
+        av_log(NULL, AV_LOG_ERROR, "amf_tag_skip: exceeded max depth\n");
+        return AVERROR_PATCHWELCOME;
+    }
 
     type = bytestream2_get_byte(gb);
     switch (type) {
@@ -460,13 +472,13 @@ static int amf_tag_skip(GetByteContext *gb)
         bytestream2_skip(gb, 10);
         return 0;
     case AMF_DATA_TYPE_ARRAY:
-        parse_key = 0;
     case AMF_DATA_TYPE_MIXEDARRAY:
         nb = bytestream2_get_be32(gb);
+        av_fallthrough;
     case AMF_DATA_TYPE_OBJECT:
-        while (nb-- > 0 || type != AMF_DATA_TYPE_ARRAY) {
+        while (type != AMF_DATA_TYPE_ARRAY || nb-- > 0) {
             int t;
-            if (parse_key) {
+            if (type != AMF_DATA_TYPE_ARRAY) {
                 int size = bytestream2_get_be16(gb);
                 if (!size) {
                     bytestream2_get_byte(gb);
@@ -476,7 +488,7 @@ static int amf_tag_skip(GetByteContext *gb)
                     return -1;
                 bytestream2_skip(gb, size);
             }
-            t = amf_tag_skip(gb);
+            t = amf_tag_skip(gb, depth + 1);
             if (t < 0 || bytestream2_get_bytes_left(gb) <= 0)
                 return -1;
         }
@@ -496,7 +508,7 @@ int ff_amf_tag_size(const uint8_t *data, const uint8_t *data_end)
 
     bytestream2_init(&gb, data, data_end - data);
 
-    ret = amf_tag_skip(&gb);
+    ret = amf_tag_skip(&gb, 0);
     if (ret < 0 || bytestream2_get_bytes_left(&gb) <= 0)
         return -1;
     av_assert0(bytestream2_tell(&gb) >= 0 && bytestream2_tell(&gb) <= data_end - data);
@@ -510,7 +522,7 @@ static int amf_get_field_value2(GetByteContext *gb,
     int len;
 
     while (bytestream2_peek_byte(gb) != AMF_DATA_TYPE_OBJECT && bytestream2_get_bytes_left(gb) > 0) {
-        int ret = amf_tag_skip(gb);
+        int ret = amf_tag_skip(gb, 0);
         if (ret < 0)
             return -1;
     }
@@ -547,7 +559,7 @@ static int amf_get_field_value2(GetByteContext *gb,
             }
             return 0;
         }
-        len = amf_tag_skip(gb);
+        len = amf_tag_skip(gb, 0);
         if (len < 0 || bytestream2_get_bytes_left(gb) <= 0)
             return -1;
     }
@@ -590,12 +602,17 @@ static const char* rtmp_packet_type(int type)
 }
 
 static void amf_tag_contents(void *ctx, const uint8_t *data,
-                             const uint8_t *data_end)
+                             const uint8_t *data_end, int depth)
 {
     unsigned int size, nb = -1;
     char buf[1024];
     AMFDataType type;
     int parse_key = 1;
+
+    if (depth > MAX_DEPTH) {
+        av_log(NULL, AV_LOG_ERROR, "amf_tag_contents: exceeded max depth\n");
+        return;
+    }
 
     if (data >= data_end)
         return;
@@ -644,7 +661,7 @@ static void amf_tag_contents(void *ctx, const uint8_t *data,
                 data += size;
                 av_log(ctx, AV_LOG_DEBUG, "  %s: ", buf);
             }
-            amf_tag_contents(ctx, data, data_end);
+            amf_tag_contents(ctx, data, data_end, depth + 1);
             t = ff_amf_tag_size(data, data_end);
             if (t < 0 || t >= data_end - data)
                 return;
@@ -667,7 +684,7 @@ void ff_rtmp_packet_dump(void *ctx, RTMPPacket *p)
         uint8_t *src = p->data, *src_end = p->data + p->size;
         while (src < src_end) {
             int sz;
-            amf_tag_contents(ctx, src, src_end);
+            amf_tag_contents(ctx, src, src_end, 0);
             sz = ff_amf_tag_size(src, src_end);
             if (sz < 0)
                 break;

@@ -208,7 +208,7 @@ cglobal sbr_sum64x5, 1,2,4,z
     add     zq, 32
     cmp     zq, r1q
     jne  .loop
-    REP_RET
+    RET
 
 INIT_XMM sse
 cglobal sbr_qmf_post_shuffle, 2,3,4,W,z
@@ -227,7 +227,7 @@ cglobal sbr_qmf_post_shuffle, 2,3,4,W,z
     add               zq, 16
     cmp               zq, r2q
     jl             .loop
-    REP_RET
+    RET
 
 INIT_XMM sse
 cglobal sbr_neg_odd_64, 1,2,4,z
@@ -248,10 +248,10 @@ cglobal sbr_neg_odd_64, 1,2,4,z
     add         zq, 64
     cmp         zq, r1q
     jne      .loop
-    REP_RET
+    RET
 
 ; void ff_sbr_qmf_deint_bfly_sse2(float *v, const float *src0, const float *src1)
-%macro SBR_QMF_DEINT_BFLY  0
+INIT_XMM sse2
 cglobal sbr_qmf_deint_bfly, 3,5,8, v,src0,src1,vrev,c
     mov               cq, 64*4-2*mmsize
     lea            vrevq, [vq + 64*4]
@@ -260,17 +260,10 @@ cglobal sbr_qmf_deint_bfly, 3,5,8, v,src0,src1,vrev,c
     mova              m1, [src1q]
     mova              m4, [src0q+cq+mmsize]
     mova              m5, [src1q+mmsize]
-%if cpuflag(sse2)
     pshufd            m2, m0, q0123
     pshufd            m3, m1, q0123
     pshufd            m6, m4, q0123
     pshufd            m7, m5, q0123
-%else
-    shufps            m2, m0, m0, q0123
-    shufps            m3, m1, m1, q0123
-    shufps            m6, m4, m4, q0123
-    shufps            m7, m5, m5, q0123
-%endif
     addps             m5, m2
     subps             m0, m7
     addps             m1, m6
@@ -283,14 +276,7 @@ cglobal sbr_qmf_deint_bfly, 3,5,8, v,src0,src1,vrev,c
     add            vrevq, 2*mmsize
     sub               cq, 2*mmsize
     jge            .loop
-    REP_RET
-%endmacro
-
-INIT_XMM sse
-SBR_QMF_DEINT_BFLY
-
-INIT_XMM sse2
-SBR_QMF_DEINT_BFLY
+    RET
 
 INIT_XMM sse2
 cglobal sbr_qmf_pre_shuffle, 1,4,6,z
@@ -320,9 +306,9 @@ cglobal sbr_qmf_pre_shuffle, 1,4,6,z
     jge      .loop
     movq       m2, [zq]
     movq    [r2q], m2
-    REP_RET
+    RET
 
-%ifdef PIC
+%if PIC
 %define NREGS 1
 %if UNIX64
 %define NOISE_TABLE r6q ; r5q is m_max
@@ -335,7 +321,7 @@ cglobal sbr_qmf_pre_shuffle, 1,4,6,z
 %endif
 
 %macro LOAD_NST  1
-%ifdef PIC
+%if PIC
     lea  NOISE_TABLE, [%1]
     mova          m0, [kxq + NOISE_TABLE]
 %else
@@ -385,7 +371,7 @@ apply_noise_main:
     movsxdifnidn    noiseq, noised
     dec    noiseq
     shl    countd, 2
-%ifdef PIC
+%if PIC
     lea NOISE_TABLE, [sbr_noise_table]
 %endif
     lea        Yq, [Yq + 2*countq]
@@ -446,7 +432,7 @@ cglobal sbr_qmf_deint_neg, 2,4,4,v,src,vrev,c
     sub        vq, mmsize
     add        cq, mmsize
     jl      .loop
-    REP_RET
+    RET
 
 %macro SBR_AUTOCORRELATE 0
 cglobal sbr_autocorrelate, 2,3,8,32, x, phi, cnt

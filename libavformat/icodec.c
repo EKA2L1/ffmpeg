@@ -25,10 +25,11 @@
  */
 
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavcodec/bytestream.h"
-#include "libavcodec/bmp.h"
 #include "libavcodec/png.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 typedef struct {
@@ -112,7 +113,7 @@ static int read_header(AVFormatContext *s)
         avio_skip(pb, 5);
 
         ico->images[i].size   = avio_rl32(pb);
-        if (ico->images[i].size <= 0) {
+        if (ico->images[i].size <= 0 || ico->images[i].size > INT_MAX - 14) {
             av_log(s, AV_LOG_ERROR, "Invalid image size %d\n", ico->images[i].size);
             return AVERROR_INVALIDDATA;
         }
@@ -197,6 +198,9 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
             AV_WL32(buf + 32, image->nb_pal);
         }
 
+        if (image->nb_pal > INT_MAX / 4 - 14 - 40U)
+            return AVERROR_INVALIDDATA;
+
         AV_WL32(buf - 4, 14 + 40 + image->nb_pal * 4);
         AV_WL32(buf + 8, AV_RL32(buf + 8) / 2);
     }
@@ -214,14 +218,14 @@ static int ico_read_close(AVFormatContext * s)
     return 0;
 }
 
-const AVInputFormat ff_ico_demuxer = {
-    .name           = "ico",
-    .long_name      = NULL_IF_CONFIG_SMALL("Microsoft Windows ICO"),
+const FFInputFormat ff_ico_demuxer = {
+    .p.name         = "ico",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Microsoft Windows ICO"),
+    .p.flags        = AVFMT_NOTIMESTAMPS,
     .priv_data_size = sizeof(IcoDemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = probe,
     .read_header    = read_header,
     .read_packet    = read_packet,
     .read_close     = ico_read_close,
-    .flags          = AVFMT_NOTIMESTAMPS,
 };

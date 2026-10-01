@@ -25,6 +25,7 @@
  */
 
 #include "libavutil/adler32.h"
+#include "libavutil/mem.h"
 #include "libavcodec/avcodec.h"
 #include "libavformat/avformat.h"
 #include "libavutil/imgutils.h"
@@ -153,8 +154,8 @@ static int video_decode_example(const char *input_filename)
                 av_frame_unref(fr);
                 return number_of_written_bytes;
             }
-            printf("%d, %s, %s, %8"PRId64", %8d, 0x%08"PRIx32"\n", video_stream,
-                   av_ts2str(fr->pts), av_ts2str(fr->pkt_dts), fr->pkt_duration,
+            printf("%d, %10s, %10s, %8"PRId64", %8d, 0x%08"PRIx32"\n", video_stream,
+                   av_ts2str(fr->pts), av_ts2str(fr->pkt_dts), fr->duration,
                    number_of_written_bytes, av_adler32_update(0, (const uint8_t*)byte_buffer, number_of_written_bytes));
 
             av_frame_unref(fr);

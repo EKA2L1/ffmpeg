@@ -27,6 +27,7 @@
 
 #include "parser.h"
 #include "g729.h"
+#include "parser_internal.h"
 
 typedef struct G729ParseContext {
     ParseContext pc;
@@ -48,7 +49,10 @@ static int g729_parse(AVCodecParserContext *s1, AVCodecContext *avctx,
         s->block_size = (avctx->bit_rate < 8000) ? G729D_6K4_BLOCK_SIZE : G729_8K_BLOCK_SIZE;
         if (avctx->codec_id == AV_CODEC_ID_ACELP_KELVIN)
             s->block_size++;
-        s->block_size *= avctx->channels;
+        // channels > 2 is invalid, we pass the packet on unchanged
+        if (avctx->ch_layout.nb_channels > 2)
+            s->block_size = 0;
+        s->block_size *= avctx->ch_layout.nb_channels;
         s->duration   = avctx->frame_size;
     }
 
@@ -81,9 +85,9 @@ static int g729_parse(AVCodecParserContext *s1, AVCodecContext *avctx,
     return next;
 }
 
-const AVCodecParser ff_g729_parser = {
-    .codec_ids      = { AV_CODEC_ID_G729, AV_CODEC_ID_ACELP_KELVIN },
+const FFCodecParser ff_g729_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_G729, AV_CODEC_ID_ACELP_KELVIN),
     .priv_data_size = sizeof(G729ParseContext),
-    .parser_parse   = g729_parse,
-    .parser_close   = ff_parse_close,
+    .parse          = g729_parse,
+    .close          = ff_parse_close,
 };

@@ -21,9 +21,9 @@
 #include "libavutil/pixdesc.h"
 
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "vaapi_vpp.h"
+#include "video.h"
 
 // Denoise min/max/default Values
 #define DENOISE_MIN            0
@@ -131,6 +131,9 @@ static int misc_vaapi_filter_frame(AVFilterLink *inlink, AVFrame *input_frame)
            av_get_pix_fmt_name(input_frame->format),
            input_frame->width, input_frame->height, input_frame->pts);
 
+    if (vpp_ctx->passthrough)
+        return ff_filter_frame(outlink, input_frame);
+
     if (vpp_ctx->va_context == VA_INVALID_ID)
         return AVERROR(EINVAL);
 
@@ -176,11 +179,14 @@ fail:
 static av_cold int denoise_vaapi_init(AVFilterContext *avctx)
 {
     VAAPIVPPContext *vpp_ctx = avctx->priv;
+    DenoiseVAAPIContext *ctx = avctx->priv;
 
     ff_vaapi_vpp_ctx_init(avctx);
     vpp_ctx->pipeline_uninit     = ff_vaapi_vpp_pipeline_uninit;
     vpp_ctx->build_filter_params = denoise_vaapi_build_filter_params;
     vpp_ctx->output_format       = AV_PIX_FMT_NONE;
+    if (ctx->denoise == DENOISE_DEFAULT)
+        vpp_ctx->passthrough = 1;
 
     return 0;
 }
@@ -188,11 +194,14 @@ static av_cold int denoise_vaapi_init(AVFilterContext *avctx)
 static av_cold int sharpness_vaapi_init(AVFilterContext *avctx)
 {
     VAAPIVPPContext *vpp_ctx = avctx->priv;
+    SharpnessVAAPIContext *ctx = avctx->priv;
 
     ff_vaapi_vpp_ctx_init(avctx);
     vpp_ctx->pipeline_uninit     = ff_vaapi_vpp_pipeline_uninit;
     vpp_ctx->build_filter_params = sharpness_vaapi_build_filter_params;
     vpp_ctx->output_format       = AV_PIX_FMT_NONE;
+    if (ctx->sharpness == SHARPNESS_DEFAULT)
+        vpp_ctx->passthrough = 1;
 
     return 0;
 }
@@ -232,28 +241,28 @@ static const AVFilterPad misc_vaapi_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_denoise_vaapi = {
-    .name          = "denoise_vaapi",
-    .description   = NULL_IF_CONFIG_SMALL("VAAPI VPP for de-noise"),
+const FFFilter ff_vf_denoise_vaapi = {
+    .p.name        = "denoise_vaapi",
+    .p.description = NULL_IF_CONFIG_SMALL("VAAPI VPP for de-noise"),
+    .p.priv_class  = &denoise_vaapi_class,
     .priv_size     = sizeof(DenoiseVAAPIContext),
     .init          = &denoise_vaapi_init,
     .uninit        = &ff_vaapi_vpp_ctx_uninit,
     FILTER_INPUTS(misc_vaapi_inputs),
     FILTER_OUTPUTS(misc_vaapi_outputs),
-    FILTER_QUERY_FUNC(&ff_vaapi_vpp_query_formats),
-    .priv_class    = &denoise_vaapi_class,
+    FILTER_QUERY_FUNC2(&ff_vaapi_vpp_query_formats),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 
-const AVFilter ff_vf_sharpness_vaapi = {
-    .name          = "sharpness_vaapi",
-    .description   = NULL_IF_CONFIG_SMALL("VAAPI VPP for sharpness"),
+const FFFilter ff_vf_sharpness_vaapi = {
+    .p.name        = "sharpness_vaapi",
+    .p.description = NULL_IF_CONFIG_SMALL("VAAPI VPP for sharpness"),
+    .p.priv_class  = &sharpness_vaapi_class,
     .priv_size     = sizeof(SharpnessVAAPIContext),
     .init          = &sharpness_vaapi_init,
     .uninit        = &ff_vaapi_vpp_ctx_uninit,
     FILTER_INPUTS(misc_vaapi_inputs),
     FILTER_OUTPUTS(misc_vaapi_outputs),
-    FILTER_QUERY_FUNC(&ff_vaapi_vpp_query_formats),
-    .priv_class    = &sharpness_vaapi_class,
+    FILTER_QUERY_FUNC2(&ff_vaapi_vpp_query_formats),
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

@@ -19,12 +19,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/opt.h"
 
 #include "avcodec.h"
 #include "bytestream.h"
+#include "codec_internal.h"
 #include "encode.h"
-#include "internal.h"
 #include "sunrast.h"
 
 typedef struct SUNRASTContext {
@@ -154,7 +155,7 @@ static av_cold int sunrast_encode_init(AVCodecContext *avctx)
     case AV_PIX_FMT_PAL8 :
         s->maptype   = RMT_EQUAL_RGB;
         s->maplength = 3 * 256;
-        /* fall-through */
+        av_fallthrough;
     case AV_PIX_FMT_GRAY8:
         s->depth = 8;
         break;
@@ -208,19 +209,18 @@ static const AVClass sunrast_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_sunrast_encoder = {
-    .name           = "sunrast",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sun Rasterfile image"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_SUNRAST,
+const FFCodec ff_sunrast_encoder = {
+    .p.name         = "sunrast",
+    CODEC_LONG_NAME("Sun Rasterfile image"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_SUNRAST,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(SUNRASTContext),
     .init           = sunrast_encode_init,
-    .encode2        = sunrast_encode_frame,
-    .priv_class     = &sunrast_class,
-    .pix_fmts       = (const enum AVPixelFormat[]){ AV_PIX_FMT_BGR24,
-                                                  AV_PIX_FMT_PAL8,
-                                                  AV_PIX_FMT_GRAY8,
-                                                  AV_PIX_FMT_MONOWHITE,
-                                                  AV_PIX_FMT_NONE },
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    FF_CODEC_ENCODE_CB(sunrast_encode_frame),
+    .p.priv_class   = &sunrast_class,
+    CODEC_PIXFMTS(AV_PIX_FMT_BGR24,
+                  AV_PIX_FMT_PAL8,
+                  AV_PIX_FMT_GRAY8,
+                  AV_PIX_FMT_MONOWHITE),
 };

@@ -22,6 +22,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 static int mtaf_probe(const AVProbeData *p)
@@ -54,9 +55,9 @@ static int mtaf_read_header(AVFormatContext *s)
 
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id    = AV_CODEC_ID_ADPCM_MTAF;
-    st->codecpar->channels    = 2 * stream_count;
+    st->codecpar->ch_layout.nb_channels = 2 * stream_count;
     st->codecpar->sample_rate = 48000;
-    st->codecpar->block_align = 0x110 * st->codecpar->channels / 2;
+    st->codecpar->block_align = 0x110 * st->codecpar->ch_layout.nb_channels / 2;
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
 
     avio_seek(s->pb, 0x800, SEEK_SET);
@@ -71,11 +72,11 @@ static int mtaf_read_packet(AVFormatContext *s, AVPacket *pkt)
     return av_get_packet(s->pb, pkt, par->block_align);
 }
 
-const AVInputFormat ff_mtaf_demuxer = {
-    .name           = "mtaf",
-    .long_name      = NULL_IF_CONFIG_SMALL("Konami PS2 MTAF"),
+const FFInputFormat ff_mtaf_demuxer = {
+    .p.name         = "mtaf",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Konami PS2 MTAF"),
+    .p.extensions   = "mtaf",
     .read_probe     = mtaf_probe,
     .read_header    = mtaf_read_header,
     .read_packet    = mtaf_read_packet,
-    .extensions     = "mtaf",
 };

@@ -53,7 +53,7 @@ static const struct {
   {13, "CN",         AVMEDIA_TYPE_AUDIO,   AV_CODEC_ID_NONE, 8000, 1},
   {14, "MPA",        AVMEDIA_TYPE_AUDIO,   AV_CODEC_ID_MP2, -1, -1},
   {14, "MPA",        AVMEDIA_TYPE_AUDIO,   AV_CODEC_ID_MP3, -1, -1},
-  {15, "G728",       AVMEDIA_TYPE_AUDIO,   AV_CODEC_ID_NONE, 8000, 1},
+  {15, "G728",       AVMEDIA_TYPE_AUDIO,   AV_CODEC_ID_G728, 8000, 1},
   {16, "DVI4",       AVMEDIA_TYPE_AUDIO,   AV_CODEC_ID_NONE, 11025, 1},
   {17, "DVI4",       AVMEDIA_TYPE_AUDIO,   AV_CODEC_ID_NONE, 22050, 1},
   {18, "G729",       AVMEDIA_TYPE_AUDIO,   AV_CODEC_ID_NONE, 8000, 1},
@@ -77,8 +77,11 @@ int ff_rtp_get_codec_info(AVCodecParameters *par, int payload_type)
             if (rtp_payload_types[i].codec_id != AV_CODEC_ID_NONE) {
                 par->codec_type = rtp_payload_types[i].codec_type;
                 par->codec_id = rtp_payload_types[i].codec_id;
-                if (rtp_payload_types[i].audio_channels > 0)
-                    par->channels = rtp_payload_types[i].audio_channels;
+                if (rtp_payload_types[i].audio_channels > 0) {
+                    av_channel_layout_uninit(&par->ch_layout);
+                    par->ch_layout.order = AV_CHANNEL_ORDER_UNSPEC;
+                    par->ch_layout.nb_channels = rtp_payload_types[i].audio_channels;
+                }
                 if (rtp_payload_types[i].clock_rate > 0)
                     par->sample_rate = rtp_payload_types[i].clock_rate;
                 return 0;
@@ -111,13 +114,13 @@ int ff_rtp_get_payload_type(const AVFormatContext *fmt,
             /* G722 has 8000 as nominal rate even if the sample rate is 16000,
              * see section 4.5.2 in RFC 3551. */
             if (par->codec_id == AV_CODEC_ID_ADPCM_G722 &&
-                par->sample_rate == 16000 && par->channels == 1)
+                par->sample_rate == 16000 && par->ch_layout.nb_channels == 1)
                 return rtp_payload_types[i].pt;
             if (par->codec_type == AVMEDIA_TYPE_AUDIO &&
                 ((rtp_payload_types[i].clock_rate > 0 &&
                   par->sample_rate != rtp_payload_types[i].clock_rate) ||
                  (rtp_payload_types[i].audio_channels > 0 &&
-                  par->channels != rtp_payload_types[i].audio_channels)))
+                  par->ch_layout.nb_channels != rtp_payload_types[i].audio_channels)))
                 continue;
             return rtp_payload_types[i].pt;
         }

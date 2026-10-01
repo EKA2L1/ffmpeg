@@ -24,11 +24,11 @@
  * RV30/40 parser
  */
 
-#include "parser.h"
+#include "avcodec.h"
+#include "parser_internal.h"
 #include "libavutil/intreadwrite.h"
 
 typedef struct RV34ParseContext {
-    ParseContext pc;
     int64_t key_dts;
     int key_pts;
 } RV34ParseContext;
@@ -76,18 +76,8 @@ static int rv34_parse(AVCodecParserContext *s,
     return buf_size;
 }
 
-#if CONFIG_RV30_PARSER
-const AVCodecParser ff_rv30_parser = {
-    .codec_ids      = { AV_CODEC_ID_RV30 },
+const FFCodecParser ff_rv34_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_RV30, AV_CODEC_ID_RV40),
     .priv_data_size = sizeof(RV34ParseContext),
-    .parser_parse   = rv34_parse,
+    .parse          = rv34_parse,
 };
-#endif
-
-#if CONFIG_RV40_PARSER
-const AVCodecParser ff_rv40_parser = {
-    .codec_ids      = { AV_CODEC_ID_RV40 },
-    .priv_data_size = sizeof(RV34ParseContext),
-    .parser_parse   = rv34_parse,
-};
-#endif

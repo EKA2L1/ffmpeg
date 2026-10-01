@@ -37,7 +37,6 @@ GENERAL="
     --disable-avdevice
     --disable-programs
     --disable-avfilter
-    --disable-postproc
     --disable-doc
     --disable-pthreads
     --enable-w32threads

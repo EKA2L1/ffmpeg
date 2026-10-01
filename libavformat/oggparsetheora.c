@@ -23,7 +23,8 @@
  **/
 
 #include <stdlib.h>
-#include "libavutil/bswap.h"
+#include "libavutil/attributes.h"
+#include "libavutil/mem.h"
 #include "libavcodec/get_bits.h"
 #include "avformat.h"
 #include "internal.h"
@@ -117,6 +118,7 @@ static int theora_header(AVFormatContext *s, int idx)
     break;
     case 0x81:
         ff_vorbis_stream_comment(s, st, os->buf + os->pstart + 7, os->psize - 7);
+        av_fallthrough;
     case 0x82:
         if (!thp->version)
             return AVERROR_INVALIDDATA;
@@ -196,7 +198,7 @@ static int theora_packet(AVFormatContext *s, int idx)
         if(s->streams[idx]->start_time == AV_NOPTS_VALUE && os->lastpts != AV_NOPTS_VALUE) {
             s->streams[idx]->start_time = os->lastpts;
             if (s->streams[idx]->duration > 0)
-                s->streams[idx]->duration -= s->streams[idx]->start_time;
+                s->streams[idx]->duration = av_sat_sub64(s->streams[idx]->duration, s->streams[idx]->start_time);
         }
     }
 

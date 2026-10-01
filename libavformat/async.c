@@ -27,6 +27,9 @@
  *      support work with concatdec, hls
  */
 
+#include <inttypes.h>
+#include <string.h>
+
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/error.h"
@@ -35,7 +38,6 @@
 #include "libavutil/opt.h"
 #include "libavutil/thread.h"
 #include "url.h"
-#include <stdint.h>
 
 #if HAVE_UNISTD_H
 #include <unistd.h>
@@ -47,13 +49,13 @@
 
 typedef struct RingBuffer
 {
-    AVFifoBuffer *fifo;
+    AVFifo       *fifo;
     int           read_back_capacity;
 
     int           read_pos;
 } RingBuffer;
 
-typedef struct Context {
+typedef struct AsyncContext {
     AVClass        *class;
     URLContext     *inner;
 
@@ -78,12 +80,12 @@ typedef struct Context {
 
     int             abort_request;
     AVIOInterruptCB interrupt_callback;
-} Context;
+} AsyncContext;
 
 static int ring_init(RingBuffer *ring, unsigned int capacity, int read_back_capacity)
 {
     memset(ring, 0, sizeof(RingBuffer));
-    ring->fifo = av_fifo_alloc(capacity + read_back_capacity);
+    ring->fifo = av_fifo_alloc2(capacity + read_back_capacity, 1, 0);
     if (!ring->fifo)
         return AVERROR(ENOMEM);
 
@@ -93,45 +95,65 @@ static int ring_init(RingBuffer *ring, unsigned int capacity, int read_back_capa
 
 static void ring_destroy(RingBuffer *ring)
 {
-    av_fifo_freep(&ring->fifo);
+    av_fifo_freep2(&ring->fifo);
 }
 
 static void ring_reset(RingBuffer *ring)
 {
-    av_fifo_reset(ring->fifo);
+    av_fifo_reset2(ring->fifo);
     ring->read_pos = 0;
 }
 
 static int ring_size(RingBuffer *ring)
 {
-    return av_fifo_size(ring->fifo) - ring->read_pos;
+    return av_fifo_can_read(ring->fifo) - ring->read_pos;
 }
 
 static int ring_space(RingBuffer *ring)
 {
-    return av_fifo_space(ring->fifo);
+    return av_fifo_can_write(ring->fifo);
 }
 
-static int ring_generic_read(RingBuffer *ring, void *dest, int buf_size, void (*func)(void*, void*, int))
+static int ring_read(RingBuffer *ring, void *dest, int buf_size)
 {
-    int ret;
+    int ret = 0;
 
     av_assert2(buf_size <= ring_size(ring));
-    ret = av_fifo_generic_peek_at(ring->fifo, dest, ring->read_pos, buf_size, func);
+    if (dest)
+        ret = av_fifo_peek(ring->fifo, dest, buf_size, ring->read_pos);
     ring->read_pos += buf_size;
 
     if (ring->read_pos > ring->read_back_capacity) {
-        av_fifo_drain(ring->fifo, ring->read_pos - ring->read_back_capacity);
+        av_fifo_drain2(ring->fifo, ring->read_pos - ring->read_back_capacity);
         ring->read_pos = ring->read_back_capacity;
     }
 
     return ret;
 }
 
-static int ring_generic_write(RingBuffer *ring, void *src, int size, int (*func)(void*, void*, int))
+static int wrapped_url_read(void *src, void *dst, size_t *size)
 {
+    URLContext *h   = src;
+    AsyncContext *c = h->priv_data;
+    int         ret;
+
+    ret = ffurl_read(c->inner, dst, *size);
+    *size             = ret > 0 ? ret : 0;
+    c->inner_io_error = ret < 0 ? ret : 0;
+
+    return c->inner_io_error;
+}
+
+static int ring_write(RingBuffer *ring, URLContext *h, size_t size)
+{
+    int ret;
+
     av_assert2(size <= ring_space(ring));
-    return av_fifo_generic_write(ring->fifo, src, size, func);
+    ret = av_fifo_write_from_cb(ring->fifo, wrapped_url_read, h, &size);
+    if (ret < 0)
+        return ret;
+
+    return size;
 }
 
 static int ring_size_of_read_back(RingBuffer *ring)
@@ -150,7 +172,7 @@ static int ring_drain(RingBuffer *ring, int offset)
 static int async_check_interrupt(void *arg)
 {
     URLContext *h   = arg;
-    Context    *c   = h->priv_data;
+    AsyncContext *c = h->priv_data;
 
     if (c->abort_request)
         return 1;
@@ -161,25 +183,15 @@ static int async_check_interrupt(void *arg)
     return c->abort_request;
 }
 
-static int wrapped_url_read(void *src, void *dst, int size)
-{
-    URLContext *h   = src;
-    Context    *c   = h->priv_data;
-    int         ret;
-
-    ret = ffurl_read(c->inner, dst, size);
-    c->inner_io_error = ret < 0 ? ret : 0;
-
-    return ret;
-}
-
 static void *async_buffer_task(void *arg)
 {
     URLContext   *h    = arg;
-    Context      *c    = h->priv_data;
+    AsyncContext *c    = h->priv_data;
     RingBuffer   *ring = &c->ring;
     int           ret  = 0;
     int64_t       seek_ret;
+
+    ff_thread_setname("async");
 
     while (1) {
         int fifo_space, to_copy;
@@ -221,7 +233,7 @@ static void *async_buffer_task(void *arg)
         pthread_mutex_unlock(&c->mutex);
 
         to_copy = FFMIN(4096, fifo_space);
-        ret = ring_generic_write(ring, (void *)h, to_copy, wrapped_url_read);
+        ret = ring_write(ring, h, to_copy);
 
         pthread_mutex_lock(&c->mutex);
         if (ret <= 0) {
@@ -239,7 +251,7 @@ static void *async_buffer_task(void *arg)
 
 static int async_open(URLContext *h, const char *arg, int flags, AVDictionary **options)
 {
-    Context         *c = h->priv_data;
+    AsyncContext *c = h->priv_data;
     int              ret;
     AVIOInterruptCB  interrupt_callback = {.callback = async_check_interrupt, .opaque = h};
 
@@ -306,7 +318,7 @@ fifo_fail:
 
 static int async_close(URLContext *h)
 {
-    Context *c = h->priv_data;
+    AsyncContext *c = h->priv_data;
     int      ret;
 
     pthread_mutex_lock(&c->mutex);
@@ -327,11 +339,11 @@ static int async_close(URLContext *h)
     return 0;
 }
 
-static int async_read_internal(URLContext *h, void *dest, int size, int read_complete,
-                               void (*func)(void*, void*, int))
+static int async_read_internal(URLContext *h, void *dest, int size)
 {
-    Context      *c       = h->priv_data;
+    AsyncContext *c       = h->priv_data;
     RingBuffer   *ring    = &c->ring;
+    int     read_complete = !dest;
     int           to_read = size;
     int           ret     = 0;
 
@@ -346,8 +358,8 @@ static int async_read_internal(URLContext *h, void *dest, int size, int read_com
         fifo_size = ring_size(ring);
         to_copy   = FFMIN(to_read, fifo_size);
         if (to_copy > 0) {
-            ring_generic_read(ring, dest, to_copy, func);
-            if (!func)
+            ring_read(ring, dest, to_copy);
+            if (dest)
                 dest = (uint8_t *)dest + to_copy;
             c->logical_pos += to_copy;
             to_read        -= to_copy;
@@ -376,16 +388,12 @@ static int async_read_internal(URLContext *h, void *dest, int size, int read_com
 
 static int async_read(URLContext *h, unsigned char *buf, int size)
 {
-    return async_read_internal(h, buf, size, 0, NULL);
-}
-
-static void fifo_do_not_copy_func(void* dest, void* src, int size) {
-    // do not copy
+    return async_read_internal(h, buf, size);
 }
 
 static int64_t async_seek(URLContext *h, int64_t pos, int whence)
 {
-    Context      *c    = h->priv_data;
+    AsyncContext *c    = h->priv_data;
     RingBuffer   *ring = &c->ring;
     int64_t       ret;
     int64_t       new_logical_pos;
@@ -422,7 +430,7 @@ static int64_t async_seek(URLContext *h, int64_t pos, int whence)
 
         if (pos_delta > 0) {
             // fast seek forwards
-            async_read_internal(h, NULL, pos_delta, 1, fifo_do_not_copy_func);
+            async_read_internal(h, NULL, pos_delta);
         } else {
             // fast seek backwards
             ring_drain(ring, pos_delta);
@@ -466,7 +474,7 @@ static int64_t async_seek(URLContext *h, int64_t pos, int whence)
     return ret;
 }
 
-#define OFFSET(x) offsetof(Context, x)
+#define OFFSET(x) offsetof(AsyncContext, x)
 #define D AV_OPT_FLAG_DECODING_PARAM
 
 static const AVOption options[] = {
@@ -489,7 +497,7 @@ const URLProtocol ff_async_protocol = {
     .url_read            = async_read,
     .url_seek            = async_seek,
     .url_close           = async_close,
-    .priv_data_size      = sizeof(Context),
+    .priv_data_size      = sizeof(AsyncContext),
     .priv_data_class     = &async_context_class,
 };
 

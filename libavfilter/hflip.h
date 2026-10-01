@@ -22,10 +22,9 @@
 #ifndef AVFILTER_HFLIP_H
 #define AVFILTER_HFLIP_H
 
-#include "avfilter.h"
+#include <stdint.h>
 
 typedef struct FlipContext {
-    const AVClass *class;
     int max_step[4];    ///< max pixel step for each plane, expressed as a number of bytes
     int bayer_plus1;    ///< 1 .. not a Bayer input format, 2 .. Bayer input format
     int planewidth[4];  ///< width of each plane
@@ -34,7 +33,6 @@ typedef struct FlipContext {
     void (*flip_line[4])(const uint8_t *src, uint8_t *dst, int w);
 } FlipContext;
 
-int ff_hflip_init(FlipContext *s, int step[4], int nb_planes);
 void ff_hflip_init_x86(FlipContext *s, int step[4], int nb_planes);
 
 #endif /* AVFILTER_HFLIP_H */

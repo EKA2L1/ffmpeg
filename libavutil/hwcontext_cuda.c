@@ -35,16 +35,34 @@ typedef struct CUDAFramesContext {
     int tex_alignment;
 } CUDAFramesContext;
 
+typedef struct CUDADeviceContext {
+    AVCUDADeviceContext p;
+    AVCUDADeviceContextInternal internal;
+} CUDADeviceContext;
+
 static const enum AVPixelFormat supported_formats[] = {
     AV_PIX_FMT_NV12,
+    AV_PIX_FMT_NV16,
     AV_PIX_FMT_YUV420P,
     AV_PIX_FMT_YUVA420P,
     AV_PIX_FMT_YUV444P,
     AV_PIX_FMT_P010,
+    AV_PIX_FMT_P012,
     AV_PIX_FMT_P016,
+    AV_PIX_FMT_P210,
+    AV_PIX_FMT_P212,
+    AV_PIX_FMT_P216,
+    AV_PIX_FMT_YUV422P,
+    AV_PIX_FMT_YUV420P10,
+    AV_PIX_FMT_YUV422P10,
+    AV_PIX_FMT_YUV444P10,
+    AV_PIX_FMT_YUV444P10MSB,
+    AV_PIX_FMT_YUV444P12MSB,
     AV_PIX_FMT_YUV444P16,
     AV_PIX_FMT_0RGB32,
     AV_PIX_FMT_0BGR32,
+    AV_PIX_FMT_RGB32,
+    AV_PIX_FMT_BGR32,
 #if CONFIG_VULKAN
     AV_PIX_FMT_VULKAN,
 #endif
@@ -128,7 +146,7 @@ static int cuda_frames_init(AVHWFramesContext *ctx)
 {
     AVHWDeviceContext *device_ctx = ctx->device_ctx;
     AVCUDADeviceContext    *hwctx = device_ctx->hwctx;
-    CUDAFramesContext       *priv = ctx->internal->priv;
+    CUDAFramesContext       *priv = ctx->hwctx;
     CudaFunctions             *cu = hwctx->internal->cuda_dl;
     int err, i;
 
@@ -163,8 +181,9 @@ static int cuda_frames_init(AVHWFramesContext *ctx)
         if (size < 0)
             return size;
 
-        ctx->internal->pool_internal = av_buffer_pool_init2(size, ctx, cuda_pool_alloc, NULL);
-        if (!ctx->internal->pool_internal)
+        ffhwframesctx(ctx)->pool_internal =
+            av_buffer_pool_init2(size, ctx, cuda_pool_alloc, NULL);
+        if (!ffhwframesctx(ctx)->pool_internal)
             return AVERROR(ENOMEM);
     }
 
@@ -173,7 +192,7 @@ static int cuda_frames_init(AVHWFramesContext *ctx)
 
 static int cuda_get_buffer(AVHWFramesContext *ctx, AVFrame *frame)
 {
-    CUDAFramesContext *priv = ctx->internal->priv;
+    CUDAFramesContext *priv = ctx->hwctx;
     int res;
 
     frame->buf[0] = av_buffer_pool_get(ctx->pool);
@@ -190,7 +209,7 @@ static int cuda_get_buffer(AVHWFramesContext *ctx, AVFrame *frame)
     if (ctx->sw_format == AV_PIX_FMT_YUV420P) {
         frame->linesize[1] = frame->linesize[2] = frame->linesize[0] / 2;
         frame->data[2]     = frame->data[1];
-        frame->data[1]     = frame->data[2] + frame->linesize[2] * (ctx->height / 2);
+        frame->data[1]     = frame->data[2] + frame->linesize[2] * AV_CEIL_RSHIFT(ctx->height, 1);
     }
 
     frame->format = AV_PIX_FMT_CUDA;
@@ -221,7 +240,7 @@ static int cuda_transfer_get_formats(AVHWFramesContext *ctx,
 static int cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
                                  const AVFrame *src)
 {
-    CUDAFramesContext       *priv = ctx->internal->priv;
+    CUDAFramesContext       *priv = ctx->hwctx;
     AVHWDeviceContext *device_ctx = ctx->device_ctx;
     AVCUDADeviceContext    *hwctx = device_ctx->hwctx;
     CudaFunctions             *cu = hwctx->internal->cuda_dl;
@@ -280,39 +299,35 @@ exit:
 
 static void cuda_device_uninit(AVHWDeviceContext *device_ctx)
 {
-    AVCUDADeviceContext *hwctx = device_ctx->hwctx;
+    CUDADeviceContext *hwctx = device_ctx->hwctx;
 
-    if (hwctx->internal) {
-        CudaFunctions *cu = hwctx->internal->cuda_dl;
+    if (hwctx->p.internal) {
+        CudaFunctions *cu = hwctx->internal.cuda_dl;
 
-        if (hwctx->internal->is_allocated && hwctx->cuda_ctx) {
-            if (hwctx->internal->flags & AV_CUDA_USE_PRIMARY_CONTEXT)
-                CHECK_CU(cu->cuDevicePrimaryCtxRelease(hwctx->internal->cuda_device));
-            else
-                CHECK_CU(cu->cuCtxDestroy(hwctx->cuda_ctx));
+        if (hwctx->internal.is_allocated && hwctx->p.cuda_ctx) {
+            if (hwctx->internal.flags & AV_CUDA_USE_PRIMARY_CONTEXT)
+                CHECK_CU(cu->cuDevicePrimaryCtxRelease(hwctx->internal.cuda_device));
+            else if (!(hwctx->internal.flags & AV_CUDA_USE_CURRENT_CONTEXT))
+                CHECK_CU(cu->cuCtxDestroy(hwctx->p.cuda_ctx));
 
-            hwctx->cuda_ctx = NULL;
+            hwctx->p.cuda_ctx = NULL;
         }
 
-        cuda_free_functions(&hwctx->internal->cuda_dl);
+        cuda_free_functions(&hwctx->internal.cuda_dl);
+        memset(&hwctx->internal, 0, sizeof(hwctx->internal));
+        hwctx->p.internal = NULL;
     }
-
-    av_freep(&hwctx->internal);
 }
 
 static int cuda_device_init(AVHWDeviceContext *ctx)
 {
-    AVCUDADeviceContext *hwctx = ctx->hwctx;
+    CUDADeviceContext *hwctx = ctx->hwctx;
     int ret;
 
-    if (!hwctx->internal) {
-        hwctx->internal = av_mallocz(sizeof(*hwctx->internal));
-        if (!hwctx->internal)
-            return AVERROR(ENOMEM);
-    }
+    hwctx->p.internal = &hwctx->internal;
 
-    if (!hwctx->internal->cuda_dl) {
-        ret = cuda_load_functions(&hwctx->internal->cuda_dl, ctx);
+    if (!hwctx->internal.cuda_dl) {
+        ret = cuda_load_functions(&hwctx->internal.cuda_dl, ctx);
         if (ret < 0) {
             av_log(ctx, AV_LOG_ERROR, "Could not dynamically load CUDA\n");
             goto error;
@@ -359,6 +374,11 @@ static int cuda_context_init(AVHWDeviceContext *device_ctx, int flags) {
                                                     hwctx->internal->cuda_device));
         if (ret < 0)
             return ret;
+    } else if (flags & AV_CUDA_USE_CURRENT_CONTEXT) {
+        ret = CHECK_CU(cu->cuCtxGetCurrent(&hwctx->cuda_ctx));
+        if (ret < 0)
+            return ret;
+        av_log(device_ctx, AV_LOG_INFO, "Using current CUDA context.\n");
     } else {
         ret = CHECK_CU(cu->cuCtxCreate(&hwctx->cuda_ctx, desired_flags,
                                        hwctx->internal->cuda_device));
@@ -380,13 +400,34 @@ static int cuda_flags_from_opts(AVHWDeviceContext *device_ctx,
                                 AVDictionary *opts, int *flags)
 {
     AVDictionaryEntry *primary_ctx_opt = av_dict_get(opts, "primary_ctx", NULL, 0);
+    AVDictionaryEntry *current_ctx_opt = av_dict_get(opts, "current_ctx", NULL, 0);
 
-    if (primary_ctx_opt && strtol(primary_ctx_opt->value, NULL, 10)) {
+    int use_primary_ctx = 0, use_current_ctx = 0;
+    if (primary_ctx_opt)
+        use_primary_ctx = strtol(primary_ctx_opt->value, NULL, 10);
+
+    if (current_ctx_opt)
+        use_current_ctx = strtol(current_ctx_opt->value, NULL, 10);
+
+    if (use_primary_ctx && use_current_ctx) {
+        av_log(device_ctx, AV_LOG_ERROR, "Requested both primary and current CUDA context simultaneously.\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (primary_ctx_opt && use_primary_ctx) {
         av_log(device_ctx, AV_LOG_VERBOSE, "Using CUDA primary device context\n");
         *flags |= AV_CUDA_USE_PRIMARY_CONTEXT;
     } else if (primary_ctx_opt) {
         av_log(device_ctx, AV_LOG_VERBOSE, "Disabling use of CUDA primary device context\n");
         *flags &= ~AV_CUDA_USE_PRIMARY_CONTEXT;
+    }
+
+    if (current_ctx_opt && use_current_ctx) {
+        av_log(device_ctx, AV_LOG_VERBOSE, "Using CUDA current device context\n");
+        *flags |= AV_CUDA_USE_CURRENT_CONTEXT;
+    } else if (current_ctx_opt) {
+        av_log(device_ctx, AV_LOG_VERBOSE, "Disabling use of CUDA current device context\n");
+        *flags &= ~AV_CUDA_USE_CURRENT_CONTEXT;
     }
 
     return 0;
@@ -438,6 +479,9 @@ static int cuda_device_derive(AVHWDeviceContext *device_ctx,
     AVCUDADeviceContext *hwctx = device_ctx->hwctx;
     CudaFunctions *cu;
     const char *src_uuid = NULL;
+#if CONFIG_VULKAN
+    VkPhysicalDeviceIDProperties vk_idp;
+#endif
     int ret, i, device_count;
 
     ret = cuda_flags_from_opts(device_ctx, opts, &flags);
@@ -445,7 +489,7 @@ static int cuda_device_derive(AVHWDeviceContext *device_ctx,
         goto error;
 
 #if CONFIG_VULKAN
-    VkPhysicalDeviceIDProperties vk_idp = {
+    vk_idp = (VkPhysicalDeviceIDProperties) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES,
     };
 #endif
@@ -531,8 +575,8 @@ const HWContextType ff_hwcontext_type_cuda = {
     .type                 = AV_HWDEVICE_TYPE_CUDA,
     .name                 = "CUDA",
 
-    .device_hwctx_size    = sizeof(AVCUDADeviceContext),
-    .frames_priv_size     = sizeof(CUDAFramesContext),
+    .device_hwctx_size    = sizeof(CUDADeviceContext),
+    .frames_hwctx_size    = sizeof(CUDAFramesContext),
 
     .device_create        = cuda_device_create,
     .device_derive        = cuda_device_derive,

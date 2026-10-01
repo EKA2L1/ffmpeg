@@ -271,7 +271,8 @@ int ff_listen_bind(int fd, const struct sockaddr *addr,
  * @param addrlen Third argument of bind().
  * @return        0 on success or an AVERROR on failure.
  */
-int ff_listen(int fd, const struct sockaddr *addr, socklen_t addrlen);
+int ff_listen(int fd, const struct sockaddr *addr, socklen_t addrlen,
+              void *logctx);
 
 /**
  * Poll for a single connection on the passed file descriptor.
@@ -305,7 +306,7 @@ int ff_listen_connect(int fd, const struct sockaddr *addr,
 
 int ff_http_match_no_proxy(const char *no_proxy, const char *hostname);
 
-int ff_socket(int domain, int type, int protocol);
+int ff_socket(int domain, int type, int protocol, void *logctx);
 
 void ff_log_net_error(void *ctx, int level, const char* prefix);
 
@@ -335,6 +336,9 @@ void ff_log_net_error(void *ctx, int level, const char* prefix);
  */
 int ff_connect_parallel(struct addrinfo *addrs, int timeout_ms_per_address,
                         int parallel, URLContext *h, int *fd,
-                        void (*customize_fd)(void *, int), void *customize_ctx);
+                        int (*customize_fd)(void *, int, int), void *customize_ctx);
+
+void ff_udp_get_last_recv_addr(URLContext *h, struct sockaddr_storage *addr, socklen_t *addr_len);
+int ff_udp_set_remote_addr(URLContext *h, const struct sockaddr *dest_addr, socklen_t dest_addr_len, int do_connect);
 
 #endif /* AVFORMAT_NETWORK_H */

@@ -25,8 +25,6 @@
 
 #include "avcodec.h"
 #include "bytestream.h"
-#include "get_bits.h"
-#include "vlc.h"
 #include "cfhddsp.h"
 
 enum CFHDParam {
@@ -93,13 +91,22 @@ enum CFHDParam {
     ChannelHeight    = 105,
 };
 
+enum CFHDSegment {
+    LowPassSegment      = 0x1a4a,
+    LowPassEndSegment   = 0x1b4b,
+    HighPassSegment     = 0x0d0d,
+    BandSegment         = 0x0e0e,
+    HighPassEndSegment  = 0x0c0c,
+    CoefficientSegment  = 0x0f0f,
+};
+
 #define VLC_BITS       9
 #define SUBBAND_COUNT 10
 #define SUBBAND_COUNT_3D 17
 
 typedef struct CFHD_RL_VLC_ELEM {
     int16_t level;
-    int8_t len;
+    int8_t len8;
     uint16_t run;
 } CFHD_RL_VLC_ELEM;
 
@@ -141,14 +148,9 @@ typedef struct CFHDContext {
     AVCodecContext *avctx;
 
     CFHD_RL_VLC_ELEM table_9_rl_vlc[2088];
-    VLC vlc_9;
-
     CFHD_RL_VLC_ELEM table_18_rl_vlc[4572];
-    VLC vlc_18;
 
     int lut[2][256];
-
-    GetBitContext gb;
 
     int planes;
     int frame_type;

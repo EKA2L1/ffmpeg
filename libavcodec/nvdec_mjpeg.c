@@ -25,8 +25,11 @@
 #include "mjpegdec.h"
 #include "nvdec.h"
 #include "decode.h"
+#include "hwaccel_internal.h"
 
-static int nvdec_mjpeg_start_frame(AVCodecContext *avctx, const uint8_t *buffer, uint32_t size)
+static int nvdec_mjpeg_start_frame(AVCodecContext *avctx,
+                                   const AVBufferRef *buffer_ref,
+                                   const uint8_t *buffer, uint32_t size)
 {
     MJpegDecodeContext *s = avctx->priv_data;
 
@@ -42,7 +45,7 @@ static int nvdec_mjpeg_start_frame(AVCodecContext *avctx, const uint8_t *buffer,
     if (ret < 0)
         return ret;
 
-    fdd = (FrameDecodeData*)cur_frame->private_ref->data;
+    fdd = cur_frame->private_ref;
     cf  = (NVDECFrame*)fdd->hwaccel_priv;
 
     *pp = (CUVIDPICPARAMS) {
@@ -69,12 +72,11 @@ static int nvdec_mjpeg_frame_params(AVCodecContext *avctx,
     return ff_nvdec_frame_params(avctx, hw_frames_ctx, 1, 0);
 }
 
-#if CONFIG_MJPEG_NVDEC_HWACCEL
-AVHWAccel ff_mjpeg_nvdec_hwaccel = {
-    .name                 = "mjpeg_nvdec",
-    .type                 = AVMEDIA_TYPE_VIDEO,
-    .id                   = AV_CODEC_ID_MJPEG,
-    .pix_fmt              = AV_PIX_FMT_CUDA,
+const FFHWAccel ff_mjpeg_nvdec_hwaccel = {
+    .p.name               = "mjpeg_nvdec",
+    .p.type               = AVMEDIA_TYPE_VIDEO,
+    .p.id                 = AV_CODEC_ID_MJPEG,
+    .p.pix_fmt            = AV_PIX_FMT_CUDA,
     .start_frame          = nvdec_mjpeg_start_frame,
     .end_frame            = ff_nvdec_simple_end_frame,
     .decode_slice         = nvdec_mjpeg_decode_slice,
@@ -83,4 +85,3 @@ AVHWAccel ff_mjpeg_nvdec_hwaccel = {
     .uninit               = ff_nvdec_decode_uninit,
     .priv_data_size       = sizeof(NVDECContext),
 };
-#endif

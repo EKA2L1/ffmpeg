@@ -20,6 +20,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <inttypes.h>
+#include <stdio.h>
+
+#include "libavutil/common.h"
+
 #include "libavcodec/jpeg2000dwt.c"
 
 #include "libavutil/lfg.h"
@@ -41,18 +46,23 @@ static int test_dwt(int *array, int *ref, int border[2][2], int decomp_levels, i
         fprintf(stderr, "ff_dwt_encode failed\n");
         return 1;
     }
+    if (type == FF_DWT97_INT) {
+        // pre-scaling to simulate dequantization which places the binary point at 1 bit above from LSB
+        for (j = 0; j< s->linelen[decomp_levels-1][0] * s->linelen[decomp_levels-1][1]; j++)
+            array[j] = (uint32_t)array[j] << I_PRESHIFT;
+    }
     ret = ff_dwt_decode(s, array);
     if (ret < 0) {
         fprintf(stderr, "ff_dwt_encode failed\n");
         return 1;
     }
     for (j = 0; j<MAX_W * MAX_W; j++) {
-        if (FFABS(array[j] - ref[j]) > max_diff) {
-            fprintf(stderr, "missmatch at %d (%d != %d) decomp:%d border %d %d %d %d\n",
+        if (FFABS(array[j] - (int64_t)ref[j]) > max_diff) {
+            fprintf(stderr, "mismatch at %d (%d != %d) decomp:%d border %d %d %d %d\n",
                     j, array[j], ref[j],decomp_levels, border[0][0], border[0][1], border[1][0], border[1][1]);
             return 2;
         }
-        err2 += (array[j] - ref[j]) * (array[j] - ref[j]);
+        err2 += (array[j] - ref[j]) * (int64_t)(array[j] - ref[j]);
         array[j] = ref[j];
     }
     ff_dwt_destroy(s);
@@ -87,7 +97,7 @@ static int test_dwtf(float *array, float *ref, int border[2][2], int decomp_leve
     }
     for (j = 0; j<MAX_W * MAX_W; j++) {
         if (FFABS(array[j] - ref[j]) > max_diff) {
-            fprintf(stderr, "missmatch at %d (%f != %f) decomp:%d border %d %d %d %d\n",
+            fprintf(stderr, "mismatch at %d (%f != %f) decomp:%d border %d %d %d %d\n",
                     j, array[j], ref[j],decomp_levels, border[0][0], border[0][1], border[1][0], border[1][1]);
             return 2;
         }

@@ -16,30 +16,17 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
-#include "config.h"
-
 #include <float.h>
 #include <stdint.h>
 
 #include "libavutil/float_dsp.h"
 #include "libavutil/internal.h"
+#include "libavutil/mem.h"
 #include "libavutil/mem_internal.h"
 
 #include "checkasm.h"
 
 #define LEN 256
-
-#define randomize_buffer(buf)                 \
-do {                                          \
-    int i;                                    \
-    double bmg[2], stddev = 10.0, mean = 0.0; \
-                                              \
-    for (i = 0; i < LEN; i += 2) {            \
-        av_bmg_get(&checkasm_lfg, bmg);       \
-        buf[i]     = bmg[0] * stddev + mean;  \
-        buf[i + 1] = bmg[1] * stddev + mean;  \
-    }                                         \
-} while(0);
 
 static void test_vector_fmul(const float *src0, const float *src1)
 {
@@ -236,7 +223,7 @@ static void test_butterflies_float(const float *src0, const float *src1)
     LOCAL_ALIGNED_16(float,  odst1, [LEN]);
     int i;
 
-    declare_func(void, float *av_restrict src0, float *av_restrict src1,
+    declare_func(void, float *restrict src0, float *restrict src1,
     int len);
 
     memcpy(cdst,  src0, LEN * sizeof(*src0));
@@ -279,6 +266,22 @@ static void test_scalarproduct_float(const float *src0, const float *src1)
     bench_new(src0, src1, LEN);
 }
 
+static void test_scalarproduct_double(const double *src0, const double *src1)
+{
+    double cprod, oprod;
+
+    declare_func_float(double, const double *, const double *, size_t);
+
+    cprod = call_ref(src0, src1, LEN);
+    oprod = call_new(src0, src1, LEN);
+    if (!double_near_abs_eps(cprod, oprod, ARBITRARY_SCALARPRODUCT_CONST)) {
+        fprintf(stderr, "%- .12f - %- .12f = % .12g\n",
+                cprod, oprod, cprod - oprod);
+        fail();
+    }
+    bench_new(src0, src1, LEN);
+}
+
 void checkasm_check_float_dsp(void)
 {
     LOCAL_ALIGNED_32(float,  src0,     [LEN]);
@@ -297,15 +300,15 @@ void checkasm_check_float_dsp(void)
         return;
     }
 
-    randomize_buffer(src0);
-    randomize_buffer(src1);
-    randomize_buffer(src2);
-    randomize_buffer(src3);
-    randomize_buffer(src4);
-    randomize_buffer(src5);
-    randomize_buffer(dbl_src0);
-    randomize_buffer(dbl_src1);
-    randomize_buffer(dbl_src2);
+    randomize_stddev(src0, LEN, 10.0);
+    randomize_stddev(src1, LEN, 10.0);
+    randomize_stddev(src2, LEN, 10.0);
+    randomize_stddev(src3, LEN, 10.0);
+    randomize_stddev(src4, LEN, 10.0);
+    randomize_stddev(src5, LEN, 10.0);
+    randomize_stddev_dbl(dbl_src0, LEN, 10.0);
+    randomize_stddev_dbl(dbl_src1, LEN, 10.0);
+    randomize_stddev_dbl(dbl_src2, LEN, 10.0);
 
     if (check_func(fdsp->vector_fmul, "vector_fmul"))
         test_vector_fmul(src0, src1);
@@ -335,6 +338,9 @@ void checkasm_check_float_dsp(void)
     if (check_func(fdsp->scalarproduct_float, "scalarproduct_float"))
         test_scalarproduct_float(src3, src4);
     report("scalarproduct_float");
+    if (check_func(fdsp->scalarproduct_double, "scalarproduct_double"))
+        test_scalarproduct_double(dbl_src0, dbl_src1);
+    report("scalarproduct_double");
 
     av_freep(&fdsp);
 }

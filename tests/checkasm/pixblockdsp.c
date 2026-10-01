@@ -48,7 +48,7 @@
 #define check_get_pixels(type, aligned)                                                    \
     do {                                                                                   \
         int i;                                                                             \
-        declare_func_emms(AV_CPU_FLAG_MMX, void, int16_t *block, const uint8_t *pixels, ptrdiff_t line_size);    \
+        declare_func(void, int16_t *block, const uint8_t *pixels, ptrdiff_t line_size);    \
                                                                                            \
         for (i = 0; i < BUF_UNITS; i++) {                                              \
             int src_offset = i * 64 * sizeof(type) + (aligned ? 8 : 1) * i;                \
@@ -65,7 +65,7 @@
 #define check_diff_pixels(type, aligned)                                                   \
     do {                                                                                   \
         int i;                                                                             \
-        declare_func_emms(AV_CPU_FLAG_MMX, void, int16_t *av_restrict block, const uint8_t *s1, const uint8_t *s2, ptrdiff_t stride); \
+        declare_func(void, int16_t *restrict block, const uint8_t *s1, const uint8_t *s2, ptrdiff_t stride); \
                                                                                            \
         for (i = 0; i < BUF_UNITS; i++) {                                              \
             int src_offset = i * 64 * sizeof(type) + (aligned ? 8 : 1) * i;                \
@@ -90,11 +90,8 @@ void checkasm_check_pixblockdsp(void)
     uint16_t *dst0 = (uint16_t *)dst0_;
     uint16_t *dst1 = (uint16_t *)dst1_;
     PixblockDSPContext h;
-    AVCodecContext avctx = {
-        .bits_per_raw_sample = 8,
-    };
 
-    ff_pixblockdsp_init(&h, &avctx);
+    ff_pixblockdsp_init(&h, 8);
 
     if (check_func(h.get_pixels, "get_pixels"))
         check_get_pixels(uint8_t, 1);

@@ -28,14 +28,13 @@
  * The MS RLE decoder outputs PAL8 colorspace data.
  */
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "avcodec.h"
+#include "codec_internal.h"
 #include "decode.h"
-#include "internal.h"
 #include "msrledec.h"
+#include "libavutil/attributes.h"
 #include "libavutil/imgutils.h"
 
 typedef struct MsrleContext {
@@ -81,9 +80,8 @@ static av_cold int msrle_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
-static int msrle_decode_frame(AVCodecContext *avctx,
-                              void *data, int *got_frame,
-                              AVPacket *avpkt)
+static int msrle_decode_frame(AVCodecContext *avctx, AVFrame *rframe,
+                              int *got_frame, AVPacket *avpkt)
 {
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
@@ -98,8 +96,7 @@ static int msrle_decode_frame(AVCodecContext *avctx,
         return ret;
 
     if (avctx->bits_per_coded_sample > 1 && avctx->bits_per_coded_sample <= 8) {
-        s->frame->palette_has_changed = ff_copy_palette(s->pal, avpkt, avctx);
-
+        ff_copy_palette(s->pal, avpkt, avctx);
         /* make the palette available */
         memcpy(s->frame->data[1], s->pal, AVPALETTE_SIZE);
     }
@@ -108,7 +105,7 @@ static int msrle_decode_frame(AVCodecContext *avctx,
     if (avctx->height * istride == avpkt->size) { /* assume uncompressed */
         int linesize = av_image_get_linesize(avctx->pix_fmt, avctx->width, 0);
         uint8_t *ptr = s->frame->data[0];
-        uint8_t *buf = avpkt->data + (avctx->height-1)*istride;
+        const uint8_t *buf = avpkt->data + (avctx->height-1)*istride;
         int i, j;
 
         if (linesize < 0)
@@ -133,7 +130,7 @@ static int msrle_decode_frame(AVCodecContext *avctx,
         ff_msrle_decode(avctx, s->frame, avctx->bits_per_coded_sample, &s->gb);
     }
 
-    if ((ret = av_frame_ref(data, s->frame)) < 0)
+    if ((ret = av_frame_ref(rframe, s->frame)) < 0)
         return ret;
 
     *got_frame      = 1;
@@ -142,7 +139,7 @@ static int msrle_decode_frame(AVCodecContext *avctx,
     return buf_size;
 }
 
-static void msrle_decode_flush(AVCodecContext *avctx)
+static av_cold void msrle_decode_flush(AVCodecContext *avctx)
 {
     MsrleContext *s = avctx->priv_data;
 
@@ -159,16 +156,15 @@ static av_cold int msrle_decode_end(AVCodecContext *avctx)
     return 0;
 }
 
-const AVCodec ff_msrle_decoder = {
-    .name           = "msrle",
-    .long_name      = NULL_IF_CONFIG_SMALL("Microsoft RLE"),
-    .type           = AVMEDIA_TYPE_VIDEO,
-    .id             = AV_CODEC_ID_MSRLE,
+const FFCodec ff_msrle_decoder = {
+    .p.name         = "msrle",
+    CODEC_LONG_NAME("Microsoft RLE"),
+    .p.type         = AVMEDIA_TYPE_VIDEO,
+    .p.id           = AV_CODEC_ID_MSRLE,
     .priv_data_size = sizeof(MsrleContext),
     .init           = msrle_decode_init,
     .close          = msrle_decode_end,
-    .decode         = msrle_decode_frame,
+    FF_CODEC_DECODE_CB(msrle_decode_frame),
     .flush          = msrle_decode_flush,
-    .capabilities   = AV_CODEC_CAP_DR1,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    .p.capabilities = AV_CODEC_CAP_DR1,
 };

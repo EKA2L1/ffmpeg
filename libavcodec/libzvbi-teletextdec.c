@@ -20,11 +20,12 @@
 
 #include "avcodec.h"
 #include "libavcodec/ass.h"
+#include "codec_internal.h"
 #include "libavcodec/dvbtxt.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/bprint.h"
 #include "libavutil/internal.h"
-#include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
 #include "libavutil/common.h"
 
@@ -90,7 +91,7 @@ static int my_ass_subtitle_header(AVCodecContext *avctx)
     if (ret < 0)
         return ret;
 
-    event_pos = strstr(avctx->subtitle_header, "\r\n[Events]\r\n");
+    event_pos = strstr(avctx->subtitle_header, "\n[Events]\n");
     if (!event_pos)
         return AVERROR_BUG;
 
@@ -105,7 +106,7 @@ static int my_ass_subtitle_header(AVCodecContext *avctx)
         "0,0,"                 /* Spacing, Angle */
         "3,0.1,0,"             /* BorderStyle, Outline, Shadow */
         "5,1,1,1,"             /* Alignment, Margin[LRV] */
-        "0\r\n"                /* Encoding */
+        "0\n"                  /* Encoding */
         "Style: "
         "Subtitle,"            /* Name */
         "Monospace,16,"        /* Font{name,size} */
@@ -115,7 +116,7 @@ static int my_ass_subtitle_header(AVCodecContext *avctx)
         "0,0,"                 /* Spacing, Angle */
         "1,1,1,"               /* BorderStyle, Outline, Shadow */
         "8,48,48,20,"          /* Alignment, Margin[LRV] */
-        "0\r\n"                /* Encoding */
+        "0\n"                  /* Encoding */
         , event_pos);
 
     if (!new_header)
@@ -427,6 +428,7 @@ static void fix_transparency(TeletextContext *ctx, AVSubtitleRect *sub_rect, vbi
                 case VBI_OPAQUE:
                     if (!ctx->transparent_bg)
                         break;
+                    av_fallthrough;
                 case VBI_SEMI_TRANSPARENT:
                     if (ctx->opacity > 0) {
                         if (ctx->opacity < 255)
@@ -435,6 +437,7 @@ static void fix_transparency(TeletextContext *ctx, AVSubtitleRect *sub_rect, vbi
                                     *pixel += VBI_NB_COLORS;
                         break;
                     }
+                    av_fallthrough;
                 case VBI_TRANSPARENT_FULL:
                     for(; pixel < pixelnext; pixel++)
                         if (*pixel == vc->background)
@@ -580,7 +583,7 @@ static void handler(vbi_event *ev, void *user_data)
     vbi_unref_page(&page);
 }
 
-static int slice_to_vbi_lines(TeletextContext *ctx, uint8_t* buf, int size)
+static int slice_to_vbi_lines(TeletextContext *ctx, const uint8_t *buf, int size)
 {
     int lines = 0;
     while (size >= 2 && lines < MAX_SLICES) {
@@ -636,10 +639,10 @@ static int slice_to_vbi_lines(TeletextContext *ctx, uint8_t* buf, int size)
     return lines;
 }
 
-static int teletext_decode_frame(AVCodecContext *avctx, void *data, int *got_sub_ptr, AVPacket *pkt)
+static int teletext_decode_frame(AVCodecContext *avctx, AVSubtitle *sub,
+                                 int *got_sub_ptr, const AVPacket *pkt)
 {
     TeletextContext *ctx = avctx->priv_data;
-    AVSubtitle      *sub = data;
     int             ret = 0;
 
     if (!ctx->vbi) {
@@ -790,10 +793,10 @@ static const AVOption options[] = {
     {"txt_page",        "page numbers to decode, subtitle for subtitles, * for all", OFFSET(pgno),   AV_OPT_TYPE_STRING, {.str = "*"},      0, 0,        SD},
     {"txt_default_region", "default G0 character set used for decoding",     OFFSET(default_region), AV_OPT_TYPE_INT,    {.i64 = -1},      -1, 87,       SD},
     {"txt_chop_top",    "discards the top teletext line",                    OFFSET(chop_top),       AV_OPT_TYPE_INT,    {.i64 = 1},        0, 1,        SD},
-    {"txt_format",      "format of the subtitles (bitmap or text or ass)",   OFFSET(format_id),      AV_OPT_TYPE_INT,    {.i64 = 0},        0, 2,        SD,  "txt_format"},
-    {"bitmap",          NULL,                                                0,                      AV_OPT_TYPE_CONST,  {.i64 = 0},        0, 0,        SD,  "txt_format"},
-    {"text",            NULL,                                                0,                      AV_OPT_TYPE_CONST,  {.i64 = 1},        0, 0,        SD,  "txt_format"},
-    {"ass",             NULL,                                                0,                      AV_OPT_TYPE_CONST,  {.i64 = 2},        0, 0,        SD,  "txt_format"},
+    {"txt_format",      "format of the subtitles (bitmap or text or ass)",   OFFSET(format_id),      AV_OPT_TYPE_INT,    {.i64 = 0},        0, 2,        SD,  .unit = "txt_format"},
+    {"bitmap",          NULL,                                                0,                      AV_OPT_TYPE_CONST,  {.i64 = 0},        0, 0,        SD,  .unit = "txt_format"},
+    {"text",            NULL,                                                0,                      AV_OPT_TYPE_CONST,  {.i64 = 1},        0, 0,        SD,  .unit = "txt_format"},
+    {"ass",             NULL,                                                0,                      AV_OPT_TYPE_CONST,  {.i64 = 2},        0, 0,        SD,  .unit = "txt_format"},
     {"txt_left",        "x offset of generated bitmaps",                     OFFSET(x_offset),       AV_OPT_TYPE_INT,    {.i64 = 0},        0, 65535,    SD},
     {"txt_top",         "y offset of generated bitmaps",                     OFFSET(y_offset),       AV_OPT_TYPE_INT,    {.i64 = 0},        0, 65535,    SD},
     {"txt_chop_spaces", "chops leading and trailing spaces from text",       OFFSET(chop_spaces),    AV_OPT_TYPE_INT,    {.i64 = 1},        0, 1,        SD},
@@ -810,17 +813,18 @@ static const AVClass teletext_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_libzvbi_teletext_decoder = {
-    .name      = "libzvbi_teletextdec",
-    .long_name = NULL_IF_CONFIG_SMALL("Libzvbi DVB teletext decoder"),
-    .type      = AVMEDIA_TYPE_SUBTITLE,
-    .id        = AV_CODEC_ID_DVB_TELETEXT,
+const FFCodec ff_libzvbi_teletext_decoder = {
+    .p.name         = "libzvbi_teletextdec",
+    CODEC_LONG_NAME("Libzvbi DVB teletext decoder"),
+    .p.type         = AVMEDIA_TYPE_SUBTITLE,
+    .p.id           = AV_CODEC_ID_DVB_TELETEXT,
+    .p.capabilities = AV_CODEC_CAP_DELAY,
+    .p.priv_class   = &teletext_class,
+    .p.wrapper_name = "libzvbi",
+    .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
     .priv_data_size = sizeof(TeletextContext),
     .init      = teletext_init_decoder,
     .close     = teletext_close_decoder,
-    .decode    = teletext_decode_frame,
-    .capabilities = AV_CODEC_CAP_DELAY,
+    FF_CODEC_DECODE_SUB_CB(teletext_decode_frame),
     .flush     = teletext_flush,
-    .priv_class= &teletext_class,
-    .wrapper_name = "libzvbi",
 };

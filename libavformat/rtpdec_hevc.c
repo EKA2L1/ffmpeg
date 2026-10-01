@@ -21,8 +21,7 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
-#include "libavutil/base64.h"
-#include "libavcodec/get_bits.h"
+#include "libavutil/mem.h"
 
 #include "avformat.h"
 #include "internal.h"

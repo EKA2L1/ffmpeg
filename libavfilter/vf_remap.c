@@ -42,9 +42,9 @@
 #include "libavutil/opt.h"
 #include "avfilter.h"
 #include "drawutils.h"
+#include "filters.h"
 #include "formats.h"
 #include "framesync.h"
-#include "internal.h"
 #include "video.h"
 
 typedef struct RemapContext {
@@ -66,7 +66,7 @@ typedef struct RemapContext {
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
 static const AVOption remap_options[] = {
-    { "format", "set output format", OFFSET(format), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, "format" },
+    { "format", "set output format", OFFSET(format), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, .unit = "format" },
         { "color",  "", 0, AV_OPT_TYPE_CONST, {.i64=0},   .flags = FLAGS, .unit = "format" },
         { "gray",   "", 0, AV_OPT_TYPE_CONST, {.i64=1},   .flags = FLAGS, .unit = "format" },
     { "fill", "set the color of the unmapped pixels", OFFSET(fill_rgba), AV_OPT_TYPE_COLOR, {.str="black"}, .flags = FLAGS },
@@ -82,9 +82,11 @@ typedef struct ThreadData {
     int step;
 } ThreadData;
 
-static int query_formats(AVFilterContext *ctx)
+static int query_formats(const AVFilterContext *ctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
 {
-    RemapContext *s = ctx->priv;
+    const RemapContext *s = ctx->priv;
     static const enum AVPixelFormat pix_fmts[] = {
         AV_PIX_FMT_YUVA444P,
         AV_PIX_FMT_YUV444P,
@@ -115,15 +117,15 @@ static int query_formats(AVFilterContext *ctx)
     AVFilterFormats *pix_formats = NULL, *map_formats = NULL;
     int ret;
 
-    pix_formats = ff_make_format_list(s->format ? gray_pix_fmts : pix_fmts);
-    if ((ret = ff_formats_ref(pix_formats, &ctx->inputs[0]->outcfg.formats)) < 0 ||
-        (ret = ff_formats_ref(pix_formats, &ctx->outputs[0]->incfg.formats)) < 0)
+    pix_formats = ff_make_pixel_format_list(s->format ? gray_pix_fmts : pix_fmts);
+    if ((ret = ff_formats_ref(pix_formats, &cfg_in[0]->formats)) < 0 ||
+        (ret = ff_formats_ref(pix_formats, &cfg_out[0]->formats)) < 0)
         return ret;
 
-    map_formats = ff_make_format_list(map_fmts);
-    if ((ret = ff_formats_ref(map_formats, &ctx->inputs[1]->outcfg.formats)) < 0)
+    map_formats = ff_make_pixel_format_list(map_fmts);
+    if ((ret = ff_formats_ref(map_formats, &cfg_in[1]->formats)) < 0)
         return ret;
-    return ff_formats_ref(map_formats, &ctx->inputs[2]->outcfg.formats);
+    return ff_formats_ref(map_formats, &cfg_in[2]->formats);
 }
 
 /**
@@ -141,8 +143,8 @@ static int remap_planar##bits##_##name##_slice(AVFilterContext *ctx, void *arg, 
     const AVFrame *xin = td->xin;                                                           \
     const AVFrame *yin = td->yin;                                                           \
     const AVFrame *out = td->out;                                                           \
-    const int slice_start = (out->height *  jobnr   ) / nb_jobs;                            \
-    const int slice_end   = (out->height * (jobnr+1)) / nb_jobs;                            \
+    const int slice_start = ff_slice_pos(out->height, jobnr, nb_jobs);                      \
+    const int slice_end   = ff_slice_pos(out->height, jobnr + 1, nb_jobs);                  \
     const int xlinesize = xin->linesize[0] / 2;                                             \
     const int ylinesize = yin->linesize[0] / 2;                                             \
     int x , y, plane;                                                                       \
@@ -192,8 +194,8 @@ static int remap_packed##bits##_##name##_slice(AVFilterContext *ctx, void *arg, 
     const AVFrame *xin = td->xin;                                                           \
     const AVFrame *yin = td->yin;                                                           \
     const AVFrame *out = td->out;                                                           \
-    const int slice_start = (out->height *  jobnr   ) / nb_jobs;                            \
-    const int slice_end   = (out->height * (jobnr+1)) / nb_jobs;                            \
+    const int slice_start = ff_slice_pos(out->height, jobnr, nb_jobs);                      \
+    const int slice_end   = ff_slice_pos(out->height, jobnr + 1, nb_jobs);                  \
     const int dlinesize  = out->linesize[0] / div;                                          \
     const int slinesize  = in->linesize[0] / div;                                           \
     const int xlinesize  = xin->linesize[0] / 2;                                            \
@@ -313,6 +315,8 @@ static int config_output(AVFilterLink *outlink)
     AVFilterLink *srclink = ctx->inputs[0];
     AVFilterLink *xlink = ctx->inputs[1];
     AVFilterLink *ylink = ctx->inputs[2];
+    FilterLink *il = ff_filter_link(srclink);
+    FilterLink *ol = ff_filter_link(outlink);
     FFFrameSyncIn *in;
     int ret;
 
@@ -328,7 +332,7 @@ static int config_output(AVFilterLink *outlink)
     outlink->w = xlink->w;
     outlink->h = xlink->h;
     outlink->sample_aspect_ratio = srclink->sample_aspect_ratio;
-    outlink->frame_rate = srclink->frame_rate;
+    ol->frame_rate = il->frame_rate;
 
     ret = ff_framesync_init(&s->fs, ctx, 3);
     if (ret < 0)
@@ -393,15 +397,15 @@ static const AVFilterPad remap_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_remap = {
-    .name          = "remap",
-    .description   = NULL_IF_CONFIG_SMALL("Remap pixels."),
+const FFFilter ff_vf_remap = {
+    .p.name        = "remap",
+    .p.description = NULL_IF_CONFIG_SMALL("Remap pixels."),
+    .p.priv_class  = &remap_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(RemapContext),
     .uninit        = uninit,
     .activate      = activate,
     FILTER_INPUTS(remap_inputs),
     FILTER_OUTPUTS(remap_outputs),
-    FILTER_QUERY_FUNC(query_formats),
-    .priv_class    = &remap_class,
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,
+    FILTER_QUERY_FUNC2(query_formats),
 };

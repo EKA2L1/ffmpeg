@@ -26,12 +26,14 @@
  */
 
 #include <limits.h>
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "bswapdsp.h"
 #include "bytestream.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "get_bits.h"
 #include "golomb.h"
-#include "internal.h"
 
 #define MAX_CHANNELS 8
 #define MAX_BLOCKSIZE 65535
@@ -279,7 +281,7 @@ static int decode_wave_header(AVCodecContext *avctx, const uint8_t *header,
                               int header_size)
 {
     int len, bps;
-    short wave_format;
+    uint16_t wave_format;
     GetByteContext gb;
 
     bytestream2_init(&gb, header, header_size);
@@ -428,7 +430,11 @@ static int read_header(ShortenContext *s)
         s->channels = 0;
         return AVERROR_INVALIDDATA;
     }
-    s->avctx->channels = s->channels;
+    if (s->avctx->ch_layout.nb_channels != s->channels) {
+        av_channel_layout_uninit(&s->avctx->ch_layout);
+        s->avctx->ch_layout.nb_channels = s->channels;
+        s->avctx->ch_layout.order       = AV_CHANNEL_ORDER_UNSPEC;
+    }
 
     /* get blocksize if version > 0 */
     if (s->version > 0) {
@@ -517,10 +523,9 @@ end:
     return 0;
 }
 
-static int shorten_decode_frame(AVCodecContext *avctx, void *data,
+static int shorten_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                                 int *got_frame_ptr, AVPacket *avpkt)
 {
-    AVFrame *frame     = data;
     const uint8_t *buf = avpkt->data;
     int buf_size       = avpkt->size;
     ShortenContext *s  = avctx->priv_data;
@@ -577,10 +582,9 @@ static int shorten_decode_frame(AVCodecContext *avctx, void *data,
             return ret;
 
         if (avpkt->size) {
-            int max_framesize;
+            int max_framesize = s->blocksize * s->channels * 8;
             void *tmp_ptr;
-
-            max_framesize = FFMAX(s->max_framesize, s->blocksize * s->channels * 8);
+            unsigned old_allocated_bitstream_size = s->allocated_bitstream_size;
             tmp_ptr = av_fast_realloc(s->bitstream, &s->allocated_bitstream_size,
                                       max_framesize + AV_INPUT_BUFFER_PADDING_SIZE);
             if (!tmp_ptr) {
@@ -588,7 +592,9 @@ static int shorten_decode_frame(AVCodecContext *avctx, void *data,
                 return AVERROR(ENOMEM);
             }
             s->bitstream = tmp_ptr;
-            s->max_framesize = max_framesize;
+            if (s->allocated_bitstream_size > old_allocated_bitstream_size)
+                memset(s->bitstream + old_allocated_bitstream_size, 0, s->allocated_bitstream_size - old_allocated_bitstream_size);
+            s->max_framesize = FFMAX(s->max_framesize, max_framesize);
             *got_frame_ptr = 0;
             goto finish_frame;
         }
@@ -799,21 +805,16 @@ static av_cold int shorten_decode_close(AVCodecContext *avctx)
     return 0;
 }
 
-const AVCodec ff_shorten_decoder = {
-    .name           = "shorten",
-    .long_name      = NULL_IF_CONFIG_SMALL("Shorten"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_SHORTEN,
+const FFCodec ff_shorten_decoder = {
+    .p.name         = "shorten",
+    CODEC_LONG_NAME("Shorten"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_SHORTEN,
     .priv_data_size = sizeof(ShortenContext),
     .init           = shorten_decode_init,
     .close          = shorten_decode_close,
-    .decode         = shorten_decode_frame,
-    .capabilities   = AV_CODEC_CAP_CHANNEL_CONF |
+    FF_CODEC_DECODE_CB(shorten_decode_frame),
+    .p.capabilities = AV_CODEC_CAP_CHANNEL_CONF |
                       AV_CODEC_CAP_DELAY |
-                      AV_CODEC_CAP_DR1 |
-                      AV_CODEC_CAP_SUBFRAMES ,
-    .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S16P,
-                                                      AV_SAMPLE_FMT_U8P,
-                                                      AV_SAMPLE_FMT_NONE },
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+                      AV_CODEC_CAP_DR1,
 };

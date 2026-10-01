@@ -46,20 +46,18 @@
  */
 
 #include <float.h>
-#include <libavutil/lfg.h>
+#include "libavutil/lfg.h"
 #include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/fifo.h"
 #include "libavutil/common.h"
 #include "libavutil/avassert.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
 #include "avfilter.h"
 #include "framequeue.h"
 #include "filters.h"
 #include "transform.h"
-#include "formats.h"
-#include "internal.h"
 #include "opencl.h"
 #include "opencl_source.h"
 #include "video.h"
@@ -134,7 +132,7 @@ typedef struct DebugMatches {
 // for each frame
 typedef struct AbsoluteFrameMotion {
     // Array with the various ringbuffers, indexed via the RingbufferIndices enum
-    AVFifoBuffer *ringbuffers[RingbufCount];
+    AVFifo *ringbuffers[RingbufCount];
 
     // Offset to get to the current frame being processed
     // (not in bytes)
@@ -144,7 +142,7 @@ typedef struct AbsoluteFrameMotion {
     int data_start_offset;
     int data_end_offset;
 
-    AVFifoBuffer *debug_matches;
+    AVFifo *debug_matches;
 } AbsoluteFrameMotion;
 
 // Takes care of freeing the arrays within the DebugMatches inside of the
@@ -156,18 +154,10 @@ static void free_debug_matches(AbsoluteFrameMotion *afm) {
         return;
     }
 
-    while (av_fifo_size(afm->debug_matches) > 0) {
-        av_fifo_generic_read(
-            afm->debug_matches,
-            &dm,
-            sizeof(DebugMatches),
-            NULL
-        );
-
+    while (av_fifo_read(afm->debug_matches, &dm, 1) >= 0)
         av_freep(&dm.matches);
-    }
 
-    av_fifo_freep(&afm->debug_matches);
+    av_fifo_freep2(&afm->debug_matches);
 }
 
 // Stores the translation, scale, rotation, and skew deltas between two frames
@@ -712,7 +702,7 @@ static int minimize_error(
             total_err += deshake_ctx->ransac_err[j];
         }
 
-        if (total_err < best_err) {
+        if (i == 0 || total_err < best_err) {
             for (int mi = 0; mi < 6; ++mi) {
                 best_model[mi] = model[mi];
             }
@@ -853,7 +843,7 @@ static IterIndices start_end_for(DeshakeOpenCLContext *deshake_ctx, int length) 
 // clipping the offset into the appropriate range
 static void ringbuf_float_at(
     DeshakeOpenCLContext *deshake_ctx,
-    AVFifoBuffer *values,
+    AVFifo *values,
     float *val,
     int offset
 ) {
@@ -863,7 +853,7 @@ static void ringbuf_float_at(
     } else {
         // This expression represents the last valid index in the buffer,
         // which we use repeatedly at the end of the video.
-        clip_end = deshake_ctx->smooth_window - (av_fifo_space(values) / sizeof(float)) - 1;
+        clip_end = deshake_ctx->smooth_window - av_fifo_can_write(values) - 1;
     }
 
     if (deshake_ctx->abs_motion.data_start_offset != -1) {
@@ -881,13 +871,7 @@ static void ringbuf_float_at(
         clip_end
     );
 
-    av_fifo_generic_peek_at(
-        values,
-        val,
-        offset_clipped * sizeof(float),
-        sizeof(float),
-        NULL
-    );
+    av_fifo_peek(values, val, 1, offset_clipped);
 }
 
 // Returns smoothed current frame value of the given buffer of floats based on the
@@ -905,7 +889,7 @@ static float smooth(
     float *gauss_kernel,
     int length,
     float max_val,
-    AVFifoBuffer *values
+    AVFifo *values
 ) {
     float new_large_s = 0, new_small_s = 0, new_best = 0, old, diff_between,
           percent_of_max, inverted_percent;
@@ -1069,7 +1053,7 @@ static av_cold void deshake_opencl_uninit(AVFilterContext *avctx)
     cl_int cle;
 
     for (int i = 0; i < RingbufCount; i++)
-        av_fifo_freep(&ctx->abs_motion.ringbuffers[i]);
+        av_fifo_freep2(&ctx->abs_motion.ringbuffers[i]);
 
     if (ctx->debug_on)
         free_debug_matches(&ctx->abs_motion);
@@ -1127,6 +1111,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     DeshakeOpenCLContext *ctx = avctx->priv;
     AVFilterLink *outlink = avctx->outputs[0];
     AVFilterLink *inlink = avctx->inputs[0];
+    FilterLink      *inl = ff_filter_link(inlink);
     // Pointer to the host-side pattern buffer to be initialized and then copied
     // to the GPU
     PointPair *pattern_host = NULL;
@@ -1161,7 +1146,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     const int descriptor_buf_size = image_grid_32 * (BREIFN / 8);
     const int features_buf_size = image_grid_32 * sizeof(cl_float2);
 
-    const AVHWFramesContext *hw_frames_ctx = (AVHWFramesContext*)inlink->hw_frames_ctx->data;
+    const AVHWFramesContext *hw_frames_ctx = (AVHWFramesContext*)inl->hw_frames_ctx->data;
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(hw_frames_ctx->sw_format);
 
     av_assert0(hw_frames_ctx);
@@ -1170,7 +1155,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     ff_framequeue_global_init(&fqg);
     ff_framequeue_init(&ctx->fq, &fqg);
     ctx->eof = 0;
-    ctx->smooth_window = (int)(av_q2d(avctx->inputs[0]->frame_rate) * ctx->smooth_window_multiplier);
+    ctx->smooth_window = (int)(av_q2d(inl->frame_rate) * ctx->smooth_window_multiplier);
     ctx->curr_frame = 0;
 
     memset(&zeroed_ulong8, 0, sizeof(cl_ulong8));
@@ -1188,10 +1173,8 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     }
 
     for (int i = 0; i < RingbufCount; i++) {
-        ctx->abs_motion.ringbuffers[i] = av_fifo_alloc_array(
-            ctx->smooth_window,
-            sizeof(float)
-        );
+        ctx->abs_motion.ringbuffers[i] = av_fifo_alloc2(ctx->smooth_window,
+            sizeof(float), 0);
 
         if (!ctx->abs_motion.ringbuffers[i]) {
             err = AVERROR(ENOMEM);
@@ -1200,9 +1183,9 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     }
 
     if (ctx->debug_on) {
-        ctx->abs_motion.debug_matches = av_fifo_alloc_array(
+        ctx->abs_motion.debug_matches = av_fifo_alloc2(
             ctx->smooth_window / 2,
-            sizeof(DebugMatches)
+            sizeof(DebugMatches), 0
         );
 
         if (!ctx->abs_motion.debug_matches) {
@@ -1267,7 +1250,7 @@ static int deshake_opencl_init(AVFilterContext *avctx)
     }
     ctx->sw_format = hw_frames_ctx->sw_format;
 
-    err = ff_opencl_filter_load_program(avctx, &ff_opencl_source_deshake, 1);
+    err = ff_opencl_filter_load_program(avctx, &ff_source_deshake_cl, 1);
     if (err < 0)
         goto fail;
 
@@ -1386,6 +1369,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
 {
     AVFilterContext *avctx = link->dst;
     AVFilterLink *outlink = avctx->outputs[0];
+    FilterLink      *outl = ff_filter_link(outlink);
     DeshakeOpenCLContext *deshake_ctx = avctx->priv;
     AVFrame *cropped_frame = NULL, *transformed_frame = NULL;
     int err;
@@ -1404,8 +1388,8 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     size_t global_work[2];
     int64_t duration;
     cl_mem src, transformed, dst;
-    cl_mem transforms[3];
-    CropInfo crops[3];
+    cl_mem transforms[AV_VIDEO_MAX_PLANES];
+    CropInfo crops[AV_VIDEO_MAX_PLANES];
     cl_event transform_event, crop_upscale_event;
     DebugMatches debug_matches;
     cl_int num_model_matches;
@@ -1424,30 +1408,23 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     const float luma_h_over_chroma_h = ((float)input_frame->height / (float)chroma_height);
 
     if (deshake_ctx->debug_on) {
-        av_fifo_generic_read(
+        av_fifo_read(
             deshake_ctx->abs_motion.debug_matches,
-            &debug_matches,
-            sizeof(DebugMatches),
-            NULL
-        );
+            &debug_matches, 1);
     }
 
-    if (input_frame->pkt_duration) {
-        duration = input_frame->pkt_duration;
+    if (input_frame->duration) {
+        duration = input_frame->duration;
     } else {
-        duration = av_rescale_q(1, av_inv_q(outlink->frame_rate), outlink->time_base);
+        duration = av_rescale_q(1, av_inv_q(outl->frame_rate), outlink->time_base);
     }
     deshake_ctx->duration = input_frame->pts + duration;
 
     // Get the absolute transform data for this frame
     for (int i = 0; i < RingbufCount; i++) {
-        av_fifo_generic_peek_at(
-            deshake_ctx->abs_motion.ringbuffers[i],
-            &old_vals[i],
-            deshake_ctx->abs_motion.curr_frame_offset * sizeof(float),
-            sizeof(float),
-            NULL
-        );
+        av_fifo_peek(deshake_ctx->abs_motion.ringbuffers[i],
+                     &old_vals[i], 1,
+                     deshake_ctx->abs_motion.curr_frame_offset);
     }
 
     if (deshake_ctx->tripod_mode) {
@@ -1542,7 +1519,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
     transforms[0] = deshake_ctx->transform_y;
     transforms[1] = transforms[2] = deshake_ctx->transform_uv;
 
-    for (int p = 0; p < FF_ARRAY_ELEMS(transformed_frame->data); p++) {
+    for (int p = 0; p < AV_VIDEO_MAX_PLANES; p++) {
         // Transform all of the planes appropriately
         src = (cl_mem)input_frame->data[p];
         transformed = (cl_mem)transformed_frame->data[p];
@@ -1643,7 +1620,7 @@ static int filter_frame(AVFilterLink *link, AVFrame *input_frame)
         crops[0] = deshake_ctx->crop_y;
         crops[1] = crops[2] = deshake_ctx->crop_uv;
 
-        for (int p = 0; p < FF_ARRAY_ELEMS(cropped_frame->data); p++) {
+        for (int p = 0; p < AV_VIDEO_MAX_PLANES; p++) {
             // Crop all of the planes appropriately
             dst = (cl_mem)cropped_frame->data[p];
             transformed = (cl_mem)transformed_frame->data[p];
@@ -1842,7 +1819,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         { sizeof(cl_mem), &deshake_ctx->brief_pattern}
     );
 
-    if (av_fifo_size(deshake_ctx->abs_motion.ringbuffers[RingbufX]) == 0) {
+    if (!av_fifo_can_read(deshake_ctx->abs_motion.ringbuffers[RingbufX])) {
         // This is the first frame we've been given to queue, meaning there is
         // no previous frame to match descriptors to
 
@@ -1892,7 +1869,7 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
         // old data (and just treat them all as part of the new values)
         if (deshake_ctx->abs_motion.data_end_offset == -1) {
             deshake_ctx->abs_motion.data_end_offset =
-                av_fifo_size(deshake_ctx->abs_motion.ringbuffers[RingbufX]) / sizeof(float) - 1;
+                av_fifo_can_read(deshake_ctx->abs_motion.ringbuffers[RingbufX]) - 1;
         }
 
         goto no_motion_data;
@@ -1934,13 +1911,10 @@ static int queue_frame(AVFilterLink *link, AVFrame *input_frame)
 
     // Get the absolute transform data for the previous frame
     for (int i = 0; i < RingbufCount; i++) {
-        av_fifo_generic_peek_at(
+        av_fifo_peek(
             deshake_ctx->abs_motion.ringbuffers[i],
-            &prev_vals[i],
-            av_fifo_size(deshake_ctx->abs_motion.ringbuffers[i]) - sizeof(float),
-            sizeof(float),
-            NULL
-        );
+            &prev_vals[i], 1,
+            av_fifo_can_read(deshake_ctx->abs_motion.ringbuffers[i]) - 1);
     }
 
     new_vals[RingbufX]      = prev_vals[RingbufX] + relative.translation.s[0];
@@ -2011,21 +1985,13 @@ end:
         }
         debug_matches.num_matches = num_vectors;
 
-        av_fifo_generic_write(
+        av_fifo_write(
             deshake_ctx->abs_motion.debug_matches,
-            &debug_matches,
-            sizeof(DebugMatches),
-            NULL
-        );
+            &debug_matches, 1);
     }
 
     for (int i = 0; i < RingbufCount; i++) {
-        av_fifo_generic_write(
-            deshake_ctx->abs_motion.ringbuffers[i],
-            &new_vals[i],
-            sizeof(float),
-            NULL
-        );
+        av_fifo_write(deshake_ctx->abs_motion.ringbuffers[i], &new_vals[i], 1);
     }
 
     return ff_framequeue_add(&deshake_ctx->fq, input_frame);
@@ -2063,9 +2029,9 @@ static int activate(AVFilterContext *ctx)
 
             // If there is no more space in the ringbuffers, remove the oldest
             // values to make room for the new ones
-            if (av_fifo_space(deshake_ctx->abs_motion.ringbuffers[RingbufX]) == 0) {
+            if (!av_fifo_can_write(deshake_ctx->abs_motion.ringbuffers[RingbufX])) {
                 for (int i = 0; i < RingbufCount; i++) {
-                    av_fifo_drain(deshake_ctx->abs_motion.ringbuffers[i], sizeof(float));
+                    av_fifo_drain2(deshake_ctx->abs_motion.ringbuffers[i], 1);
                 }
             }
             ret = queue_frame(inlink, frame);
@@ -2092,7 +2058,7 @@ static int activate(AVFilterContext *ctx)
         // Finish processing the rest of the frames in the queue.
         while(ff_framequeue_queued_frames(&deshake_ctx->fq) != 0) {
             for (int i = 0; i < RingbufCount; i++) {
-                av_fifo_drain(deshake_ctx->abs_motion.ringbuffers[i], sizeof(float));
+                av_fifo_drain2(deshake_ctx->abs_motion.ringbuffers[i], 1);
             }
 
             ret = filter_frame(inlink, ff_framequeue_take(&deshake_ctx->fq));
@@ -2185,16 +2151,17 @@ static const AVOption deshake_opencl_options[] = {
 
 AVFILTER_DEFINE_CLASS(deshake_opencl);
 
-const AVFilter ff_vf_deshake_opencl = {
-    .name           = "deshake_opencl",
-    .description    = NULL_IF_CONFIG_SMALL("Feature-point based video stabilization filter"),
+const FFFilter ff_vf_deshake_opencl = {
+    .p.name         = "deshake_opencl",
+    .p.description  = NULL_IF_CONFIG_SMALL("Feature-point based video stabilization filter"),
+    .p.priv_class   = &deshake_opencl_class,
+    .p.flags        = AVFILTER_FLAG_HWDEVICE,
     .priv_size      = sizeof(DeshakeOpenCLContext),
-    .priv_class     = &deshake_opencl_class,
     .init           = &ff_opencl_filter_init,
     .uninit         = &deshake_opencl_uninit,
     .activate       = activate,
     FILTER_INPUTS(deshake_opencl_inputs),
     FILTER_OUTPUTS(deshake_opencl_outputs),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_OPENCL),
-    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE
+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

@@ -20,13 +20,13 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "libavutil/parseutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/xga_font_data.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 
 enum GraticuleType {
@@ -85,55 +85,56 @@ typedef struct VectorscopeContext {
 
 #define OFFSET(x) offsetof(VectorscopeContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
+#define TFLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
 static const AVOption vectorscope_options[] = {
-    { "mode", "set vectorscope mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, MODE_NB-1, FLAGS, "mode"},
-    { "m",    "set vectorscope mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, MODE_NB-1, FLAGS, "mode"},
-    {   "gray",   0, 0, AV_OPT_TYPE_CONST, {.i64=TINT},   0, 0, FLAGS, "mode" },
-    {   "tint",   0, 0, AV_OPT_TYPE_CONST, {.i64=TINT},   0, 0, FLAGS, "mode" },
-    {   "color",  0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR},  0, 0, FLAGS, "mode" },
-    {   "color2", 0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR2}, 0, 0, FLAGS, "mode" },
-    {   "color3", 0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR3}, 0, 0, FLAGS, "mode" },
-    {   "color4", 0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR4}, 0, 0, FLAGS, "mode" },
-    {   "color5", 0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR5}, 0, 0, FLAGS, "mode" },
+    { "mode", "set vectorscope mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, MODE_NB-1, FLAGS, .unit = "mode"},
+    { "m",    "set vectorscope mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=0}, 0, MODE_NB-1, FLAGS, .unit = "mode"},
+    {   "gray",   0, 0, AV_OPT_TYPE_CONST, {.i64=TINT},   0, 0, FLAGS, .unit = "mode" },
+    {   "tint",   0, 0, AV_OPT_TYPE_CONST, {.i64=TINT},   0, 0, FLAGS, .unit = "mode" },
+    {   "color",  0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR},  0, 0, FLAGS, .unit = "mode" },
+    {   "color2", 0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR2}, 0, 0, FLAGS, .unit = "mode" },
+    {   "color3", 0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR3}, 0, 0, FLAGS, .unit = "mode" },
+    {   "color4", 0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR4}, 0, 0, FLAGS, .unit = "mode" },
+    {   "color5", 0, 0, AV_OPT_TYPE_CONST, {.i64=COLOR5}, 0, 0, FLAGS, .unit = "mode" },
     { "x", "set color component on X axis", OFFSET(x), AV_OPT_TYPE_INT, {.i64=1}, 0, 2, FLAGS},
     { "y", "set color component on Y axis", OFFSET(y), AV_OPT_TYPE_INT, {.i64=2}, 0, 2, FLAGS},
-    { "intensity", "set intensity", OFFSET(fintensity), AV_OPT_TYPE_FLOAT, {.dbl=0.004}, 0, 1, FLAGS},
-    { "i",         "set intensity", OFFSET(fintensity), AV_OPT_TYPE_FLOAT, {.dbl=0.004}, 0, 1, FLAGS},
-    { "envelope",  "set envelope", OFFSET(envelope), AV_OPT_TYPE_INT, {.i64=0}, 0, 3, FLAGS, "envelope"},
-    { "e",         "set envelope", OFFSET(envelope), AV_OPT_TYPE_INT, {.i64=0}, 0, 3, FLAGS, "envelope"},
-    {   "none",         0, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "envelope" },
-    {   "instant",      0, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "envelope" },
-    {   "peak",         0, 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, "envelope" },
-    {   "peak+instant", 0, 0, AV_OPT_TYPE_CONST, {.i64=3}, 0, 0, FLAGS, "envelope" },
-    { "graticule", "set graticule", OFFSET(graticule), AV_OPT_TYPE_INT, {.i64=GRAT_NONE}, 0, NB_GRATICULES-1, FLAGS, "graticule"},
-    { "g",         "set graticule", OFFSET(graticule), AV_OPT_TYPE_INT, {.i64=GRAT_NONE}, 0, NB_GRATICULES-1, FLAGS, "graticule"},
-    {   "none",         0, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_NONE},  0, 0, FLAGS, "graticule" },
-    {   "green",        0, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_GREEN}, 0, 0, FLAGS, "graticule" },
-    {   "color",        0, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_COLOR}, 0, 0, FLAGS, "graticule" },
-    {   "invert",       0, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_INVERT},0, 0, FLAGS, "graticule" },
-    { "opacity", "set graticule opacity", OFFSET(opacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, FLAGS},
-    { "o",       "set graticule opacity", OFFSET(opacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, FLAGS},
-    { "flags", "set graticule flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64=4}, 0, 7, FLAGS, "flags"},
-    { "f",     "set graticule flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64=4}, 0, 7, FLAGS, "flags"},
-    {   "white", "draw white point", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "flags" },
-    {   "black", "draw black point", 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, "flags" },
-    {   "name",  "draw point name",  0, AV_OPT_TYPE_CONST, {.i64=4}, 0, 0, FLAGS, "flags" },
-    { "bgopacity", "set background opacity", OFFSET(bgopacity), AV_OPT_TYPE_FLOAT, {.dbl=0.3}, 0, 1, FLAGS},
-    { "b",         "set background opacity", OFFSET(bgopacity), AV_OPT_TYPE_FLOAT, {.dbl=0.3}, 0, 1, FLAGS},
+    { "intensity", "set intensity", OFFSET(fintensity), AV_OPT_TYPE_FLOAT, {.dbl=0.004}, 0, 1, TFLAGS},
+    { "i",         "set intensity", OFFSET(fintensity), AV_OPT_TYPE_FLOAT, {.dbl=0.004}, 0, 1, TFLAGS},
+    { "envelope",  "set envelope", OFFSET(envelope), AV_OPT_TYPE_INT, {.i64=0}, 0, 3, TFLAGS, .unit = "envelope"},
+    { "e",         "set envelope", OFFSET(envelope), AV_OPT_TYPE_INT, {.i64=0}, 0, 3, TFLAGS, .unit = "envelope"},
+    {   "none",         0, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, TFLAGS, .unit = "envelope" },
+    {   "instant",      0, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, TFLAGS, .unit = "envelope" },
+    {   "peak",         0, 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, TFLAGS, .unit = "envelope" },
+    {   "peak+instant", 0, 0, AV_OPT_TYPE_CONST, {.i64=3}, 0, 0, TFLAGS, .unit = "envelope" },
+    { "graticule", "set graticule", OFFSET(graticule), AV_OPT_TYPE_INT, {.i64=GRAT_NONE}, 0, NB_GRATICULES-1, FLAGS, .unit = "graticule"},
+    { "g",         "set graticule", OFFSET(graticule), AV_OPT_TYPE_INT, {.i64=GRAT_NONE}, 0, NB_GRATICULES-1, FLAGS, .unit = "graticule"},
+    {   "none",         0, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_NONE},  0, 0, FLAGS, .unit = "graticule" },
+    {   "green",        0, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_GREEN}, 0, 0, FLAGS, .unit = "graticule" },
+    {   "color",        0, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_COLOR}, 0, 0, FLAGS, .unit = "graticule" },
+    {   "invert",       0, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_INVERT},0, 0, FLAGS, .unit = "graticule" },
+    { "opacity", "set graticule opacity", OFFSET(opacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, TFLAGS},
+    { "o",       "set graticule opacity", OFFSET(opacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, TFLAGS},
+    { "flags", "set graticule flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64=4}, 0, 7, TFLAGS, .unit = "flags"},
+    { "f",     "set graticule flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64=4}, 0, 7, TFLAGS, .unit = "flags"},
+    {   "white", "draw white point", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, TFLAGS, .unit = "flags" },
+    {   "black", "draw black point", 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, TFLAGS, .unit = "flags" },
+    {   "name",  "draw point name",  0, AV_OPT_TYPE_CONST, {.i64=4}, 0, 0, TFLAGS, .unit = "flags" },
+    { "bgopacity", "set background opacity", OFFSET(bgopacity), AV_OPT_TYPE_FLOAT, {.dbl=0.3}, 0, 1, TFLAGS},
+    { "b",         "set background opacity", OFFSET(bgopacity), AV_OPT_TYPE_FLOAT, {.dbl=0.3}, 0, 1, TFLAGS},
     { "lthreshold", "set low threshold",  OFFSET(lthreshold), AV_OPT_TYPE_FLOAT, {.dbl=0}, 0, 1, FLAGS},
     { "l",          "set low threshold",  OFFSET(lthreshold), AV_OPT_TYPE_FLOAT, {.dbl=0}, 0, 1, FLAGS},
     { "hthreshold", "set high threshold", OFFSET(hthreshold), AV_OPT_TYPE_FLOAT, {.dbl=1}, 0, 1, FLAGS},
     { "h",          "set high threshold", OFFSET(hthreshold), AV_OPT_TYPE_FLOAT, {.dbl=1}, 0, 1, FLAGS},
-    { "colorspace", "set colorspace", OFFSET(colorspace), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, "colorspace"},
-    { "c",          "set colorspace", OFFSET(colorspace), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, "colorspace"},
-    {   "auto",       0, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "colorspace" },
-    {   "601",        0, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "colorspace" },
-    {   "709",        0, 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, "colorspace" },
-    { "tint0", "set 1st tint", OFFSET(ftint[0]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, FLAGS},
-    { "t0",    "set 1st tint", OFFSET(ftint[0]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, FLAGS},
-    { "tint1", "set 2nd tint", OFFSET(ftint[1]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, FLAGS},
-    { "t1",    "set 2nd tint", OFFSET(ftint[1]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, FLAGS},
+    { "colorspace", "set colorspace", OFFSET(colorspace), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, .unit = "colorspace"},
+    { "c",          "set colorspace", OFFSET(colorspace), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, .unit = "colorspace"},
+    {   "auto",       0, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, .unit = "colorspace" },
+    {   "601",        0, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, .unit = "colorspace" },
+    {   "709",        0, 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, .unit = "colorspace" },
+    { "tint0", "set 1st tint", OFFSET(ftint[0]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, TFLAGS},
+    { "t0",    "set 1st tint", OFFSET(ftint[0]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, TFLAGS},
+    { "tint1", "set 2nd tint", OFFSET(ftint[1]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, TFLAGS},
+    { "t1",    "set 2nd tint", OFFSET(ftint[1]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, TFLAGS},
     { NULL }
 };
 
@@ -228,7 +229,7 @@ static int query_formats(AVFilterContext *ctx)
             in_pix_fmts = in2_pix_fmts;
         else
             in_pix_fmts = in1_pix_fmts;
-        if ((ret = ff_formats_ref(ff_make_format_list(in_pix_fmts), &ctx->inputs[0]->outcfg.formats)) < 0)
+        if ((ret = ff_formats_ref(ff_make_pixel_format_list(in_pix_fmts), &ctx->inputs[0]->outcfg.formats)) < 0)
             return ret;
     }
 
@@ -261,7 +262,7 @@ static int query_formats(AVFilterContext *ctx)
         out_pix_fmts = out_yuv12_pix_fmts;
     else
         return AVERROR(EAGAIN);
-    if ((ret = ff_formats_ref(ff_make_format_list(out_pix_fmts), &ctx->outputs[0]->incfg.formats)) < 0)
+    if ((ret = ff_formats_ref(ff_make_pixel_format_list(out_pix_fmts), &ctx->outputs[0]->incfg.formats)) < 0)
         return ret;
 
     return 0;
@@ -272,7 +273,6 @@ static int config_output(AVFilterLink *outlink)
     VectorscopeContext *s = outlink->src->priv;
     int i;
 
-    s->intensity = s->fintensity * (s->size - 1);
     outlink->h = outlink->w = s->size;
     outlink->sample_aspect_ratio = (AVRational){1,1};
 
@@ -968,7 +968,7 @@ static void draw_ihtext(AVFrame *out, int x, int y, float o1, float o2, const ch
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -993,7 +993,7 @@ static void draw_ihtext16(AVFrame *out, int x, int y, float o1, float o2, const 
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -1019,7 +1019,7 @@ static void draw_htext(AVFrame *out, int x, int y, float o1, float o2, const cha
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -1045,7 +1045,7 @@ static void draw_htext16(AVFrame *out, int x, int y, float o1, float o2, const c
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -1442,6 +1442,13 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *out;
     int plane;
 
+    s->bg_color[3] = s->bgopacity * (s->size - 1);
+
+    s->tint[0] = .5f * (s->ftint[0] + 1.f) * (s->size - 1);
+    s->tint[1] = .5f * (s->ftint[1] + 1.f) * (s->size - 1);
+
+    s->intensity = s->fintensity * (s->size - 1);
+
     if (s->colorspace) {
         s->cs = (s->depth - 8) * 2 + s->colorspace - 1;
     } else {
@@ -1462,6 +1469,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         return AVERROR(ENOMEM);
     }
     av_frame_copy_props(out, in);
+    out->sample_aspect_ratio = outlink->sample_aspect_ratio;
 
     s->vectorscope(s, in, out, s->pd);
     s->graticulef(s, out, s->x, s->y, s->pd, s->cs);
@@ -1529,11 +1537,6 @@ static int config_input(AVFilterLink *inlink)
             s->graticulef = invert_graticule16;
     }
 
-    s->bg_color[3] = s->bgopacity * (s->size - 1);
-
-    s->tint[0] = .5f * (s->ftint[0] + 1.f) * (s->size - 1);
-    s->tint[1] = .5f * (s->ftint[1] + 1.f) * (s->size - 1);
-
     switch (inlink->format) {
     case AV_PIX_FMT_GBRP12:
     case AV_PIX_FMT_GBRP10:
@@ -1585,13 +1588,14 @@ static const AVFilterPad outputs[] = {
     },
 };
 
-const AVFilter ff_vf_vectorscope = {
-    .name          = "vectorscope",
-    .description   = NULL_IF_CONFIG_SMALL("Video vectorscope."),
+const FFFilter ff_vf_vectorscope = {
+    .p.name        = "vectorscope",
+    .p.description = NULL_IF_CONFIG_SMALL("Video vectorscope."),
+    .p.priv_class  = &vectorscope_class,
     .priv_size     = sizeof(VectorscopeContext),
-    .priv_class    = &vectorscope_class,
     .uninit        = uninit,
     FILTER_INPUTS(inputs),
     FILTER_OUTPUTS(outputs),
     FILTER_QUERY_FUNC(query_formats),
+    .process_command = ff_filter_process_command,
 };

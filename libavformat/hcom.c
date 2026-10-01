@@ -20,8 +20,9 @@
  */
 
 #include "libavutil/intreadwrite.h"
-#include "libavcodec/internal.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "pcm.h"
 
@@ -62,7 +63,7 @@ static int hcom_read_header(AVFormatContext *s)
         return AVERROR(ENOMEM);
 
     st->codecpar->codec_type  = AVMEDIA_TYPE_AUDIO;
-    st->codecpar->channels    = 1;
+    st->codecpar->ch_layout.nb_channels = 1;
     st->codecpar->sample_rate = 22050 / divisor;
     st->codecpar->codec_id    = AV_CODEC_ID_HCOM;
     st->codecpar->bits_per_coded_sample = 8;
@@ -73,7 +74,9 @@ static int hcom_read_header(AVFormatContext *s)
         return ret;
     AV_WB16(st->codecpar->extradata, dict_entries);
     AV_WB32(st->codecpar->extradata + 2, compresstype);
-    avio_read(s->pb, st->codecpar->extradata + 6, dict_entries * 4);
+    ret = ffio_read_size(s->pb, st->codecpar->extradata + 6, dict_entries * 4);
+    if (ret < 0)
+        return ret;
     avio_skip(s->pb, 1);
     st->codecpar->extradata[dict_entries * 4 + 6] = avio_r8(s->pb);
 
@@ -82,9 +85,9 @@ static int hcom_read_header(AVFormatContext *s)
     return 0;
 }
 
-const AVInputFormat ff_hcom_demuxer = {
-    .name           = "hcom",
-    .long_name      = NULL_IF_CONFIG_SMALL("Macintosh HCOM"),
+const FFInputFormat ff_hcom_demuxer = {
+    .p.name         = "hcom",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Macintosh HCOM"),
     .read_probe     = hcom_probe,
     .read_header    = hcom_read_header,
     .read_packet    = ff_pcm_read_packet,

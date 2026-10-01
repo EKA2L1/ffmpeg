@@ -57,11 +57,11 @@ const ChannelInformation ff_mlp_ch_info[21] = {
     { 0x3F, 0x04, 0x02, 0x00 },
 };
 
-const uint64_t ff_mlp_channel_layouts[12] = {
-    AV_CH_LAYOUT_MONO, AV_CH_LAYOUT_STEREO, AV_CH_LAYOUT_2_1,
-    AV_CH_LAYOUT_QUAD, AV_CH_LAYOUT_2POINT1, AV_CH_LAYOUT_SURROUND,
-    AV_CH_LAYOUT_4POINT0, AV_CH_LAYOUT_5POINT0_BACK, AV_CH_LAYOUT_3POINT1,
-    AV_CH_LAYOUT_4POINT1, AV_CH_LAYOUT_5POINT1_BACK, 0,
+const AVChannelLayout ff_mlp_ch_layouts[12] = {
+    AV_CHANNEL_LAYOUT_MONO, AV_CHANNEL_LAYOUT_STEREO, AV_CHANNEL_LAYOUT_2_1,
+    AV_CHANNEL_LAYOUT_QUAD, AV_CHANNEL_LAYOUT_2POINT1, AV_CHANNEL_LAYOUT_SURROUND,
+    AV_CHANNEL_LAYOUT_4POINT0, AV_CHANNEL_LAYOUT_5POINT0_BACK, AV_CHANNEL_LAYOUT_3POINT1,
+    AV_CHANNEL_LAYOUT_4POINT1, AV_CHANNEL_LAYOUT_5POINT1_BACK, { 0 },
 };
 
 #if CONFIG_SMALL
@@ -70,13 +70,11 @@ const uint64_t ff_mlp_channel_layouts[12] = {
 #define CRC_TABLE_SIZE 1024
 #endif
 static AVCRC crc_63[CRC_TABLE_SIZE];
-static AVCRC crc_1D[CRC_TABLE_SIZE];
 static AVCRC crc_2D[CRC_TABLE_SIZE];
 
 static av_cold void mlp_init_crc(void)
 {
     av_crc_init(crc_63, 0,  8,   0x63, sizeof(crc_63));
-    av_crc_init(crc_1D, 0,  8,   0x1D, sizeof(crc_1D));
     av_crc_init(crc_2D, 0, 16, 0x002D, sizeof(crc_2D));
 }
 
@@ -104,11 +102,15 @@ uint8_t ff_mlp_checksum8(const uint8_t *buf, unsigned int buf_size)
 
 uint8_t ff_mlp_restart_checksum(const uint8_t *buf, unsigned int bit_size)
 {
+    const AVCRC *crc_1D = av_crc_get_table(AV_CRC_8_EBU);
     int i;
     int num_bytes = (bit_size + 2) / 8;
 
-    int crc = crc_1D[buf[0] & 0x3f];
-    crc = av_crc(crc_1D, crc, buf + 1, num_bytes - 2);
+    // The two most significant bits of buf[0] are not supposed
+    // to be contained in the checksum; using buf[0] & 0xC0 as start value
+    // achieves this.
+    int crc = av_crc(crc_1D, buf[0] & 0xC0, buf, num_bytes - 1);
+
     crc ^= buf[num_bytes - 1];
 
     for (i = 0; i < ((bit_size + 2) & 7); i++) {

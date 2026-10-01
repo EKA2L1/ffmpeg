@@ -27,7 +27,6 @@
 #define RET 0xC3 // near return opcode for x86
 #define PREFETCH "prefetchnta"
 
-#if HAVE_INLINE_ASM
 av_cold int ff_init_hscaler_mmxext(int dstW, int xInc, uint8_t *filterCode,
                                        int16_t *filter, int32_t *filterPos,
                                        int numSplits)
@@ -190,7 +189,7 @@ av_cold int ff_init_hscaler_mmxext(int dstW, int xInc, uint8_t *filterCode,
     return fragmentPos + 1;
 }
 
-void ff_hyscale_fast_mmxext(SwsContext *c, int16_t *dst,
+void ff_hyscale_fast_mmxext(SwsInternal *c, int16_t *dst,
                                  int dstWidth, const uint8_t *src,
                                  int srcW, int xInc)
 {
@@ -276,11 +275,11 @@ void ff_hyscale_fast_mmxext(SwsContext *c, int16_t *dst,
 #endif
     );
 
-    for (i=dstWidth-1; (i*xInc)>>16 >=srcW-1; i--)
+    for (i=dstWidth-1; (i*(int64_t)xInc)>>16 >=srcW-1; i--)
         dst[i] = src[srcW-1]*128;
 }
 
-void ff_hcscale_fast_mmxext(SwsContext *c, int16_t *dst1, int16_t *dst2,
+void ff_hcscale_fast_mmxext(SwsInternal *c, int16_t *dst1, int16_t *dst2,
                                  int dstWidth, const uint8_t *src1,
                                  const uint8_t *src2, int srcW, int xInc)
 {
@@ -353,9 +352,8 @@ void ff_hcscale_fast_mmxext(SwsContext *c, int16_t *dst1, int16_t *dst2,
 #endif
     );
 
-    for (i=dstWidth-1; (i*xInc)>>16 >=srcW-1; i--) {
+    for (i=dstWidth-1; (i*(int64_t)xInc)>>16 >=srcW-1; i--) {
         dst1[i] = src1[srcW-1]*128;
         dst2[i] = src2[srcW-1]*128;
     }
 }
-#endif //HAVE_INLINE_ASM

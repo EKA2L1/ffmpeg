@@ -19,22 +19,30 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/intreadwrite.h"
+#include "libavcodec/packet.h"
 #include "avformat.h"
-#include "internal.h"
+#include "rawutils.h"
 
 int ff_reshuffle_raw_rgb(AVFormatContext *s, AVPacket **ppkt, AVCodecParameters *par, int expected_stride)
 {
     int ret;
     AVPacket *pkt = *ppkt;
     int64_t bpc = par->bits_per_coded_sample != 15 ? par->bits_per_coded_sample : 16;
-    int min_stride = (par->width * bpc + 7) >> 3;
-    int with_pal_size = min_stride * par->height + 1024;
-    int contains_pal = bpc == 8 && pkt->size == with_pal_size;
-    int size = contains_pal ? min_stride * par->height : pkt->size;
-    int stride = size / par->height;
-    int padding = expected_stride - FFMIN(expected_stride, stride);
-    int y;
+    int64_t min_stride = (par->width * bpc + 7) >> 3;
+    int with_pal_size, contains_pal, size, stride, padding, y;
     AVPacket *new_pkt;
+
+    if (par->height <= 0 || min_stride <= 0 || expected_stride <= 0 ||
+        min_stride      > (INT_MAX - 1024) / par->height ||
+        expected_stride > (INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE) / par->height)
+        return AVERROR(EINVAL);
+
+    with_pal_size = min_stride * par->height + 1024;
+    contains_pal  = bpc == 8 && pkt->size == with_pal_size;
+    size          = contains_pal ? min_stride * par->height : pkt->size;
+    stride        = size / par->height;
+    padding       = expected_stride - FFMIN(expected_stride, stride);
 
     if (pkt->size == expected_stride * par->height)
         return 0;
@@ -64,4 +72,28 @@ fail:
     av_packet_free(&new_pkt);
 
     return ret;
+}
+
+int ff_get_packet_palette(AVFormatContext *s, AVPacket *pkt, int ret, uint32_t *palette)
+{
+    uint8_t *side_data;
+    size_t size;
+
+    side_data = av_packet_get_side_data(pkt, AV_PKT_DATA_PALETTE, &size);
+    if (side_data) {
+        if (size != AVPALETTE_SIZE) {
+            av_log(s, AV_LOG_ERROR, "Invalid palette side data\n");
+            return AVERROR_INVALIDDATA;
+        }
+        memcpy(palette, side_data, AVPALETTE_SIZE);
+        return 1;
+    }
+
+    if (ret == CONTAINS_PAL) {
+        for (int i = 0; i < AVPALETTE_COUNT; i++)
+            palette[i] = AV_RL32(pkt->data + pkt->size - AVPALETTE_SIZE + i*4);
+        return 1;
+    }
+
+    return 0;
 }

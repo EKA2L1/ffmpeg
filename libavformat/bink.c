@@ -33,6 +33,7 @@
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 enum BinkAudFlags {
@@ -119,13 +120,13 @@ static int read_header(AVFormatContext *s)
 
     if (vst->duration > 1000000) {
         av_log(s, AV_LOG_ERROR, "invalid header: more than 1000000 frames\n");
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
 
     if (avio_rl32(pb) > bink->file_size) {
         av_log(s, AV_LOG_ERROR,
                "invalid header: largest frame size greater than file size\n");
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
 
     avio_skip(pb, 4);
@@ -139,7 +140,7 @@ static int read_header(AVFormatContext *s)
         av_log(s, AV_LOG_ERROR,
                "invalid header: invalid fps (%"PRIu32"/%"PRIu32")\n",
                fps_num, fps_den);
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
     avpriv_set_pts_info(vst, 64, fps_den, fps_num);
     vst->avg_frame_rate = av_inv_q(vst->time_base);
@@ -161,7 +162,7 @@ static int read_header(AVFormatContext *s)
         av_log(s, AV_LOG_ERROR,
                "invalid header: more than "AV_STRINGIFY(BINK_MAX_AUDIO_TRACKS)" audio tracks (%"PRIu32")\n",
                bink->num_audio_tracks);
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
 
     signature = (vst->codecpar->codec_tag & 0xFFFFFF);
@@ -186,11 +187,9 @@ static int read_header(AVFormatContext *s)
             ast->codecpar->codec_id = flags & BINK_AUD_USEDCT ?
                                    AV_CODEC_ID_BINKAUDIO_DCT : AV_CODEC_ID_BINKAUDIO_RDFT;
             if (flags & BINK_AUD_STEREO) {
-                ast->codecpar->channels       = 2;
-                ast->codecpar->channel_layout = AV_CH_LAYOUT_STEREO;
+                ast->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_STEREO;
             } else {
-                ast->codecpar->channels       = 1;
-                ast->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+                ast->codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
             }
             if ((ret = ff_alloc_extradata(ast->codecpar, 4)) < 0)
                 return ret;
@@ -218,7 +217,7 @@ static int read_header(AVFormatContext *s)
 
         if (next_pos <= pos) {
             av_log(s, AV_LOG_ERROR, "invalid frame index table\n");
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         }
         if ((ret = av_add_index_entry(vst, pos, i, next_pos - pos, 0,
                                       keyframe ? AVINDEX_KEYFRAME : 0)) < 0)
@@ -254,7 +253,7 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
             av_log(s, AV_LOG_ERROR,
                    "could not find index entry for frame %"PRId64"\n",
                    bink->video_pts);
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         }
 
         bink->remain_packet_size = sti->index_entries[index_entry].size;
@@ -268,7 +267,7 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
             av_log(s, AV_LOG_ERROR,
                    "frame %"PRId64": audio size in header (%"PRIu32") > size of packet left (%"PRIu32")\n",
                    bink->video_pts, audio_size, bink->remain_packet_size);
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         }
         bink->remain_packet_size -= 4 + audio_size;
         bink->current_track++;
@@ -283,7 +282,7 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
                (in bytes). We use this value to calculate the audio PTS */
             if (pkt->size >= 4)
                 bink->audio_pts[bink->current_track -1] +=
-                    AV_RL32(pkt->data) / (2 * s->streams[bink->current_track]->codecpar->channels);
+                    AV_RL32(pkt->data) / (2 * s->streams[bink->current_track]->codecpar->ch_layout.nb_channels);
             return 0;
         } else {
             avio_skip(pb, audio_size);
@@ -325,13 +324,13 @@ static int read_seek(AVFormatContext *s, int stream_index, int64_t timestamp, in
     return 0;
 }
 
-const AVInputFormat ff_bink_demuxer = {
-    .name           = "bink",
-    .long_name      = NULL_IF_CONFIG_SMALL("Bink"),
+const FFInputFormat ff_bink_demuxer = {
+    .p.name         = "bink",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Bink"),
+    .p.flags        = AVFMT_SHOW_IDS,
     .priv_data_size = sizeof(BinkDemuxContext),
     .read_probe     = probe,
     .read_header    = read_header,
     .read_packet    = read_packet,
     .read_seek      = read_seek,
-    .flags          = AVFMT_SHOW_IDS,
 };

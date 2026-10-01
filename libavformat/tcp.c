@@ -20,6 +20,7 @@
  */
 #include "avformat.h"
 #include "libavutil/avassert.h"
+#include "libavutil/mem.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
@@ -36,12 +37,15 @@ typedef struct TCPContext {
     const AVClass *class;
     int fd;
     int listen;
+    char *local_port;
+    char *local_addr;
     int open_timeout;
     int rw_timeout;
     int listen_timeout;
     int recv_buffer_size;
     int send_buffer_size;
     int tcp_nodelay;
+    int tcp_keepalive;
 #if !HAVE_WINSOCK2_H
     int tcp_mss;
 #endif /* !HAVE_WINSOCK2_H */
@@ -52,11 +56,14 @@ typedef struct TCPContext {
 #define E AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
     { "listen",          "Listen for incoming connections",  OFFSET(listen),         AV_OPT_TYPE_INT, { .i64 = 0 },     0,       2,       .flags = D|E },
+    { "local_port",      "Local port",                                         OFFSET(local_port),     AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, .flags = D|E },
+    { "local_addr",      "Local address",                                      OFFSET(local_addr),     AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, .flags = D|E },
     { "timeout",     "set timeout (in microseconds) of socket I/O operations", OFFSET(rw_timeout),     AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
     { "listen_timeout",  "Connection awaiting timeout (in milliseconds)",      OFFSET(listen_timeout), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
     { "send_buffer_size", "Socket send buffer size (in bytes)",                OFFSET(send_buffer_size), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
     { "recv_buffer_size", "Socket receive buffer size (in bytes)",             OFFSET(recv_buffer_size), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
     { "tcp_nodelay", "Use TCP_NODELAY to disable nagle's algorithm",           OFFSET(tcp_nodelay), AV_OPT_TYPE_BOOL, { .i64 = 0 },             0, 1, .flags = D|E },
+    { "tcp_keepalive", "Use TCP keepalive to detect dead connections and keep long-lived connections active.",           OFFSET(tcp_keepalive), AV_OPT_TYPE_BOOL, { .i64 = 0 },             0, 1, .flags = D|E },
 #if !HAVE_WINSOCK2_H
     { "tcp_mss",     "Maximum segment size for outgoing TCP packets",          OFFSET(tcp_mss),     AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
 #endif /* !HAVE_WINSOCK2_H */
@@ -70,9 +77,40 @@ static const AVClass tcp_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-static void customize_fd(void *ctx, int fd)
+static int customize_fd(void *ctx, int fd, int family)
 {
     TCPContext *s = ctx;
+
+    if (s->local_addr || s->local_port) {
+        struct addrinfo hints = { 0 }, *ai, *cur_ai;
+        int ret;
+
+        hints.ai_family = family;
+        hints.ai_socktype = SOCK_STREAM;
+
+        ret = getaddrinfo(s->local_addr, s->local_port, &hints, &ai);
+        if (ret) {
+            av_log(ctx, AV_LOG_ERROR,
+               "Failed to getaddrinfo local addr: %s port: %s err: %s\n",
+               s->local_addr, s->local_port, gai_strerror(ret));
+            return ret;
+        }
+
+        cur_ai = ai;
+        while (cur_ai) {
+            ret = bind(fd, (struct sockaddr *)cur_ai->ai_addr, (int)cur_ai->ai_addrlen);
+            if (ret)
+                cur_ai = cur_ai->ai_next;
+            else
+                break;
+        }
+        freeaddrinfo(ai);
+
+        if (ret) {
+            ff_log_net_error(ctx, AV_LOG_ERROR, "bind local failed");
+            return ret;
+        }
+    }
     /* Set the socket's send or receive buffer sizes, if specified.
        If unspecified or setting fails, system default is used. */
     if (s->recv_buffer_size > 0) {
@@ -90,6 +128,12 @@ static void customize_fd(void *ctx, int fd)
             ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(TCP_NODELAY)");
         }
     }
+    if (s->tcp_keepalive > 0) {
+        if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &s->tcp_keepalive, sizeof(s->tcp_keepalive))) {
+            ff_log_net_error(ctx, AV_LOG_WARNING, "setsockopt(SO_KEEPALIVE)");
+        }
+    }
+
 #if !HAVE_WINSOCK2_H
     if (s->tcp_mss > 0) {
         if (setsockopt (fd, IPPROTO_TCP, TCP_MAXSEG, &s->tcp_mss, sizeof (s->tcp_mss))) {
@@ -97,6 +141,8 @@ static void customize_fd(void *ctx, int fd)
         }
     }
 #endif /* !HAVE_WINSOCK2_H */
+
+    return 0;
 }
 
 /* return non zero if error */
@@ -106,7 +152,6 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
     int port, fd = -1;
     TCPContext *s = h->priv_data;
     const char *p;
-    char buf[256];
     int ret;
     char hostname[1024],proto[1024],path[1024];
     char portstr[10];
@@ -122,22 +167,9 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
     }
     p = strchr(uri, '?');
     if (p) {
-        if (av_find_info_tag(buf, sizeof(buf), "listen", p)) {
-            char *endptr = NULL;
-            s->listen = strtol(buf, &endptr, 10);
-            /* assume if no digits were found it is a request to enable it */
-            if (buf == endptr)
-                s->listen = 1;
-        }
-        if (av_find_info_tag(buf, sizeof(buf), "timeout", p)) {
-            s->rw_timeout = strtol(buf, NULL, 10);
-        }
-        if (av_find_info_tag(buf, sizeof(buf), "listen_timeout", p)) {
-            s->listen_timeout = strtol(buf, NULL, 10);
-        }
-        if (av_find_info_tag(buf, sizeof(buf), "tcp_nodelay", p)) {
-            s->tcp_nodelay = strtol(buf, NULL, 10);
-        }
+        ret = ff_parse_opts_from_query_string(s, p, 1);
+        if (ret < 0)
+            return ret;
     }
     if (s->rw_timeout >= 0) {
         s->open_timeout =
@@ -175,7 +207,7 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
         while (cur_ai && fd < 0) {
             fd = ff_socket(cur_ai->ai_family,
                            cur_ai->ai_socktype,
-                           cur_ai->ai_protocol);
+                           cur_ai->ai_protocol, h);
             if (fd < 0) {
                 ret = ff_neterrno();
                 cur_ai = cur_ai->ai_next;
@@ -183,12 +215,12 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
         }
         if (fd < 0)
             goto fail1;
-        customize_fd(s, fd);
+        customize_fd(s, fd, cur_ai->ai_family);
     }
 
     if (s->listen == 2) {
         // multi-client
-        if ((ret = ff_listen(fd, cur_ai->ai_addr, cur_ai->ai_addrlen)) < 0)
+        if ((ret = ff_listen(fd, cur_ai->ai_addr, cur_ai->ai_addrlen, h)) < 0)
             goto fail1;
     } else if (s->listen == 1) {
         // single client

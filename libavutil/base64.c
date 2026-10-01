@@ -24,10 +24,12 @@
  * @author Ryan Martell <rdm4@martellventures.com> (with lots of Michael)
  */
 
-#include "common.h"
+#include <limits.h>
+#include <stddef.h>
+
 #include "base64.h"
+#include "error.h"
 #include "intreadwrite.h"
-#include "timer.h"
 
 /* ---------------- private code */
 static const uint8_t map2[256] =
@@ -125,10 +127,12 @@ validity_check:
     }
 
 out3:
-    *dst++ = v >> 10;
+    if (end - dst)
+        *dst++ = v >> 10;
     v <<= 2;
 out2:
-    *dst++ = v >> 4;
+    if (end - dst)
+        *dst++ = v >> 4;
 out1:
 out0:
     return bits & 1 ? AVERROR_INVALIDDATA : out ? dst - out : 0;

@@ -19,13 +19,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "libavutil/parseutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/xga_font_data.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "formats.h"
-#include "internal.h"
 #include "video.h"
 
 typedef struct ThreadData {
@@ -77,7 +77,7 @@ enum GraticuleType {
 };
 
 typedef struct GraticuleLine {
-    const char *name;
+    char name[6];
     uint16_t pos;
 } GraticuleLine;
 
@@ -114,12 +114,13 @@ typedef struct WaveformContext {
     int            scale;
     uint8_t        grat_yuva_color[4];
     int            shift_w[4], shift_h[4];
-    GraticuleLines *glines;
+    const GraticuleLines *glines;
     int            nb_glines;
     int            rgb;
     float          ftint[2];
     int            tint[2];
     int            fitmode;
+    int            input;
 
     int (*waveform_slice)(AVFilterContext *ctx, void *arg,
                           int jobnr, int nb_jobs);
@@ -135,66 +136,70 @@ typedef struct WaveformContext {
 
 #define OFFSET(x) offsetof(WaveformContext, x)
 #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
+#define TFLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
 
 static const AVOption waveform_options[] = {
-    { "mode", "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS, "mode" },
-    { "m",    "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS, "mode" },
-        { "row",    NULL, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "mode" },
-        { "column", NULL, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "mode" },
-    { "intensity", "set intensity", OFFSET(fintensity), AV_OPT_TYPE_FLOAT, {.dbl=0.04}, 0, 1, FLAGS },
-    { "i",         "set intensity", OFFSET(fintensity), AV_OPT_TYPE_FLOAT, {.dbl=0.04}, 0, 1, FLAGS },
+    { "mode", "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS, .unit = "mode" },
+    { "m",    "set mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS, .unit = "mode" },
+        { "row",    NULL, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, .unit = "mode" },
+        { "column", NULL, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, .unit = "mode" },
+    { "intensity", "set intensity", OFFSET(fintensity), AV_OPT_TYPE_FLOAT, {.dbl=0.04}, 0, 1, TFLAGS },
+    { "i",         "set intensity", OFFSET(fintensity), AV_OPT_TYPE_FLOAT, {.dbl=0.04}, 0, 1, TFLAGS },
     { "mirror", "set mirroring", OFFSET(mirror), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, FLAGS },
     { "r",      "set mirroring", OFFSET(mirror), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, FLAGS },
-    { "display", "set display mode", OFFSET(display), AV_OPT_TYPE_INT, {.i64=STACK}, 0, NB_DISPLAYS-1, FLAGS, "display" },
-    { "d",       "set display mode", OFFSET(display), AV_OPT_TYPE_INT, {.i64=STACK}, 0, NB_DISPLAYS-1, FLAGS, "display" },
-        { "overlay", NULL, 0, AV_OPT_TYPE_CONST, {.i64=OVERLAY}, 0, 0, FLAGS, "display" },
-        { "stack",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=STACK},   0, 0, FLAGS, "display" },
-        { "parade",  NULL, 0, AV_OPT_TYPE_CONST, {.i64=PARADE},  0, 0, FLAGS, "display" },
+    { "display", "set display mode", OFFSET(display), AV_OPT_TYPE_INT, {.i64=STACK}, 0, NB_DISPLAYS-1, FLAGS, .unit = "display" },
+    { "d",       "set display mode", OFFSET(display), AV_OPT_TYPE_INT, {.i64=STACK}, 0, NB_DISPLAYS-1, FLAGS, .unit = "display" },
+        { "overlay", NULL, 0, AV_OPT_TYPE_CONST, {.i64=OVERLAY}, 0, 0, FLAGS, .unit = "display" },
+        { "stack",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=STACK},   0, 0, FLAGS, .unit = "display" },
+        { "parade",  NULL, 0, AV_OPT_TYPE_CONST, {.i64=PARADE},  0, 0, FLAGS, .unit = "display" },
     { "components", "set components to display", OFFSET(pcomp), AV_OPT_TYPE_INT, {.i64=1}, 1, 15, FLAGS },
     { "c",          "set components to display", OFFSET(pcomp), AV_OPT_TYPE_INT, {.i64=1}, 1, 15, FLAGS },
-    { "envelope", "set envelope to display", OFFSET(envelope), AV_OPT_TYPE_INT, {.i64=0}, 0, 3, FLAGS, "envelope" },
-    { "e",        "set envelope to display", OFFSET(envelope), AV_OPT_TYPE_INT, {.i64=0}, 0, 3, FLAGS, "envelope" },
-        { "none",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, "envelope" },
-        { "instant",      NULL, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "envelope" },
-        { "peak",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, "envelope" },
-        { "peak+instant", NULL, 0, AV_OPT_TYPE_CONST, {.i64=3}, 0, 0, FLAGS, "envelope" },
-    { "filter", "set filter", OFFSET(filter), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_FILTERS-1, FLAGS, "filter" },
-    { "f",      "set filter", OFFSET(filter), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_FILTERS-1, FLAGS, "filter" },
-        { "lowpass", NULL, 0, AV_OPT_TYPE_CONST, {.i64=LOWPASS}, 0, 0, FLAGS, "filter" },
-        { "flat"   , NULL, 0, AV_OPT_TYPE_CONST, {.i64=FLAT},    0, 0, FLAGS, "filter" },
-        { "aflat"  , NULL, 0, AV_OPT_TYPE_CONST, {.i64=AFLAT},   0, 0, FLAGS, "filter" },
-        { "chroma",  NULL, 0, AV_OPT_TYPE_CONST, {.i64=CHROMA},  0, 0, FLAGS, "filter" },
-        { "color",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=COLOR},   0, 0, FLAGS, "filter" },
-        { "acolor",  NULL, 0, AV_OPT_TYPE_CONST, {.i64=ACOLOR},  0, 0, FLAGS, "filter" },
-        { "xflat",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=XFLAT},   0, 0, FLAGS, "filter" },
-        { "yflat",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=YFLAT},   0, 0, FLAGS, "filter" },
-    { "graticule", "set graticule", OFFSET(graticule), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_GRATICULES-1, FLAGS, "graticule" },
-    { "g",         "set graticule", OFFSET(graticule), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_GRATICULES-1, FLAGS, "graticule" },
-        { "none",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_NONE},   0, 0, FLAGS, "graticule" },
-        { "green",  NULL, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_GREEN},  0, 0, FLAGS, "graticule" },
-        { "orange", NULL, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_ORANGE}, 0, 0, FLAGS, "graticule" },
-        { "invert", NULL, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_INVERT}, 0, 0, FLAGS, "graticule" },
-    { "opacity", "set graticule opacity", OFFSET(opacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, FLAGS },
-    { "o",       "set graticule opacity", OFFSET(opacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, FLAGS },
-    { "flags", "set graticule flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64=1}, 0, 3, FLAGS, "flags" },
-    { "fl",    "set graticule flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64=1}, 0, 3, FLAGS, "flags" },
-        { "numbers",  "draw numbers", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, FLAGS, "flags" },
-        { "dots",     "draw dots instead of lines", 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, FLAGS, "flags" },
-    { "scale", "set scale", OFFSET(scale), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_SCALES-1, FLAGS, "scale" },
-    { "s",     "set scale", OFFSET(scale), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_SCALES-1, FLAGS, "scale" },
-        { "digital",    NULL, 0, AV_OPT_TYPE_CONST, {.i64=DIGITAL},    0, 0, FLAGS, "scale" },
-        { "millivolts", NULL, 0, AV_OPT_TYPE_CONST, {.i64=MILLIVOLTS}, 0, 0, FLAGS, "scale" },
-        { "ire",        NULL, 0, AV_OPT_TYPE_CONST, {.i64=IRE},        0, 0, FLAGS, "scale" },
-    { "bgopacity", "set background opacity", OFFSET(bgopacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, FLAGS },
-    { "b",         "set background opacity", OFFSET(bgopacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, FLAGS },
-    { "tint0", "set 1st tint", OFFSET(ftint[0]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, FLAGS},
-    { "t0",    "set 1st tint", OFFSET(ftint[0]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, FLAGS},
-    { "tint1", "set 2nd tint", OFFSET(ftint[1]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, FLAGS},
-    { "t1",    "set 2nd tint", OFFSET(ftint[1]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, FLAGS},
-    { "fitmode", "set fit mode", OFFSET(fitmode), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_FITMODES-1, FLAGS, "fitmode" },
-    { "fm", "set fit mode", OFFSET(fitmode), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_FITMODES-1, FLAGS, "fitmode" },
-        { "none", NULL, 0, AV_OPT_TYPE_CONST, {.i64=FM_NONE}, 0, 0, FLAGS, "fitmode" },
-        { "size", NULL, 0, AV_OPT_TYPE_CONST, {.i64=FM_SIZE}, 0, 0, FLAGS, "fitmode" },
+    { "envelope", "set envelope to display", OFFSET(envelope), AV_OPT_TYPE_INT, {.i64=0}, 0, 3, TFLAGS, .unit = "envelope" },
+    { "e",        "set envelope to display", OFFSET(envelope), AV_OPT_TYPE_INT, {.i64=0}, 0, 3, TFLAGS, .unit = "envelope" },
+        { "none",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, TFLAGS, .unit = "envelope" },
+        { "instant",      NULL, 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, TFLAGS, .unit = "envelope" },
+        { "peak",         NULL, 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, TFLAGS, .unit = "envelope" },
+        { "peak+instant", NULL, 0, AV_OPT_TYPE_CONST, {.i64=3}, 0, 0, TFLAGS, .unit = "envelope" },
+    { "filter", "set filter", OFFSET(filter), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_FILTERS-1, FLAGS, .unit = "filter" },
+    { "f",      "set filter", OFFSET(filter), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_FILTERS-1, FLAGS, .unit = "filter" },
+        { "lowpass", NULL, 0, AV_OPT_TYPE_CONST, {.i64=LOWPASS}, 0, 0, FLAGS, .unit = "filter" },
+        { "flat"   , NULL, 0, AV_OPT_TYPE_CONST, {.i64=FLAT},    0, 0, FLAGS, .unit = "filter" },
+        { "aflat"  , NULL, 0, AV_OPT_TYPE_CONST, {.i64=AFLAT},   0, 0, FLAGS, .unit = "filter" },
+        { "chroma",  NULL, 0, AV_OPT_TYPE_CONST, {.i64=CHROMA},  0, 0, FLAGS, .unit = "filter" },
+        { "color",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=COLOR},   0, 0, FLAGS, .unit = "filter" },
+        { "acolor",  NULL, 0, AV_OPT_TYPE_CONST, {.i64=ACOLOR},  0, 0, FLAGS, .unit = "filter" },
+        { "xflat",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=XFLAT},   0, 0, FLAGS, .unit = "filter" },
+        { "yflat",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=YFLAT},   0, 0, FLAGS, .unit = "filter" },
+    { "graticule", "set graticule", OFFSET(graticule), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_GRATICULES-1, FLAGS, .unit = "graticule" },
+    { "g",         "set graticule", OFFSET(graticule), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_GRATICULES-1, FLAGS, .unit = "graticule" },
+        { "none",   NULL, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_NONE},   0, 0, FLAGS, .unit = "graticule" },
+        { "green",  NULL, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_GREEN},  0, 0, FLAGS, .unit = "graticule" },
+        { "orange", NULL, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_ORANGE}, 0, 0, FLAGS, .unit = "graticule" },
+        { "invert", NULL, 0, AV_OPT_TYPE_CONST, {.i64=GRAT_INVERT}, 0, 0, FLAGS, .unit = "graticule" },
+    { "opacity", "set graticule opacity", OFFSET(opacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, TFLAGS },
+    { "o",       "set graticule opacity", OFFSET(opacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, TFLAGS },
+    { "flags", "set graticule flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64=1}, 0, 3, TFLAGS, .unit = "flags" },
+    { "fl",    "set graticule flags", OFFSET(flags), AV_OPT_TYPE_FLAGS, {.i64=1}, 0, 3, TFLAGS, .unit = "flags" },
+        { "numbers",  "draw numbers", 0, AV_OPT_TYPE_CONST, {.i64=1}, 0, 0, TFLAGS, .unit = "flags" },
+        { "dots",     "draw dots instead of lines", 0, AV_OPT_TYPE_CONST, {.i64=2}, 0, 0, TFLAGS, .unit = "flags" },
+    { "scale", "set scale", OFFSET(scale), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_SCALES-1, FLAGS, .unit = "scale" },
+    { "s",     "set scale", OFFSET(scale), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_SCALES-1, FLAGS, .unit = "scale" },
+        { "digital",    NULL, 0, AV_OPT_TYPE_CONST, {.i64=DIGITAL},    0, 0, FLAGS, .unit = "scale" },
+        { "millivolts", NULL, 0, AV_OPT_TYPE_CONST, {.i64=MILLIVOLTS}, 0, 0, FLAGS, .unit = "scale" },
+        { "ire",        NULL, 0, AV_OPT_TYPE_CONST, {.i64=IRE},        0, 0, FLAGS, .unit = "scale" },
+    { "bgopacity", "set background opacity", OFFSET(bgopacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, TFLAGS },
+    { "b",         "set background opacity", OFFSET(bgopacity), AV_OPT_TYPE_FLOAT, {.dbl=0.75}, 0, 1, TFLAGS },
+    { "tint0", "set 1st tint", OFFSET(ftint[0]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, TFLAGS},
+    { "t0",    "set 1st tint", OFFSET(ftint[0]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, TFLAGS},
+    { "tint1", "set 2nd tint", OFFSET(ftint[1]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, TFLAGS},
+    { "t1",    "set 2nd tint", OFFSET(ftint[1]), AV_OPT_TYPE_FLOAT, {.dbl=0}, -1, 1, TFLAGS},
+    { "fitmode", "set fit mode", OFFSET(fitmode), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_FITMODES-1, FLAGS, .unit = "fitmode" },
+    { "fm", "set fit mode", OFFSET(fitmode), AV_OPT_TYPE_INT, {.i64=0}, 0, NB_FITMODES-1, FLAGS, .unit = "fitmode" },
+        { "none", NULL, 0, AV_OPT_TYPE_CONST, {.i64=FM_NONE}, 0, 0, FLAGS, .unit = "fitmode" },
+        { "size", NULL, 0, AV_OPT_TYPE_CONST, {.i64=FM_SIZE}, 0, 0, FLAGS, .unit = "fitmode" },
+    { "input", "set input formats selection", OFFSET(input), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS, .unit = "input" },
+        { "all", "try to select from all available formats", 0, AV_OPT_TYPE_CONST, {.i64=0}, 0, 0, FLAGS, .unit = "input" },
+        { "first", "pick first available format", 0, AV_OPT_TYPE_CONST, {.i64=1},  0, 0, FLAGS, .unit = "input" },
     { NULL }
 };
 
@@ -340,7 +345,7 @@ static int query_formats(AVFilterContext *ctx)
     }
 
     if (!ctx->inputs[0]->outcfg.formats) {
-        if ((ret = ff_formats_ref(ff_make_format_list(in_pix_fmts), &ctx->inputs[0]->outcfg.formats)) < 0)
+        if ((ret = ff_formats_ref(ff_make_pixel_format_list(in_pix_fmts), &ctx->inputs[0]->outcfg.formats)) < 0)
             return ret;
     }
 
@@ -355,7 +360,7 @@ static int query_formats(AVFilterContext *ctx)
     depth2 = desc2->comp[0].depth;
     if (ncomp != ncomp2 || depth != depth2)
         return AVERROR(EAGAIN);
-    for (i = 1; i < avff->nb_formats; i++) {
+    for (i = 1; i < avff->nb_formats && !s->input; i++) {
         desc = av_pix_fmt_desc_get(avff->formats[i]);
         if (rgb != (desc->flags & AV_PIX_FMT_FLAG_RGB) ||
             depth != desc->comp[0].depth)
@@ -388,7 +393,7 @@ static int query_formats(AVFilterContext *ctx)
         out_pix_fmts = out_yuv12_lowpass_pix_fmts;
     else
         return AVERROR(EAGAIN);
-    if ((ret = ff_formats_ref(ff_make_format_list(out_pix_fmts), &ctx->outputs[0]->incfg.formats)) < 0)
+    if ((ret = ff_formats_ref(ff_make_pixel_format_list(out_pix_fmts), &ctx->outputs[0]->incfg.formats)) < 0)
         return ret;
 
     return 0;
@@ -700,10 +705,10 @@ static av_always_inline void lowpass16(WaveformContext *s,
     const int max = limit - intensity;
     const int src_h = AV_CEIL_RSHIFT(in->height, shift_h);
     const int src_w = AV_CEIL_RSHIFT(in->width, shift_w);
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     const int step = column ? 1 << shift_w : 1 << shift_h;
     const uint16_t *src_data = (const uint16_t *)in->data[plane] + sliceh_start * src_linesize;
     uint16_t *dst_data = (uint16_t *)out->data[dplane] + (offset_y + sliceh_start * step) * dst_linesize + offset_x;
@@ -744,7 +749,7 @@ static av_always_inline void lowpass16(WaveformContext *s,
         dst_data += dst_linesize * step;
     }
 
-    if (s->display != OVERLAY && column && !s->rgb) {
+    if (s->display != OVERLAY && column && !s->rgb && out->data[1] && out->data[2]) {
         const int mult = s->max / 256;
         const int bg = s->bg_color[0] * mult;
         const int t0 = s->tint[0];
@@ -768,7 +773,7 @@ static av_always_inline void lowpass16(WaveformContext *s,
             dst0 += dst_linesize;
             dst1 += dst_linesize;
         }
-    } else if (s->display != OVERLAY && !s->rgb) {
+    } else if (s->display != OVERLAY && !s->rgb && out->data[1] && out->data[2]) {
         const int mult = s->max / 256;
         const int bg = s->bg_color[0] * mult;
         const int t0 = s->tint[0];
@@ -837,10 +842,10 @@ static av_always_inline void lowpass(WaveformContext *s,
     const int max = 255 - intensity;
     const int src_h = AV_CEIL_RSHIFT(in->height, shift_h);
     const int src_w = AV_CEIL_RSHIFT(in->width, shift_w);
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     const int step = column ? 1 << shift_w : 1 << shift_h;
     const uint8_t *src_data = in->data[plane] + sliceh_start * src_linesize;
     uint8_t *dst_data = out->data[dplane] + (offset_y + sliceh_start * step) * dst_linesize + offset_x;
@@ -881,7 +886,7 @@ static av_always_inline void lowpass(WaveformContext *s,
         dst_data += dst_linesize * step;
     }
 
-    if (s->display != OVERLAY && column && !s->rgb) {
+    if (s->display != OVERLAY && column && !s->rgb && out->data[1] && out->data[2]) {
         const int bg = s->bg_color[0];
         const int dst_h = 256;
         const int t0 = s->tint[0];
@@ -905,7 +910,7 @@ static av_always_inline void lowpass(WaveformContext *s,
             dst0 += dst_linesize;
             dst1 += dst_linesize;
         }
-    } else if (s->display != OVERLAY && !s->rgb) {
+    } else if (s->display != OVERLAY && !s->rgb && out->data[1] && out->data[2]) {
         const int bg = s->bg_color[0];
         const int dst_w = 256;
         const int t0 = s->tint[0];
@@ -981,10 +986,10 @@ static av_always_inline void flat16(WaveformContext *s,
     const int mid = s->max / 2;
     const int src_h = in->height;
     const int src_w = in->width;
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     int x, y;
 
     if (column) {
@@ -1118,10 +1123,10 @@ static av_always_inline void flat(WaveformContext *s,
     const int max = 255 - intensity;
     const int src_h = in->height;
     const int src_w = in->width;
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     int x, y;
 
     if (column) {
@@ -1264,10 +1269,10 @@ static int name(AVFilterContext *ctx,                                           
     const int mid = s->max / 2;                                                                                    \
     const int src_h = in->height;                                                                                  \
     const int src_w = in->width;                                                                                   \
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;                                              \
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;                                        \
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;                                               \
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;                                         \
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;                                    \
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;                              \
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;                                     \
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;                               \
     int x, y;                                                                                                      \
                                                                                                                    \
     if (column) {                                                                                                  \
@@ -1381,10 +1386,10 @@ static int name(AVFilterContext *ctx,                                           
     int offset_x = td->offset_x;                                                                      \
     const int src_h = in->height;                                                                     \
     const int src_w = in->width;                                                                      \
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;                                 \
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;                           \
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;                                  \
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;                            \
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;                       \
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;                 \
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;                        \
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;                  \
     const int intensity = s->intensity;                                                               \
     const int plane = s->desc->comp[component].plane;                                                 \
     const int c0_linesize = in->linesize[ plane + 0 ];                                                \
@@ -1545,10 +1550,10 @@ static av_always_inline void chroma16(WaveformContext *s,
     const int c1_shift_h = s->shift_h[(component + 2) % s->ncomp];
     const int src_h = in->height;
     const int src_w = in->width;
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     int x, y;
 
     if (column) {
@@ -1641,10 +1646,10 @@ static av_always_inline void chroma(WaveformContext *s,
     const int plane = s->desc->comp[component].plane;
     const int src_h = in->height;
     const int src_w = in->width;
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     const int c0_linesize = in->linesize[(plane + 1) % s->ncomp];
     const int c1_linesize = in->linesize[(plane + 2) % s->ncomp];
     const int dst_linesize = out->linesize[plane];
@@ -1746,10 +1751,10 @@ static av_always_inline void color16(WaveformContext *s,
     const int limit = s->max - 1;
     const int src_h = in->height;
     const int src_w = in->width;
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     const int c0_linesize = in->linesize[ plane + 0 ] / 2;
     const int c1_linesize = in->linesize[(plane + 1) % s->ncomp] / 2;
     const int c2_linesize = in->linesize[(plane + 2) % s->ncomp] / 2;
@@ -1878,10 +1883,10 @@ static av_always_inline void color(WaveformContext *s,
     const int plane = s->desc->comp[component].plane;
     const int src_h = in->height;
     const int src_w = in->width;
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     const int c0_linesize = in->linesize[ plane + 0 ];
     const int c1_linesize = in->linesize[(plane + 1) % s->ncomp];
     const int c2_linesize = in->linesize[(plane + 2) % s->ncomp];
@@ -2012,10 +2017,10 @@ static av_always_inline void acolor16(WaveformContext *s,
     const int max = limit - intensity;
     const int src_h = in->height;
     const int src_w = in->width;
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     const int c0_shift_h = s->shift_h[ component + 0 ];
     const int c1_shift_h = s->shift_h[(component + 1) % s->ncomp];
     const int c2_shift_h = s->shift_h[(component + 2) % s->ncomp];
@@ -2144,10 +2149,10 @@ static av_always_inline void acolor(WaveformContext *s,
     const int plane = s->desc->comp[component].plane;
     const int src_h = in->height;
     const int src_w = in->width;
-    const int sliceh_start = !column ? (src_h * jobnr) / nb_jobs : 0;
-    const int sliceh_end = !column ? (src_h * (jobnr+1)) / nb_jobs : src_h;
-    const int slicew_start = column ? (src_w * jobnr) / nb_jobs : 0;
-    const int slicew_end = column ? (src_w * (jobnr+1)) / nb_jobs : src_w;
+    const int sliceh_start = !column ? ff_slice_pos(src_h, jobnr, nb_jobs) : 0;
+    const int sliceh_end = !column ? ff_slice_pos(src_h, jobnr + 1, nb_jobs) : src_h;
+    const int slicew_start = column ? ff_slice_pos(src_w, jobnr, nb_jobs) : 0;
+    const int slicew_end = column ? ff_slice_pos(src_w, jobnr + 1, nb_jobs) : src_w;
     const int c0_shift_w = s->shift_w[ component + 0 ];
     const int c1_shift_w = s->shift_w[(component + 1) % s->ncomp];
     const int c2_shift_w = s->shift_w[(component + 2) % s->ncomp];
@@ -2630,7 +2635,7 @@ static void draw_htext(AVFrame *out, int x, int y, int mult, float o1, float o2,
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -2656,7 +2661,7 @@ static void draw_htext16(AVFrame *out, int x, int y, int mult, float o1, float o
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -2682,7 +2687,7 @@ static void draw_vtext(AVFrame *out, int x, int y, int mult, float o1, float o2,
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -2707,7 +2712,7 @@ static void draw_vtext16(AVFrame *out, int x, int y, int mult, float o1, float o
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -2774,7 +2779,7 @@ static void idraw_htext(AVFrame *out, int x, int y, int mult, float o1, float o2
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -2800,7 +2805,7 @@ static void idraw_htext16(AVFrame *out, int x, int y, int mult, float o1, float 
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -2826,7 +2831,7 @@ static void idraw_vtext(AVFrame *out, int x, int y, int mult, float o1, float o2
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -2851,7 +2856,7 @@ static void idraw_vtext16(AVFrame *out, int x, int y, int mult, float o1, float 
     int font_height;
     int i, plane;
 
-    font = avpriv_cga_font,   font_height =  8;
+    font = avpriv_cga_font_get(),   font_height =  8;
 
     for (plane = 0; plane < 4 && out->data[plane]; plane++) {
         for (i = 0; txt[i]; i++) {
@@ -3049,7 +3054,6 @@ static int config_input(AVFilterLink *inlink)
     s->ncomp = s->desc->nb_components;
     s->bits = s->desc->comp[0].depth;
     s->max = 1 << s->bits;
-    s->intensity = s->fintensity * (s->max - 1);
 
     s->shift_w[0] = s->shift_w[3] = 0;
     s->shift_h[0] = s->shift_h[3] = 0;
@@ -3176,26 +3180,26 @@ static int config_input(AVFilterLink *inlink)
         switch (s->scale) {
         case DIGITAL:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)digital8;  s->nb_glines = FF_ARRAY_ELEMS(digital8);  break;
-            case  9: s->glines = (GraticuleLines *)digital9;  s->nb_glines = FF_ARRAY_ELEMS(digital9);  break;
-            case 10: s->glines = (GraticuleLines *)digital10; s->nb_glines = FF_ARRAY_ELEMS(digital10); break;
-            case 12: s->glines = (GraticuleLines *)digital12; s->nb_glines = FF_ARRAY_ELEMS(digital12); break;
+            case  8: s->glines = digital8;  s->nb_glines = FF_ARRAY_ELEMS(digital8);  break;
+            case  9: s->glines = digital9;  s->nb_glines = FF_ARRAY_ELEMS(digital9);  break;
+            case 10: s->glines = digital10; s->nb_glines = FF_ARRAY_ELEMS(digital10); break;
+            case 12: s->glines = digital12; s->nb_glines = FF_ARRAY_ELEMS(digital12); break;
             }
             break;
         case MILLIVOLTS:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)millivolts8;  s->nb_glines = FF_ARRAY_ELEMS(millivolts8);  break;
-            case  9: s->glines = (GraticuleLines *)millivolts9;  s->nb_glines = FF_ARRAY_ELEMS(millivolts9);  break;
-            case 10: s->glines = (GraticuleLines *)millivolts10; s->nb_glines = FF_ARRAY_ELEMS(millivolts10); break;
-            case 12: s->glines = (GraticuleLines *)millivolts12; s->nb_glines = FF_ARRAY_ELEMS(millivolts12); break;
+            case  8: s->glines = millivolts8;  s->nb_glines = FF_ARRAY_ELEMS(millivolts8);  break;
+            case  9: s->glines = millivolts9;  s->nb_glines = FF_ARRAY_ELEMS(millivolts9);  break;
+            case 10: s->glines = millivolts10; s->nb_glines = FF_ARRAY_ELEMS(millivolts10); break;
+            case 12: s->glines = millivolts12; s->nb_glines = FF_ARRAY_ELEMS(millivolts12); break;
             }
             break;
         case IRE:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)ire8;  s->nb_glines = FF_ARRAY_ELEMS(ire8);  break;
-            case  9: s->glines = (GraticuleLines *)ire9;  s->nb_glines = FF_ARRAY_ELEMS(ire9);  break;
-            case 10: s->glines = (GraticuleLines *)ire10; s->nb_glines = FF_ARRAY_ELEMS(ire10); break;
-            case 12: s->glines = (GraticuleLines *)ire12; s->nb_glines = FF_ARRAY_ELEMS(ire12); break;
+            case  8: s->glines = ire8;  s->nb_glines = FF_ARRAY_ELEMS(ire8);  break;
+            case  9: s->glines = ire9;  s->nb_glines = FF_ARRAY_ELEMS(ire9);  break;
+            case 10: s->glines = ire10; s->nb_glines = FF_ARRAY_ELEMS(ire10); break;
+            case 12: s->glines = ire12; s->nb_glines = FF_ARRAY_ELEMS(ire12); break;
             }
             break;
         }
@@ -3204,26 +3208,26 @@ static int config_input(AVFilterLink *inlink)
         switch (s->scale) {
         case DIGITAL:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)chroma_digital8;  s->nb_glines = FF_ARRAY_ELEMS(chroma_digital8);  break;
-            case  9: s->glines = (GraticuleLines *)chroma_digital9;  s->nb_glines = FF_ARRAY_ELEMS(chroma_digital9);  break;
-            case 10: s->glines = (GraticuleLines *)chroma_digital10; s->nb_glines = FF_ARRAY_ELEMS(chroma_digital10); break;
-            case 12: s->glines = (GraticuleLines *)chroma_digital12; s->nb_glines = FF_ARRAY_ELEMS(chroma_digital12); break;
+            case  8: s->glines = chroma_digital8;  s->nb_glines = FF_ARRAY_ELEMS(chroma_digital8);  break;
+            case  9: s->glines = chroma_digital9;  s->nb_glines = FF_ARRAY_ELEMS(chroma_digital9);  break;
+            case 10: s->glines = chroma_digital10; s->nb_glines = FF_ARRAY_ELEMS(chroma_digital10); break;
+            case 12: s->glines = chroma_digital12; s->nb_glines = FF_ARRAY_ELEMS(chroma_digital12); break;
             }
             break;
         case MILLIVOLTS:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)millivolts8;  s->nb_glines = FF_ARRAY_ELEMS(millivolts8);  break;
-            case  9: s->glines = (GraticuleLines *)millivolts9;  s->nb_glines = FF_ARRAY_ELEMS(millivolts9);  break;
-            case 10: s->glines = (GraticuleLines *)millivolts10; s->nb_glines = FF_ARRAY_ELEMS(millivolts10); break;
-            case 12: s->glines = (GraticuleLines *)millivolts12; s->nb_glines = FF_ARRAY_ELEMS(millivolts12); break;
+            case  8: s->glines = millivolts8;  s->nb_glines = FF_ARRAY_ELEMS(millivolts8);  break;
+            case  9: s->glines = millivolts9;  s->nb_glines = FF_ARRAY_ELEMS(millivolts9);  break;
+            case 10: s->glines = millivolts10; s->nb_glines = FF_ARRAY_ELEMS(millivolts10); break;
+            case 12: s->glines = millivolts12; s->nb_glines = FF_ARRAY_ELEMS(millivolts12); break;
             }
             break;
         case IRE:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)ire8;  s->nb_glines = FF_ARRAY_ELEMS(ire8);  break;
-            case  9: s->glines = (GraticuleLines *)ire9;  s->nb_glines = FF_ARRAY_ELEMS(ire9);  break;
-            case 10: s->glines = (GraticuleLines *)ire10; s->nb_glines = FF_ARRAY_ELEMS(ire10); break;
-            case 12: s->glines = (GraticuleLines *)ire12; s->nb_glines = FF_ARRAY_ELEMS(ire12); break;
+            case  8: s->glines = ire8;  s->nb_glines = FF_ARRAY_ELEMS(ire8);  break;
+            case  9: s->glines = ire9;  s->nb_glines = FF_ARRAY_ELEMS(ire9);  break;
+            case 10: s->glines = ire10; s->nb_glines = FF_ARRAY_ELEMS(ire10); break;
+            case 12: s->glines = ire12; s->nb_glines = FF_ARRAY_ELEMS(ire12); break;
             }
             break;
         }
@@ -3234,26 +3238,26 @@ static int config_input(AVFilterLink *inlink)
         switch (s->scale) {
         case DIGITAL:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)aflat_digital8;  s->nb_glines = FF_ARRAY_ELEMS(aflat_digital8);  break;
-            case  9: s->glines = (GraticuleLines *)aflat_digital9;  s->nb_glines = FF_ARRAY_ELEMS(aflat_digital9);  break;
-            case 10: s->glines = (GraticuleLines *)aflat_digital10; s->nb_glines = FF_ARRAY_ELEMS(aflat_digital10); break;
-            case 12: s->glines = (GraticuleLines *)aflat_digital12; s->nb_glines = FF_ARRAY_ELEMS(aflat_digital12); break;
+            case  8: s->glines = aflat_digital8;  s->nb_glines = FF_ARRAY_ELEMS(aflat_digital8);  break;
+            case  9: s->glines = aflat_digital9;  s->nb_glines = FF_ARRAY_ELEMS(aflat_digital9);  break;
+            case 10: s->glines = aflat_digital10; s->nb_glines = FF_ARRAY_ELEMS(aflat_digital10); break;
+            case 12: s->glines = aflat_digital12; s->nb_glines = FF_ARRAY_ELEMS(aflat_digital12); break;
             }
             break;
         case MILLIVOLTS:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)aflat_millivolts8;  s->nb_glines = FF_ARRAY_ELEMS(aflat_millivolts8);  break;
-            case  9: s->glines = (GraticuleLines *)aflat_millivolts9;  s->nb_glines = FF_ARRAY_ELEMS(aflat_millivolts9);  break;
-            case 10: s->glines = (GraticuleLines *)aflat_millivolts10; s->nb_glines = FF_ARRAY_ELEMS(aflat_millivolts10); break;
-            case 12: s->glines = (GraticuleLines *)aflat_millivolts12; s->nb_glines = FF_ARRAY_ELEMS(aflat_millivolts12); break;
+            case  8: s->glines = aflat_millivolts8;  s->nb_glines = FF_ARRAY_ELEMS(aflat_millivolts8);  break;
+            case  9: s->glines = aflat_millivolts9;  s->nb_glines = FF_ARRAY_ELEMS(aflat_millivolts9);  break;
+            case 10: s->glines = aflat_millivolts10; s->nb_glines = FF_ARRAY_ELEMS(aflat_millivolts10); break;
+            case 12: s->glines = aflat_millivolts12; s->nb_glines = FF_ARRAY_ELEMS(aflat_millivolts12); break;
             }
             break;
         case IRE:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)aflat_ire8;  s->nb_glines = FF_ARRAY_ELEMS(aflat_ire8);  break;
-            case  9: s->glines = (GraticuleLines *)aflat_ire9;  s->nb_glines = FF_ARRAY_ELEMS(aflat_ire9);  break;
-            case 10: s->glines = (GraticuleLines *)aflat_ire10; s->nb_glines = FF_ARRAY_ELEMS(aflat_ire10); break;
-            case 12: s->glines = (GraticuleLines *)aflat_ire12; s->nb_glines = FF_ARRAY_ELEMS(aflat_ire12); break;
+            case  8: s->glines = aflat_ire8;  s->nb_glines = FF_ARRAY_ELEMS(aflat_ire8);  break;
+            case  9: s->glines = aflat_ire9;  s->nb_glines = FF_ARRAY_ELEMS(aflat_ire9);  break;
+            case 10: s->glines = aflat_ire10; s->nb_glines = FF_ARRAY_ELEMS(aflat_ire10); break;
+            case 12: s->glines = aflat_ire12; s->nb_glines = FF_ARRAY_ELEMS(aflat_ire12); break;
             }
             break;
         }
@@ -3262,26 +3266,26 @@ static int config_input(AVFilterLink *inlink)
         switch (s->scale) {
         case DIGITAL:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)flat_digital8;  s->nb_glines = FF_ARRAY_ELEMS(flat_digital8);  break;
-            case  9: s->glines = (GraticuleLines *)flat_digital9;  s->nb_glines = FF_ARRAY_ELEMS(flat_digital9);  break;
-            case 10: s->glines = (GraticuleLines *)flat_digital10; s->nb_glines = FF_ARRAY_ELEMS(flat_digital10); break;
-            case 12: s->glines = (GraticuleLines *)flat_digital12; s->nb_glines = FF_ARRAY_ELEMS(flat_digital12); break;
+            case  8: s->glines = flat_digital8;  s->nb_glines = FF_ARRAY_ELEMS(flat_digital8);  break;
+            case  9: s->glines = flat_digital9;  s->nb_glines = FF_ARRAY_ELEMS(flat_digital9);  break;
+            case 10: s->glines = flat_digital10; s->nb_glines = FF_ARRAY_ELEMS(flat_digital10); break;
+            case 12: s->glines = flat_digital12; s->nb_glines = FF_ARRAY_ELEMS(flat_digital12); break;
             }
             break;
         case MILLIVOLTS:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)flat_millivolts8;  s->nb_glines = FF_ARRAY_ELEMS(flat_millivolts8);  break;
-            case  9: s->glines = (GraticuleLines *)flat_millivolts9;  s->nb_glines = FF_ARRAY_ELEMS(flat_millivolts9);  break;
-            case 10: s->glines = (GraticuleLines *)flat_millivolts10; s->nb_glines = FF_ARRAY_ELEMS(flat_millivolts10); break;
-            case 12: s->glines = (GraticuleLines *)flat_millivolts12; s->nb_glines = FF_ARRAY_ELEMS(flat_millivolts12); break;
+            case  8: s->glines = flat_millivolts8;  s->nb_glines = FF_ARRAY_ELEMS(flat_millivolts8);  break;
+            case  9: s->glines = flat_millivolts9;  s->nb_glines = FF_ARRAY_ELEMS(flat_millivolts9);  break;
+            case 10: s->glines = flat_millivolts10; s->nb_glines = FF_ARRAY_ELEMS(flat_millivolts10); break;
+            case 12: s->glines = flat_millivolts12; s->nb_glines = FF_ARRAY_ELEMS(flat_millivolts12); break;
             }
             break;
         case IRE:
             switch (s->bits) {
-            case  8: s->glines = (GraticuleLines *)flat_ire8;  s->nb_glines = FF_ARRAY_ELEMS(flat_ire8);  break;
-            case  9: s->glines = (GraticuleLines *)flat_ire9;  s->nb_glines = FF_ARRAY_ELEMS(flat_ire9);  break;
-            case 10: s->glines = (GraticuleLines *)flat_ire10; s->nb_glines = FF_ARRAY_ELEMS(flat_ire10); break;
-            case 12: s->glines = (GraticuleLines *)flat_ire12; s->nb_glines = FF_ARRAY_ELEMS(flat_ire12); break;
+            case  8: s->glines = flat_ire8;  s->nb_glines = FF_ARRAY_ELEMS(flat_ire8);  break;
+            case  9: s->glines = flat_ire9;  s->nb_glines = FF_ARRAY_ELEMS(flat_ire9);  break;
+            case 10: s->glines = flat_ire10; s->nb_glines = FF_ARRAY_ELEMS(flat_ire10); break;
+            case 12: s->glines = flat_ire12; s->nb_glines = FF_ARRAY_ELEMS(flat_ire12); break;
             }
             break;
         }
@@ -3289,9 +3293,6 @@ static int config_input(AVFilterLink *inlink)
     }
 
     s->size = s->size << (s->bits - 8);
-
-    s->tint[0] = .5f * (s->ftint[0] + 1.f) * (s->size - 1);
-    s->tint[1] = .5f * (s->ftint[1] + 1.f) * (s->size - 1);
 
     switch (inlink->format) {
     case AV_PIX_FMT_GBRAP:
@@ -3305,8 +3306,6 @@ static int config_input(AVFilterLink *inlink)
     default:
         memcpy(s->bg_color, black_yuva_color, sizeof(s->bg_color));
     }
-
-    s->bg_color[3] *= s->bgopacity;
 
     return 0;
 }
@@ -3394,13 +3393,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *out;
     int i, j, k;
 
+    s->intensity = s->fintensity * (s->max - 1);
+    s->bg_color[3] = s->bgopacity * (s->max - 1);
+    s->tint[0] = .5f * (s->ftint[0] + 1.f) * (s->size - 1);
+    s->tint[1] = .5f * (s->ftint[1] + 1.f) * (s->size - 1);
+
     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
     if (!out) {
         av_frame_free(&in);
         return AVERROR(ENOMEM);
     }
-    out->pts = in->pts;
-    out->color_range = AVCOL_RANGE_JPEG;
 
     for (k = 0; k < s->dcomp; k++) {
         if (s->bits <= 8) {
@@ -3484,6 +3486,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
     s->graticulef(s, out);
 
+    av_frame_copy_props(out, in);
+    out->color_range = AVCOL_RANGE_JPEG;
     av_frame_free(&in);
     out->sample_aspect_ratio = outlink->sample_aspect_ratio;
     return ff_filter_frame(outlink, out);
@@ -3513,14 +3517,15 @@ static const AVFilterPad outputs[] = {
     },
 };
 
-const AVFilter ff_vf_waveform = {
-    .name          = "waveform",
-    .description   = NULL_IF_CONFIG_SMALL("Video waveform monitor."),
+const FFFilter ff_vf_waveform = {
+    .p.name        = "waveform",
+    .p.description = NULL_IF_CONFIG_SMALL("Video waveform monitor."),
+    .p.priv_class  = &waveform_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(WaveformContext),
-    .priv_class    = &waveform_class,
     .uninit        = uninit,
     FILTER_INPUTS(inputs),
     FILTER_OUTPUTS(outputs),
     FILTER_QUERY_FUNC(query_formats),
-    .flags         = AVFILTER_FLAG_SLICE_THREADS,
+    .process_command = ff_filter_process_command,
 };

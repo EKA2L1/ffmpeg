@@ -100,7 +100,7 @@ static void check(Input input, int valid)
         av_assert0(!strcmp(format->iformat->name, "epoc"));
         av_assert0(stream->duration == 4 && stream->time_base.num == 1 && stream->time_base.den == 8000);
         av_assert0(stream->codecpar->codec_id == AV_CODEC_ID_PCM_ALAW);
-        av_assert0(stream->codecpar->channels == 1 && stream->codecpar->sample_rate == 8000);
+        av_assert0(stream->codecpar->ch_layout.nb_channels == 1 && stream->codecpar->sample_rate == 8000);
         av_assert0(av_read_frame(format, packet) == 0);
         av_assert0(packet->size == 4 && packet->pts == 0 && packet->duration == 4);
         decoder = avcodec_alloc_context3(avcodec_find_decoder(AV_CODEC_ID_PCM_ALAW));

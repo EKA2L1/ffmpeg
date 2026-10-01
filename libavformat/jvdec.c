@@ -27,8 +27,10 @@
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define JV_PREAMBLE_SIZE 5
@@ -102,8 +104,7 @@ static int read_header(AVFormatContext *s)
     ast->codecpar->codec_id       = AV_CODEC_ID_PCM_U8;
     ast->codecpar->codec_tag      = 0; /* no fourcc */
     ast->codecpar->sample_rate    = avio_rl16(pb);
-    ast->codecpar->channels       = 1;
-    ast->codecpar->channel_layout = AV_CH_LAYOUT_MONO;
+    ast->codecpar->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
     avpriv_set_pts_info(ast, 64, 1, ast->codecpar->sample_rate);
 
     avio_skip(pb, 10);
@@ -216,7 +217,7 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     if (s->pb->eof_reached)
         return AVERROR_EOF;
 
-    return AVERROR(EIO);
+    return AVERROR_INVALIDDATA;
 }
 
 static int read_seek(AVFormatContext *s, int stream_index,
@@ -251,11 +252,11 @@ static int read_seek(AVFormatContext *s, int stream_index,
     return 0;
 }
 
-const AVInputFormat ff_jv_demuxer = {
-    .name           = "jv",
-    .long_name      = NULL_IF_CONFIG_SMALL("Bitmap Brothers JV"),
+const FFInputFormat ff_jv_demuxer = {
+    .p.name         = "jv",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Bitmap Brothers JV"),
     .priv_data_size = sizeof(JVDemuxContext),
-    .flags_internal = FF_FMT_INIT_CLEANUP,
+    .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = read_probe,
     .read_header    = read_header,
     .read_packet    = read_packet,

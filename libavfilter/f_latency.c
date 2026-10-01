@@ -18,11 +18,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/opt.h"
+#include "config_components.h"
+
+#include "audio.h"
 #include "avfilter.h"
 #include "filters.h"
-#include "formats.h"
-#include "internal.h"
+#include "video.h"
 
 typedef struct LatencyContext {
     int64_t min_latency;
@@ -44,6 +45,7 @@ static int activate(AVFilterContext *ctx)
 {
     LatencyContext *s = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
+    FilterLink      *inl = ff_filter_link(inlink);
     AVFilterLink *outlink = ctx->outputs[0];
 
     FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
@@ -51,14 +53,15 @@ static int activate(AVFilterContext *ctx)
     if (!ctx->is_disabled && ctx->inputs[0]->src &&
         ctx->inputs[0]->src->nb_inputs > 0) {
         AVFilterLink *prevlink = ctx->inputs[0]->src->inputs[0];
+        FilterLink *prevl = ff_filter_link(prevlink);
         int64_t delta = 0;
 
         switch (prevlink->type) {
         case AVMEDIA_TYPE_AUDIO:
-            delta = prevlink->sample_count_in - inlink->sample_count_out;
+            delta = prevl->sample_count_in - inl->sample_count_out;
             break;
         case AVMEDIA_TYPE_VIDEO:
-            delta = prevlink->frame_count_in - inlink->frame_count_out;
+            delta = prevl->frame_count_in - inl->frame_count_out;
             break;
         }
 
@@ -97,60 +100,32 @@ static av_cold void uninit(AVFilterContext *ctx)
 
 #if CONFIG_LATENCY_FILTER
 
-static const AVFilterPad latency_inputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-static const AVFilterPad latency_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_latency = {
-    .name          = "latency",
-    .description   = NULL_IF_CONFIG_SMALL("Report video filtering latency."),
+const FFFilter ff_vf_latency = {
+    .p.name        = "latency",
+    .p.description = NULL_IF_CONFIG_SMALL("Report video filtering latency."),
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(LatencyContext),
     .init          = init,
     .uninit        = uninit,
     .activate      = activate,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
-                     AVFILTER_FLAG_METADATA_ONLY,
-    FILTER_INPUTS(latency_inputs),
-    FILTER_OUTPUTS(latency_outputs),
+    FILTER_INPUTS(ff_video_default_filterpad),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
 };
 
 #endif // CONFIG_LATENCY_FILTER
 
 #if CONFIG_ALATENCY_FILTER
 
-static const AVFilterPad alatency_inputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
-static const AVFilterPad alatency_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
-const AVFilter ff_af_alatency = {
-    .name          = "alatency",
-    .description   = NULL_IF_CONFIG_SMALL("Report audio filtering latency."),
+const FFFilter ff_af_alatency = {
+    .p.name        = "alatency",
+    .p.description = NULL_IF_CONFIG_SMALL("Report audio filtering latency."),
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
     .priv_size     = sizeof(LatencyContext),
     .init          = init,
     .uninit        = uninit,
     .activate      = activate,
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL,
-    FILTER_INPUTS(alatency_inputs),
-    FILTER_OUTPUTS(alatency_outputs),
+    FILTER_INPUTS(ff_audio_default_filterpad),
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
 };
 #endif // CONFIG_ALATENCY_FILTER

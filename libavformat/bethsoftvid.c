@@ -27,10 +27,14 @@
  * @see http://www.svatopluk.com/andux/docs/dfvid.html
  */
 
+#include "libavutil/attributes.h"
 #include "libavutil/channel_layout.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 #include "libavcodec/bethsoftvideo.h"
 
@@ -145,10 +149,9 @@ static int read_frame(BVID_DemuxContext *vid, AVIOContext *pb, AVPacket *pkt,
 
     // set the y offset if it exists (decoder header data should be in data section)
     if(block_type == VIDEO_YOFF_P_FRAME){
-        if (avio_read(pb, &vidbuf_start[vidbuf_nbytes], 2) != 2) {
-            ret = AVERROR(EIO);
+        ret = ffio_read_size(pb, &vidbuf_start[vidbuf_nbytes], 2);
+        if (ret < 0)
             goto fail;
-        }
         vidbuf_nbytes += 2;
     }
 
@@ -168,10 +171,9 @@ static int read_frame(BVID_DemuxContext *vid, AVIOContext *pb, AVPacket *pkt,
             if(block_type == VIDEO_I_FRAME)
                 vidbuf_start[vidbuf_nbytes++] = avio_r8(pb);
         } else if(code){ // plain sequence
-            if (avio_read(pb, &vidbuf_start[vidbuf_nbytes], code) != code) {
-                ret = AVERROR(EIO);
+            ret = ffio_read_size(pb, &vidbuf_start[vidbuf_nbytes], code);
+            if (ret < 0)
                 goto fail;
-            }
             vidbuf_nbytes += code;
         }
         bytes_copied += code & 0x7F;
@@ -236,9 +238,9 @@ static int vid_read_packet(AVFormatContext *s,
                 av_log(s, AV_LOG_WARNING, "discarding unused palette\n");
                 vid->has_palette = 0;
             }
-            if (avio_read(pb, vid->palette, BVID_PALETTE_SIZE) != BVID_PALETTE_SIZE) {
-                return AVERROR(EIO);
-            }
+            ret_value = ffio_read_size(pb, vid->palette, BVID_PALETTE_SIZE);
+            if (ret_value < 0)
+                return ret_value;
             vid->has_palette = 1;
             return vid_read_packet(s, pkt);
 
@@ -246,6 +248,7 @@ static int vid_read_packet(AVFormatContext *s,
             avio_rl16(pb);
             // soundblaster DAC used for sample rate, as on specification page (link above)
             vid->sample_rate = 1000000 / (256 - avio_r8(pb));
+            av_fallthrough;
         case AUDIO_BLOCK:
             if (vid->audio_index < 0) {
                 AVStream *st = avformat_new_stream(s, NULL);
@@ -254,8 +257,7 @@ static int vid_read_packet(AVFormatContext *s,
                 vid->audio_index                 = st->index;
                 st->codecpar->codec_type            = AVMEDIA_TYPE_AUDIO;
                 st->codecpar->codec_id              = AV_CODEC_ID_PCM_U8;
-                st->codecpar->channels              = 1;
-                st->codecpar->channel_layout        = AV_CH_LAYOUT_MONO;
+                st->codecpar->ch_layout             = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
                 st->codecpar->bits_per_coded_sample = 8;
                 st->codecpar->sample_rate           = vid->sample_rate;
                 st->codecpar->bit_rate              = 8 * st->codecpar->sample_rate;
@@ -267,7 +269,7 @@ static int vid_read_packet(AVFormatContext *s,
                 if (ret_value < 0)
                     return ret_value;
                 av_log(s, AV_LOG_ERROR, "incomplete audio block\n");
-                return AVERROR(EIO);
+                return AVERROR_INVALIDDATA;
             }
             pkt->stream_index = vid->audio_index;
             pkt->duration     = audio_length;
@@ -283,7 +285,7 @@ static int vid_read_packet(AVFormatContext *s,
             if(vid->nframes != 0)
                 av_log(s, AV_LOG_VERBOSE, "reached terminating character but not all frames read.\n");
             vid->is_finished = 1;
-            return AVERROR(EIO);
+            return AVERROR_INVALIDDATA;
         default:
             av_log(s, AV_LOG_ERROR, "unknown block (character = %c, decimal = %d, hex = %x)!!!\n",
                    block_type, block_type, block_type);
@@ -291,9 +293,9 @@ static int vid_read_packet(AVFormatContext *s,
     }
 }
 
-const AVInputFormat ff_bethsoftvid_demuxer = {
-    .name           = "bethsoftvid",
-    .long_name      = NULL_IF_CONFIG_SMALL("Bethesda Softworks VID"),
+const FFInputFormat ff_bethsoftvid_demuxer = {
+    .p.name         = "bethsoftvid",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Bethesda Softworks VID"),
     .priv_data_size = sizeof(BVID_DemuxContext),
     .read_probe     = vid_probe,
     .read_header    = vid_read_header,

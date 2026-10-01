@@ -1,5 +1,7 @@
 /*
  * copyright (c) 2021 Wu Jianhua <jianhua.wu@intel.com>
+ * Copyright (c) Lynne
+ *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -17,12 +19,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/random_seed.h"
 #include "libavutil/opt.h"
 #include "vulkan_filter.h"
-#include "internal.h"
 
-#define CGS 32
+#include "filters.h"
+#include "video.h"
+
+extern const unsigned char ff_flip_comp_spv_data[];
+extern const unsigned int ff_flip_comp_spv_len;
 
 enum FlipType {
     FLIP_VERTICAL,
@@ -32,97 +36,56 @@ enum FlipType {
 
 typedef struct FlipVulkanContext {
     FFVulkanContext vkctx;
-    FFVkQueueFamilyCtx qf;
-    FFVkExecContext *exec;
-    FFVulkanPipeline *pl;
-
-    VkDescriptorImageInfo input_images[3];
-    VkDescriptorImageInfo output_images[3];
 
     int initialized;
+    FFVkExecPool e;
+    AVVulkanDeviceQueueFamily *qf;
+    FFVulkanShader shd;
 } FlipVulkanContext;
 
-static av_cold int init_filter(AVFilterContext *ctx, AVFrame *in, enum FlipType type)
+static av_cold int init_filter(AVFilterContext *ctx, AVFrame *in)
 {
     int err = 0;
-    FFVkSPIRVShader *shd;
     FlipVulkanContext *s = ctx->priv;
     FFVulkanContext *vkctx = &s->vkctx;
     const int planes = av_pix_fmt_count_planes(s->vkctx.output_format);
+    FFVulkanShader *shd = &s->shd;
 
-    FFVulkanDescriptorSetBinding image_descs[] = {
-        {
-            .name       = "input_image",
-            .type       = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .dimensions = 2,
-            .elems      = planes,
-            .stages     = VK_SHADER_STAGE_COMPUTE_BIT,
-            .updater    = s->input_images,
-        },
-        {
-            .name       = "output_image",
-            .type       = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .mem_layout = ff_vk_shader_rep_fmt(s->vkctx.output_format),
-            .mem_quali  = "writeonly",
-            .dimensions = 2,
-            .elems      = planes,
-            .stages     = VK_SHADER_STAGE_COMPUTE_BIT,
-            .updater    = s->output_images,
-        },
-    };
-
-    image_descs[0].sampler = ff_vk_init_sampler(vkctx, 1, VK_FILTER_LINEAR);
-    if (!image_descs[0].sampler)
-            return AVERROR_EXTERNAL;
-
-    ff_vk_qf_init(vkctx, &s->qf, VK_QUEUE_COMPUTE_BIT, 0);
-
-    {
-        s->pl = ff_vk_create_pipeline(vkctx, &s->qf);
-        if (!s->pl)
-            return AVERROR(ENOMEM);
-
-        shd = ff_vk_init_shader(s->pl, "flip_compute", image_descs[0].stages);
-        if (!shd)
-            return AVERROR(ENOMEM);
-
-        ff_vk_set_compute_shader_sizes(shd, (int [3]){ CGS, 1, 1 });
-        RET(ff_vk_add_descriptor_set(vkctx, s->pl, shd, image_descs, FF_ARRAY_ELEMS(image_descs), 0));
-
-        GLSLC(0, void main()                                                                    );
-        GLSLC(0, {                                                                              );
-        GLSLC(1,     ivec2 size;                                                                );
-        GLSLC(1,     const ivec2 pos = ivec2(gl_GlobalInvocationID.xy);                         );
-        for (int i = 0; i < planes; i++) {
-            GLSLC(0,                                                                            );
-            GLSLF(1, size = imageSize(output_image[%i]);                                      ,i);
-            GLSLC(1, if (IS_WITHIN(pos, size)) {                                                );
-            switch (type)
-            {
-            case FLIP_HORIZONTAL:
-                GLSLF(2, vec4 res = texture(input_image[%i], ivec2(size.x - pos.x, pos.y));   ,i);
-                break;
-            case FLIP_VERTICAL:
-                GLSLF(2, vec4 res = texture(input_image[%i], ivec2(pos.x, size.y - pos.y));   ,i);
-                break;
-            case FLIP_BOTH:
-                GLSLF(2, vec4 res = texture(input_image[%i], ivec2(size.xy - pos.xy));,         i);
-                break;
-            default:
-                GLSLF(2, vec4 res = texture(input_image[%i], pos);                            ,i);
-                break;
-            }
-            GLSLF(2,     imageStore(output_image[%i], pos, res);                              ,i);
-            GLSLC(1, }                                                                          );
-        }
-        GLSLC(0, }                                                                              );
-
-        RET(ff_vk_compile_shader(vkctx, shd, "main"));
-        RET(ff_vk_init_pipeline_layout(vkctx, s->pl));
-        RET(ff_vk_init_compute_pipeline(vkctx, s->pl));
+    s->qf = ff_vk_qf_find(vkctx, VK_QUEUE_COMPUTE_BIT, 0);
+    if (!s->qf) {
+        av_log(ctx, AV_LOG_ERROR, "Device has no compute queues\n");
+        err = AVERROR(ENOTSUP);
+        goto fail;
     }
 
-    RET(ff_vk_create_exec_ctx(vkctx, &s->exec, &s->qf));
+    RET(ff_vk_exec_pool_init(vkctx, s->qf, &s->e, s->qf->num*4, 0, 0, 0, NULL));
+
+    ff_vk_shader_load(&s->shd, VK_SHADER_STAGE_COMPUTE_BIT, NULL,
+                      (uint32_t []) { 32, 8, planes }, 0);
+
+    ff_vk_shader_add_push_const(&s->shd, 0, sizeof(int),
+                                VK_SHADER_STAGE_COMPUTE_BIT);
+
+    const FFVulkanDescriptorSetBinding desc[] = {
+        { /* input_img */
+            .type   = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .stages = VK_SHADER_STAGE_COMPUTE_BIT,
+            .elems  = planes,
+        },
+        { /* output_img */
+            .type   = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .stages = VK_SHADER_STAGE_COMPUTE_BIT,
+            .elems  = planes,
+        },
+    };
+    ff_vk_shader_add_descriptor_set(vkctx, &s->shd, desc, 2, 0);
+
+    RET(ff_vk_shader_link(vkctx, shd,
+                          ff_flip_comp_spv_data,
+                          ff_flip_comp_spv_len, "main"));
+
+    RET(ff_vk_shader_register_exec(vkctx, &s->e, &s->shd));
+
     s->initialized = 1;
 
 fail:
@@ -132,102 +95,14 @@ fail:
 static av_cold void flip_vulkan_uninit(AVFilterContext *avctx)
 {
     FlipVulkanContext *s = avctx->priv;
+    FFVulkanContext *vkctx = &s->vkctx;
+
+    ff_vk_exec_pool_free(vkctx, &s->e);
+    ff_vk_shader_free(vkctx, &s->shd);
+
     ff_vk_uninit(&s->vkctx);
 
     s->initialized = 0;
-}
-
-static int process_frames(AVFilterContext *avctx, AVFrame *outframe, AVFrame *inframe)
-{
-    int err = 0;
-    VkCommandBuffer cmd_buf;
-    FlipVulkanContext *s = avctx->priv;
-    FFVulkanContext *vkctx = &s->vkctx;
-    FFVulkanFunctions *vk = &s->vkctx.vkfn;
-    AVVkFrame *in = (AVVkFrame *)inframe->data[0];
-    AVVkFrame *out = (AVVkFrame *)outframe->data[0];
-    const int planes = av_pix_fmt_count_planes(s->vkctx.output_format);
-    const VkFormat *input_formats = av_vkfmt_from_pixfmt(s->vkctx.input_format);
-    const VkFormat *output_formats = av_vkfmt_from_pixfmt(s->vkctx.output_format);
-
-    ff_vk_start_exec_recording(vkctx, s->exec);
-    cmd_buf = ff_vk_get_exec_buf(s->exec);
-
-    for (int i = 0; i < planes; i++) {
-        RET(ff_vk_create_imageview(vkctx, s->exec,
-                                   &s->input_images[i].imageView, in->img[i],
-                                   input_formats[i],
-                                   ff_comp_identity_map));
-
-        RET(ff_vk_create_imageview(vkctx, s->exec,
-                                   &s->output_images[i].imageView, out->img[i],
-                                   output_formats[i],
-                                   ff_comp_identity_map));
-
-        s->input_images[i].imageLayout  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        s->output_images[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    }
-
-    ff_vk_update_descriptor_set(vkctx, s->pl, 0);
-
-    for (int i = 0; i < planes; i++) {
-        VkImageMemoryBarrier barriers[] = {
-            {
-                .sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .srcAccessMask               = 0,
-                .dstAccessMask               = VK_ACCESS_SHADER_READ_BIT,
-                .oldLayout                   = in->layout[i],
-                .newLayout                   = s->input_images[i].imageLayout,
-                .srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED,
-                .image                       = in->img[i],
-                .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .subresourceRange.levelCount = 1,
-                .subresourceRange.layerCount = 1,
-            },
-            {
-                .sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                .srcAccessMask               = 0,
-                .dstAccessMask               = VK_ACCESS_SHADER_WRITE_BIT,
-                .oldLayout                   = out->layout[i],
-                .newLayout                   = s->output_images[i].imageLayout,
-                .srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED,
-                .dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED,
-                .image                       = out->img[i],
-                .subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .subresourceRange.levelCount = 1,
-                .subresourceRange.layerCount = 1,
-            },
-        };
-
-        vk->CmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
-                               0, NULL, 0, NULL, FF_ARRAY_ELEMS(barriers), barriers);
-
-        in->layout[i]  = barriers[0].newLayout;
-        in->access[i]  = barriers[0].dstAccessMask;
-
-        out->layout[i] = barriers[1].newLayout;
-        out->access[i] = barriers[1].dstAccessMask;
-    }
-
-    ff_vk_bind_pipeline_exec(vkctx, s->exec, s->pl);
-    vk->CmdDispatch(cmd_buf, FFALIGN(s->vkctx.output_width, CGS)/CGS,
-                    s->vkctx.output_height, 1);
-
-    ff_vk_add_exec_dep(vkctx, s->exec, inframe, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-    ff_vk_add_exec_dep(vkctx, s->exec, outframe, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-
-    err = ff_vk_submit_exec_queue(vkctx, s->exec);
-    if (err)
-        return err;
-
-    ff_vk_qf_rotate(&s->qf);
-
-    return 0;
-fail:
-    ff_vk_discard_exec_deps(s->exec);
-    return err;
 }
 
 static int filter_frame(AVFilterLink *link, AVFrame *in, enum FlipType type)
@@ -245,9 +120,10 @@ static int filter_frame(AVFilterLink *link, AVFrame *in, enum FlipType type)
     }
 
     if (!s->initialized)
-        RET(init_filter(ctx, in, type));
+        RET(init_filter(ctx, in));
 
-    RET(process_frames(ctx, out, in));
+    RET(ff_vk_filter_process_simple(&s->vkctx, &s->e, &s->shd, out, in,
+                                    VK_NULL_HANDLE, 1, &type, sizeof(int)));
 
     RET(av_frame_copy_props(out, in));
 
@@ -299,16 +175,16 @@ static const AVFilterPad hflip_vulkan_inputs[] = {
     }
 };
 
-const AVFilter ff_vf_hflip_vulkan = {
-    .name           = "hflip_vulkan",
-    .description    = NULL_IF_CONFIG_SMALL("Horizontally flip the input video in Vulkan"),
+const FFFilter ff_vf_hflip_vulkan = {
+    .p.name         = "hflip_vulkan",
+    .p.description  = NULL_IF_CONFIG_SMALL("Horizontally flip the input video in Vulkan"),
+    .p.priv_class   = &hflip_vulkan_class,
     .priv_size      = sizeof(FlipVulkanContext),
     .init           = &ff_vk_filter_init,
     .uninit         = &flip_vulkan_uninit,
     FILTER_INPUTS(hflip_vulkan_inputs),
     FILTER_OUTPUTS(flip_vulkan_outputs),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VULKAN),
-    .priv_class     = &hflip_vulkan_class,
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 
@@ -327,16 +203,16 @@ static const AVFilterPad vflip_vulkan_inputs[] = {
     }
 };
 
-const AVFilter ff_vf_vflip_vulkan = {
-    .name           = "vflip_vulkan",
-    .description    = NULL_IF_CONFIG_SMALL("Vertically flip the input video in Vulkan"),
+const FFFilter ff_vf_vflip_vulkan = {
+    .p.name         = "vflip_vulkan",
+    .p.description  = NULL_IF_CONFIG_SMALL("Vertically flip the input video in Vulkan"),
+    .p.priv_class   = &vflip_vulkan_class,
     .priv_size      = sizeof(FlipVulkanContext),
     .init           = &ff_vk_filter_init,
     .uninit         = &flip_vulkan_uninit,
     FILTER_INPUTS(vflip_vulkan_inputs),
     FILTER_OUTPUTS(flip_vulkan_outputs),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VULKAN),
-    .priv_class     = &vflip_vulkan_class,
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 
@@ -355,15 +231,16 @@ static const AVFilterPad flip_vulkan_inputs[] = {
     }
 };
 
-const AVFilter ff_vf_flip_vulkan = {
-    .name           = "flip_vulkan",
-    .description    = NULL_IF_CONFIG_SMALL("Flip both horizontally and vertically"),
+const FFFilter ff_vf_flip_vulkan = {
+    .p.name         = "flip_vulkan",
+    .p.description  = NULL_IF_CONFIG_SMALL("Flip both horizontally and vertically"),
+    .p.priv_class   = &flip_vulkan_class,
+    .p.flags        = AVFILTER_FLAG_HWDEVICE,
     .priv_size      = sizeof(FlipVulkanContext),
     .init           = &ff_vk_filter_init,
     .uninit         = &flip_vulkan_uninit,
     FILTER_INPUTS(flip_vulkan_inputs),
     FILTER_OUTPUTS(flip_vulkan_outputs),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VULKAN),
-    .priv_class     = &flip_vulkan_class,
     .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };

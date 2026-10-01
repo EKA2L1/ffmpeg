@@ -24,24 +24,17 @@
 #include "libavutil/dict.h"
 #include "libavutil/internal.h"
 #include "libavutil/mathematics.h"
-#include "libavutil/time_internal.h"
+#include "libavutil/mem.h"
 
 #include "avformat.h"
-#include "avio_internal.h"
 #include "avlanguage.h"
+#include "demux.h"
 #include "internal.h"
 #include "riff.h"
 #include "asf.h"
 #include "asfcrypt.h"
 
-#define ASF_BOOL                              0x2
-#define ASF_WORD                              0x5
-#define ASF_GUID                              0x6
-#define ASF_DWORD                             0x3
-#define ASF_QWORD                             0x4
-#define ASF_UNICODE                           0x0
 #define ASF_FLAG_BROADCAST                    0x1
-#define ASF_BYTE_ARRAY                        0x1
 #define ASF_TYPE_AUDIO                        0x2
 #define ASF_TYPE_VIDEO                        0x1
 #define ASF_STREAM_NUM                        0x7F
@@ -109,6 +102,7 @@ typedef struct ASFContext {
     int64_t data_offset;
     int64_t first_packet_offset; // packet offset
     int64_t unknown_offset;   // for top level header objects or subobjects without specified behavior
+    int in_asf_read_unknown;
 
     // ASF file must not contain more than 128 streams according to the specification
     ASFStream *asf_st[ASF_MAX_STREAMS];
@@ -173,7 +167,7 @@ static int asf_read_unknown(AVFormatContext *s, const GUIDParseTable *g)
     uint64_t size   = avio_rl64(pb);
     int ret;
 
-    if (size > INT64_MAX)
+    if (size > INT64_MAX || asf->in_asf_read_unknown > 5)
         return AVERROR_INVALIDDATA;
 
     if (asf->is_header)
@@ -182,8 +176,11 @@ static int asf_read_unknown(AVFormatContext *s, const GUIDParseTable *g)
     if (!g->is_subobject) {
         if (!(ret = strcmp(g->name, "Header Extension")))
             avio_skip(pb, 22); // skip reserved fields and Data Size
-        if ((ret = detect_unknown_subobject(s, asf->unknown_offset,
-                                            asf->unknown_size)) < 0)
+        asf->in_asf_read_unknown ++;
+        ret = detect_unknown_subobject(s, asf->unknown_offset,
+                                            asf->unknown_size);
+        asf->in_asf_read_unknown --;
+        if (ret < 0)
             return ret;
     } else {
         if (size < 24) {
@@ -534,31 +531,15 @@ static int asf_read_properties(AVFormatContext *s, const GUIDParseTable *g)
 {
     ASFContext *asf = s->priv_data;
     AVIOContext *pb = s->pb;
-    time_t creation_time;
+    int64_t creation_time;
 
     avio_rl64(pb); // read object size
     avio_skip(pb, 16); // skip File ID
     avio_skip(pb, 8);  // skip File size
     creation_time = avio_rl64(pb);
     if (!(asf->b_flags & ASF_FLAG_BROADCAST)) {
-        struct tm tmbuf;
-        struct tm *tm;
-        char buf[64];
-
-        // creation date is in 100 ns units from 1 Jan 1601, conversion to s
-        creation_time /= 10000000;
-        // there are 11644473600 seconds between 1 Jan 1601 and 1 Jan 1970
-        creation_time -= 11644473600;
-        tm = gmtime_r(&creation_time, &tmbuf);
-        if (tm) {
-            if (!strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tm))
-                buf[0] = '\0';
-        } else
-            buf[0] = '\0';
-        if (buf[0]) {
-            if (av_dict_set(&s->metadata, "creation_time", buf, 0) < 0)
-                av_log(s, AV_LOG_WARNING, "av_dict_set failed.\n");
-        }
+        if (ff_dict_set_timestamp(&s->metadata, "creation_time", ff_asf_filetime_to_avtime(creation_time)) < 0)
+            av_log(s, AV_LOG_WARNING, "av_dict_set failed.\n");
     }
     asf->nb_packets  = avio_rl64(pb);
     asf->duration    = avio_rl64(pb) / 10000; // stream duration
@@ -860,6 +841,9 @@ static int asf_read_simple_index(AVFormatContext *s, const GUIDParseTable *g)
     int64_t offset;
     uint64_t size = avio_rl64(pb);
 
+    if (size < 24)
+        return AVERROR_INVALIDDATA;
+
     // simple index objects should be ordered by stream number, this loop tries to find
     // the first not indexed video stream
     for (i = 0; i < asf->nb_streams; i++) {
@@ -884,6 +868,8 @@ static int asf_read_simple_index(AVFormatContext *s, const GUIDParseTable *g)
             av_log(s, AV_LOG_ERROR, "Skipping failed in asf_read_simple_index.\n");
             return offset;
         }
+        if (asf->first_packet_offset > INT64_MAX - asf->packet_size * pkt_num)
+            return AVERROR_INVALIDDATA;
         if (prev_pkt_num != pkt_num) {
             av_add_index_entry(st, asf->first_packet_offset + asf->packet_size *
                                pkt_num, av_rescale(interval, i, 10000),
@@ -1234,10 +1220,12 @@ static int asf_read_packet_header(AVFormatContext *s)
     ASFContext *asf = s->priv_data;
     AVIOContext *pb = s->pb;
     uint64_t size;
-    uint32_t av_unused seq;
+    av_unused uint32_t seq;
     unsigned char error_flags, len_flags, pay_flags;
 
     asf->packet_offset = avio_tell(pb);
+    if (asf->packet_offset > INT64_MAX/2)
+        asf->packet_offset = 0;
     error_flags = avio_r8(pb); // read Error Correction Flags
     if (error_flags & ASF_PACKET_FLAG_ERROR_CORRECTION_PRESENT) {
         if (!(error_flags & ASF_ERROR_CORRECTION_LENGTH_TYPE)) {
@@ -1609,7 +1597,7 @@ static int asf_read_header(AVFormatContext *s)
             break;
         asf->offset = avio_tell(pb);
         if ((ret = ff_get_guid(pb, &guid)) < 0) {
-            if (ret == AVERROR_EOF && asf->data_reached)
+            if (avio_feof(pb) && asf->data_reached)
                 break;
             else
                 goto failed;
@@ -1664,9 +1652,10 @@ failed:
     return ret;
 }
 
-const AVInputFormat ff_asf_o_demuxer = {
-    .name           = "asf_o",
-    .long_name      = NULL_IF_CONFIG_SMALL("ASF (Advanced / Active Streaming Format)"),
+const FFInputFormat ff_asf_o_demuxer = {
+    .p.name         = "asf_o",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("ASF (Advanced / Active Streaming Format)"),
+    .p.flags        = AVFMT_NOBINSEARCH | AVFMT_NOGENSEARCH,
     .priv_data_size = sizeof(ASFContext),
     .read_probe     = asf_probe,
     .read_header    = asf_read_header,
@@ -1674,5 +1663,4 @@ const AVInputFormat ff_asf_o_demuxer = {
     .read_close     = asf_read_close,
     .read_timestamp = asf_read_timestamp,
     .read_seek      = asf_read_seek,
-    .flags          = AVFMT_NOBINSEARCH | AVFMT_NOGENSEARCH,
 };

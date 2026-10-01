@@ -19,16 +19,18 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/avstring.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/mem.h"
 #include "libavutil/mem_internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
 #include "convolution.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 
 #define OFFSET(x) offsetof(ConvolutionContext, x)
@@ -39,21 +41,21 @@ static const AVOption convolution_options[] = {
     { "1m", "set matrix for 2nd plane", OFFSET(matrix_str[1]), AV_OPT_TYPE_STRING, {.str="0 0 0 0 1 0 0 0 0"}, 0, 0, FLAGS },
     { "2m", "set matrix for 3rd plane", OFFSET(matrix_str[2]), AV_OPT_TYPE_STRING, {.str="0 0 0 0 1 0 0 0 0"}, 0, 0, FLAGS },
     { "3m", "set matrix for 4th plane", OFFSET(matrix_str[3]), AV_OPT_TYPE_STRING, {.str="0 0 0 0 1 0 0 0 0"}, 0, 0, FLAGS },
-    { "0rdiv", "set rdiv for 1st plane", OFFSET(rdiv[0]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
-    { "1rdiv", "set rdiv for 2nd plane", OFFSET(rdiv[1]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
-    { "2rdiv", "set rdiv for 3rd plane", OFFSET(rdiv[2]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
-    { "3rdiv", "set rdiv for 4th plane", OFFSET(rdiv[3]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
+    { "0rdiv", "set rdiv for 1st plane", OFFSET(user_rdiv[0]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
+    { "1rdiv", "set rdiv for 2nd plane", OFFSET(user_rdiv[1]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
+    { "2rdiv", "set rdiv for 3rd plane", OFFSET(user_rdiv[2]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
+    { "3rdiv", "set rdiv for 4th plane", OFFSET(user_rdiv[3]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
     { "0bias", "set bias for 1st plane", OFFSET(bias[0]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
     { "1bias", "set bias for 2nd plane", OFFSET(bias[1]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
     { "2bias", "set bias for 3rd plane", OFFSET(bias[2]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
     { "3bias", "set bias for 4th plane", OFFSET(bias[3]), AV_OPT_TYPE_FLOAT, {.dbl=0.0}, 0.0, INT_MAX, FLAGS},
-    { "0mode", "set matrix mode for 1st plane", OFFSET(mode[0]), AV_OPT_TYPE_INT, {.i64=MATRIX_SQUARE}, 0, MATRIX_NBMODES-1, FLAGS, "mode" },
-    { "1mode", "set matrix mode for 2nd plane", OFFSET(mode[1]), AV_OPT_TYPE_INT, {.i64=MATRIX_SQUARE}, 0, MATRIX_NBMODES-1, FLAGS, "mode" },
-    { "2mode", "set matrix mode for 3rd plane", OFFSET(mode[2]), AV_OPT_TYPE_INT, {.i64=MATRIX_SQUARE}, 0, MATRIX_NBMODES-1, FLAGS, "mode" },
-    { "3mode", "set matrix mode for 4th plane", OFFSET(mode[3]), AV_OPT_TYPE_INT, {.i64=MATRIX_SQUARE}, 0, MATRIX_NBMODES-1, FLAGS, "mode" },
-    { "square", "square matrix",     0, AV_OPT_TYPE_CONST, {.i64=MATRIX_SQUARE}, 0, 0, FLAGS, "mode" },
-    { "row",    "single row matrix", 0, AV_OPT_TYPE_CONST, {.i64=MATRIX_ROW}   , 0, 0, FLAGS, "mode" },
-    { "column", "single column matrix", 0, AV_OPT_TYPE_CONST, {.i64=MATRIX_COLUMN}, 0, 0, FLAGS, "mode" },
+    { "0mode", "set matrix mode for 1st plane", OFFSET(mode[0]), AV_OPT_TYPE_INT, {.i64=MATRIX_SQUARE}, 0, MATRIX_NBMODES-1, FLAGS, .unit = "mode" },
+    { "1mode", "set matrix mode for 2nd plane", OFFSET(mode[1]), AV_OPT_TYPE_INT, {.i64=MATRIX_SQUARE}, 0, MATRIX_NBMODES-1, FLAGS, .unit = "mode" },
+    { "2mode", "set matrix mode for 3rd plane", OFFSET(mode[2]), AV_OPT_TYPE_INT, {.i64=MATRIX_SQUARE}, 0, MATRIX_NBMODES-1, FLAGS, .unit = "mode" },
+    { "3mode", "set matrix mode for 4th plane", OFFSET(mode[3]), AV_OPT_TYPE_INT, {.i64=MATRIX_SQUARE}, 0, MATRIX_NBMODES-1, FLAGS, .unit = "mode" },
+    { "square", "square matrix",     0, AV_OPT_TYPE_CONST, {.i64=MATRIX_SQUARE}, 0, 0, FLAGS, .unit = "mode" },
+    { "row",    "single row matrix", 0, AV_OPT_TYPE_CONST, {.i64=MATRIX_ROW}   , 0, 0, FLAGS, .unit = "mode" },
+    { "column", "single column matrix", 0, AV_OPT_TYPE_CONST, {.i64=MATRIX_COLUMN}, 0, 0, FLAGS, .unit = "mode" },
     { NULL }
 };
 
@@ -132,24 +134,6 @@ static void filter16_roberts(uint8_t *dstp, int width,
     for (x = 0; x < width; x++) {
         float suma = AV_RN16A(&c[0][2 * x]) *  1 + AV_RN16A(&c[1][2 * x]) * -1;
         float sumb = AV_RN16A(&c[4][2 * x]) *  1 + AV_RN16A(&c[3][2 * x]) * -1;
-
-        dst[x] = av_clip(sqrtf(suma*suma + sumb*sumb) * scale + delta, 0, peak);
-    }
-}
-
-static void filter16_sobel(uint8_t *dstp, int width,
-                           float scale, float delta, const int *const matrix,
-                           const uint8_t *c[], int peak, int radius,
-                           int dstride, int stride, int size)
-{
-    uint16_t *dst = (uint16_t *)dstp;
-    int x;
-
-    for (x = 0; x < width; x++) {
-        float suma = AV_RN16A(&c[0][2 * x]) * -1 + AV_RN16A(&c[1][2 * x]) * -2 + AV_RN16A(&c[2][2 * x]) * -1 +
-                     AV_RN16A(&c[6][2 * x]) *  1 + AV_RN16A(&c[7][2 * x]) *  2 + AV_RN16A(&c[8][2 * x]) *  1;
-        float sumb = AV_RN16A(&c[0][2 * x]) * -1 + AV_RN16A(&c[2][2 * x]) *  1 + AV_RN16A(&c[3][2 * x]) * -2 +
-                     AV_RN16A(&c[5][2 * x]) *  2 + AV_RN16A(&c[6][2 * x]) * -1 + AV_RN16A(&c[8][2 * x]) *  1;
 
         dst[x] = av_clip(sqrtf(suma*suma + sumb*sumb) * scale + delta, 0, peak);
     }
@@ -259,26 +243,6 @@ static void filter_roberts(uint8_t *dst, int width,
     }
 }
 
-static void filter_sobel(uint8_t *dst, int width,
-                         float scale, float delta, const int *const matrix,
-                         const uint8_t *c[], int peak, int radius,
-                         int dstride, int stride, int size)
-{
-    const uint8_t *c0 = c[0], *c1 = c[1], *c2 = c[2];
-    const uint8_t *c3 = c[3], *c5 = c[5];
-    const uint8_t *c6 = c[6], *c7 = c[7], *c8 = c[8];
-    int x;
-
-    for (x = 0; x < width; x++) {
-        float suma = c0[x] * -1 + c1[x] * -2 + c2[x] * -1 +
-                     c6[x] *  1 + c7[x] *  2 + c8[x] *  1;
-        float sumb = c0[x] * -1 + c2[x] *  1 + c3[x] * -2 +
-                     c5[x] *  2 + c6[x] * -1 + c8[x] *  1;
-
-        dst[x] = av_clip_uint8(sqrtf(suma*suma + sumb*sumb) * scale + delta);
-    }
-}
-
 static void filter_scharr(uint8_t *dst, int width,
                           float scale, float delta, const int *const matrix,
                           const uint8_t *c[], int peak, int radius,
@@ -358,17 +322,16 @@ static void filter16_3x3(uint8_t *dstp, int width,
     int x;
 
     for (x = 0; x < width; x++) {
-        int sum = AV_RN16A(&c[0][2 * x]) * matrix[0] +
-                  AV_RN16A(&c[1][2 * x]) * matrix[1] +
-                  AV_RN16A(&c[2][2 * x]) * matrix[2] +
-                  AV_RN16A(&c[3][2 * x]) * matrix[3] +
-                  AV_RN16A(&c[4][2 * x]) * matrix[4] +
-                  AV_RN16A(&c[5][2 * x]) * matrix[5] +
-                  AV_RN16A(&c[6][2 * x]) * matrix[6] +
-                  AV_RN16A(&c[7][2 * x]) * matrix[7] +
-                  AV_RN16A(&c[8][2 * x]) * matrix[8];
-        sum = (int)(sum * rdiv + bias + 0.5f);
-        dst[x] = av_clip(sum, 0, peak);
+        unsigned sum = (unsigned)AV_RN16A(&c[0][2 * x]) * matrix[0] +
+                  (unsigned)AV_RN16A(&c[1][2 * x]) * matrix[1] +
+                  (unsigned)AV_RN16A(&c[2][2 * x]) * matrix[2] +
+                  (unsigned)AV_RN16A(&c[3][2 * x]) * matrix[3] +
+                  (unsigned)AV_RN16A(&c[4][2 * x]) * matrix[4] +
+                  (unsigned)AV_RN16A(&c[5][2 * x]) * matrix[5] +
+                  (unsigned)AV_RN16A(&c[6][2 * x]) * matrix[6] +
+                  (unsigned)AV_RN16A(&c[7][2 * x]) * matrix[7] +
+                  (unsigned)AV_RN16A(&c[8][2 * x]) * matrix[8];
+        dst[x] = av_clip((int)sum * rdiv + bias + 0.5f, 0, peak);
     }
 }
 
@@ -381,13 +344,13 @@ static void filter16_5x5(uint8_t *dstp, int width,
     int x;
 
     for (x = 0; x < width; x++) {
-        int i, sum = 0;
+        int i;
+        unsigned sum = 0;
 
         for (i = 0; i < 25; i++)
-            sum += AV_RN16A(&c[i][2 * x]) * matrix[i];
+            sum += (unsigned)AV_RN16A(&c[i][2 * x]) * matrix[i];
 
-        sum = (int)(sum * rdiv + bias + 0.5f);
-        dst[x] = av_clip(sum, 0, peak);
+        dst[x] = av_clip((int)sum * rdiv + bias + 0.5f, 0, peak);
     }
 }
 
@@ -400,13 +363,13 @@ static void filter16_7x7(uint8_t *dstp, int width,
     int x;
 
     for (x = 0; x < width; x++) {
-        int i, sum = 0;
+        int i;
+        unsigned sum = 0;
 
         for (i = 0; i < 49; i++)
-            sum += AV_RN16A(&c[i][2 * x]) * matrix[i];
+            sum += (unsigned)AV_RN16A(&c[i][2 * x]) * matrix[i];
 
-        sum = (int)(sum * rdiv + bias + 0.5f);
-        dst[x] = av_clip(sum, 0, peak);
+        dst[x] = av_clip((int)sum * rdiv + bias + 0.5f, 0, peak);
     }
 }
 
@@ -419,13 +382,13 @@ static void filter16_row(uint8_t *dstp, int width,
     int x;
 
     for (x = 0; x < width; x++) {
-        int i, sum = 0;
+        int i;
+        unsigned sum = 0;
 
         for (i = 0; i < 2 * radius + 1; i++)
-            sum += AV_RN16A(&c[i][2 * x]) * matrix[i];
+            sum += (unsigned)AV_RN16A(&c[i][2 * x]) * matrix[i];
 
-        sum = (int)(sum * rdiv + bias + 0.5f);
-        dst[x] = av_clip(sum, 0, peak);
+        dst[x] = av_clip((int)sum * rdiv + bias + 0.5f, 0, peak);
     }
 }
 
@@ -434,7 +397,7 @@ static void filter16_column(uint8_t *dstp, int height,
                             const uint8_t *c[], int peak, int radius,
                             int dstride, int stride, int size)
 {
-    DECLARE_ALIGNED(64, int, sum)[16];
+    DECLARE_ALIGNED(64, unsigned, sum)[16];
     uint16_t *dst = (uint16_t *)dstp;
     const int width = FFMIN(16, size);
 
@@ -443,12 +406,11 @@ static void filter16_column(uint8_t *dstp, int height,
         memset(sum, 0, sizeof(sum));
         for (int i = 0; i < 2 * radius + 1; i++) {
             for (int off16 = 0; off16 < width; off16++)
-                sum[off16] += AV_RN16A(&c[i][0 + y * stride + off16 * 2]) * matrix[i];
+                sum[off16] += (unsigned)AV_RN16A(&c[i][0 + y * stride + off16 * 2]) * matrix[i];
         }
 
         for (int off16 = 0; off16 < width; off16++) {
-            sum[off16] = (int)(sum[off16] * rdiv + bias + 0.5f);
-            dst[off16] = av_clip(sum[off16], 0, peak);
+            dst[off16] = av_clip((int)sum[off16] * rdiv + bias + 0.5f, 0, peak);
         }
         dst += dstride / 2;
     }
@@ -462,13 +424,13 @@ static void filter_7x7(uint8_t *dst, int width,
     int x;
 
     for (x = 0; x < width; x++) {
-        int i, sum = 0;
+        int i;
+        unsigned sum = 0;
 
         for (i = 0; i < 49; i++)
-            sum += c[i][x] * matrix[i];
+            sum += (unsigned)c[i][x] * matrix[i];
 
-        sum = (int)(sum * rdiv + bias + 0.5f);
-        dst[x] = av_clip_uint8(sum);
+        dst[x] = av_clip_uint8((int)sum * rdiv + bias + 0.5f);
     }
 }
 
@@ -480,13 +442,13 @@ static void filter_5x5(uint8_t *dst, int width,
     int x;
 
     for (x = 0; x < width; x++) {
-        int i, sum = 0;
+        int i;
+        unsigned sum = 0;
 
         for (i = 0; i < 25; i++)
-            sum += c[i][x] * matrix[i];
+            sum += (unsigned)c[i][x] * matrix[i];
 
-        sum = (int)(sum * rdiv + bias + 0.5f);
-        dst[x] = av_clip_uint8(sum);
+        dst[x] = av_clip_uint8((int)sum * rdiv + bias + 0.5f);
     }
 }
 
@@ -501,11 +463,10 @@ static void filter_3x3(uint8_t *dst, int width,
     int x;
 
     for (x = 0; x < width; x++) {
-        int sum = c0[x] * matrix[0] + c1[x] * matrix[1] + c2[x] * matrix[2] +
-                  c3[x] * matrix[3] + c4[x] * matrix[4] + c5[x] * matrix[5] +
-                  c6[x] * matrix[6] + c7[x] * matrix[7] + c8[x] * matrix[8];
-        sum = (int)(sum * rdiv + bias + 0.5f);
-        dst[x] = av_clip_uint8(sum);
+        unsigned sum = (unsigned)c0[x] * matrix[0] + (unsigned)c1[x] * matrix[1] + (unsigned)c2[x] * matrix[2] +
+                       (unsigned)c3[x] * matrix[3] + (unsigned)c4[x] * matrix[4] + (unsigned)c5[x] * matrix[5] +
+                       (unsigned)c6[x] * matrix[6] + (unsigned)c7[x] * matrix[7] + (unsigned)c8[x] * matrix[8];
+        dst[x] = av_clip_uint8((int)sum * rdiv + bias + 0.5f);
     }
 }
 
@@ -517,13 +478,13 @@ static void filter_row(uint8_t *dst, int width,
     int x;
 
     for (x = 0; x < width; x++) {
-        int i, sum = 0;
+        int i;
+        unsigned sum = 0;
 
         for (i = 0; i < 2 * radius + 1; i++)
-            sum += c[i][x] * matrix[i];
+            sum += (unsigned)c[i][x] * matrix[i];
 
-        sum = (int)(sum * rdiv + bias + 0.5f);
-        dst[x] = av_clip_uint8(sum);
+        dst[x] = av_clip_uint8((int)sum * rdiv + bias + 0.5f);
     }
 }
 
@@ -532,37 +493,20 @@ static void filter_column(uint8_t *dst, int height,
                           const uint8_t *c[], int peak, int radius,
                           int dstride, int stride, int size)
 {
-    DECLARE_ALIGNED(64, int, sum)[16];
+    DECLARE_ALIGNED(64, unsigned, sum)[16];
 
     for (int y = 0; y < height; y++) {
         memset(sum, 0, sizeof(sum));
 
         for (int i = 0; i < 2 * radius + 1; i++) {
             for (int off16 = 0; off16 < 16; off16++)
-                sum[off16] += c[i][0 + y * stride + off16] * matrix[i];
+                sum[off16] += (unsigned)c[i][0 + y * stride + off16] * matrix[i];
         }
 
         for (int off16 = 0; off16 < 16; off16++) {
-            sum[off16] = (int)(sum[off16] * rdiv + bias + 0.5f);
-            dst[off16] = av_clip_uint8(sum[off16]);
+            dst[off16] = av_clip_uint8((int)sum[off16] * rdiv + bias + 0.5f);
         }
         dst += dstride;
-    }
-}
-
-static void setup_3x3(int radius, const uint8_t *c[], const uint8_t *src, int stride,
-                      int x, int w, int y, int h, int bpc)
-{
-    int i;
-
-    for (i = 0; i < 9; i++) {
-        int xoff = FFABS(x + ((i % 3) - 1));
-        int yoff = FFABS(y + (i / 3) - 1);
-
-        xoff = xoff >= w ? 2 * w - 1 - xoff : xoff;
-        yoff = yoff >= h ? 2 * h - 1 - yoff : yoff;
-
-        c[i] = src + xoff * bpc + yoff * stride;
     }
 }
 
@@ -572,11 +516,8 @@ static void setup_5x5(int radius, const uint8_t *c[], const uint8_t *src, int st
     int i;
 
     for (i = 0; i < 25; i++) {
-        int xoff = FFABS(x + ((i % 5) - 2));
-        int yoff = FFABS(y + (i / 5) - 2);
-
-        xoff = xoff >= w ? 2 * w - 1 - xoff : xoff;
-        yoff = yoff >= h ? 2 * h - 1 - yoff : yoff;
+        int xoff = avpriv_mirror(x + (i % 5) - 2, w - 1);
+        int yoff = avpriv_mirror(y + (i / 5) - 2, h - 1);
 
         c[i] = src + xoff * bpc + yoff * stride;
     }
@@ -588,11 +529,8 @@ static void setup_7x7(int radius, const uint8_t *c[], const uint8_t *src, int st
     int i;
 
     for (i = 0; i < 49; i++) {
-        int xoff = FFABS(x + ((i % 7) - 3));
-        int yoff = FFABS(y + (i / 7) - 3);
-
-        xoff = xoff >= w ? 2 * w - 1 - xoff : xoff;
-        yoff = yoff >= h ? 2 * h - 1 - yoff : yoff;
+        int xoff = avpriv_mirror(x + (i % 7) - 3, w - 1);
+        int yoff = avpriv_mirror(y + (i / 7) - 3, h - 1);
 
         c[i] = src + xoff * bpc + yoff * stride;
     }
@@ -604,9 +542,7 @@ static void setup_row(int radius, const uint8_t *c[], const uint8_t *src, int st
     int i;
 
     for (i = 0; i < radius * 2 + 1; i++) {
-        int xoff = FFABS(x + i - radius);
-
-        xoff = xoff >= w ? 2 * w - 1 - xoff : xoff;
+        int xoff = avpriv_mirror(x + i - radius, w - 1);
 
         c[i] = src + xoff * bpc + y * stride;
     }
@@ -618,9 +554,7 @@ static void setup_column(int radius, const uint8_t *c[], const uint8_t *src, int
     int i;
 
     for (i = 0; i < radius * 2 + 1; i++) {
-        int xoff = FFABS(x + i - radius);
-
-        xoff = xoff >= h ? 2 * h - 1 - xoff : xoff;
+        int xoff = avpriv_mirror(x + i - radius, h - 1);
 
         c[i] = src + y * bpc + xoff * stride;
     }
@@ -644,8 +578,8 @@ static int filter_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
         const int dstride = out->linesize[plane];
         const int sizeh = mode == MATRIX_COLUMN ? width : height;
         const int sizew = mode == MATRIX_COLUMN ? height : width;
-        const int slice_start = (sizeh * jobnr) / nb_jobs;
-        const int slice_end = (sizeh * (jobnr+1)) / nb_jobs;
+        const int slice_start = ff_slice_pos(sizeh, jobnr, nb_jobs);
+        const int slice_end = ff_slice_pos(sizeh, jobnr + 1, nb_jobs);
         const float rdiv = s->rdiv[plane];
         const float bias = s->bias[plane];
         const uint8_t *src = in->data[plane];
@@ -666,10 +600,12 @@ static int filter_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
             continue;
         }
         for (y = slice_start; y < slice_end; y += step) {
-            const int xoff = mode == MATRIX_COLUMN ? (y - slice_start) * bpc : radius * bpc;
-            const int yoff = mode == MATRIX_COLUMN ? radius * dstride : 0;
+            const int left = FFMIN(radius, sizew);
+            const int right = FFMAX(left, sizew - radius);
+            const int xoff = mode == MATRIX_COLUMN ? (y - slice_start) * bpc : left * bpc;
+            const int yoff = mode == MATRIX_COLUMN ? left * dstride : 0;
 
-            for (x = 0; x < radius; x++) {
+            for (x = 0; x < left; x++) {
                 const int xoff = mode == MATRIX_COLUMN ? (y - slice_start) * bpc : x * bpc;
                 const int yoff = mode == MATRIX_COLUMN ? x * dstride : 0;
 
@@ -678,11 +614,11 @@ static int filter_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
                                  bias, matrix, c, s->max, radius,
                                  dstride, stride, slice_end - step);
             }
-            s->setup[plane](radius, c, src, stride, radius, width, y, height, bpc);
-            s->filter[plane](dst + yoff + xoff, sizew - 2 * radius,
+            s->setup[plane](radius, c, src, stride, left, width, y, height, bpc);
+            s->filter[plane](dst + yoff + xoff, right - left,
                              rdiv, bias, matrix, c, s->max, radius,
                              dstride, stride, slice_end - step);
-            for (x = sizew - radius; x < sizew; x++) {
+            for (x = right; x < sizew; x++) {
                 const int xoff = mode == MATRIX_COLUMN ? (y - slice_start) * bpc : x * bpc;
                 const int yoff = mode == MATRIX_COLUMN ? x * dstride : 0;
 
@@ -706,6 +642,18 @@ static int param_init(AVFilterContext *ctx)
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
     int p, i;
 
+    s->depth = desc->comp[0].depth;
+    s->max = (1 << s->depth) - 1;
+
+    s->planewidth[1] = s->planewidth[2] = AV_CEIL_RSHIFT(inlink->w, desc->log2_chroma_w);
+    s->planewidth[0] = s->planewidth[3] = inlink->w;
+    s->planeheight[1] = s->planeheight[2] = AV_CEIL_RSHIFT(inlink->h, desc->log2_chroma_h);
+    s->planeheight[0] = s->planeheight[3] = inlink->h;
+
+    s->nb_planes = av_pix_fmt_count_planes(inlink->format);
+    s->nb_threads = ff_filter_get_nb_threads(ctx);
+    s->bpc = (s->depth + 7) / 8;
+
     if (!strcmp(ctx->filter->name, "convolution")) {
         for (i = 0; i < 4; i++) {
             int *matrix = (int *)s->matrix[i];
@@ -715,7 +663,7 @@ static int param_init(AVFilterContext *ctx)
             p = orig = av_strdup(s->matrix_str[i]);
             if (p) {
                 s->matrix_length[i] = 0;
-                s->rdiv[i] = 0.f;
+                s->rdiv[i] = s->user_rdiv[i];
                 sum = 0.f;
 
                 while (s->matrix_length[i] < 49) {
@@ -801,15 +749,10 @@ static int param_init(AVFilterContext *ctx)
             s->rdiv[i] = s->scale;
             s->bias[i] = s->delta;
         }
+#if CONFIG_SOBEL_FILTER
     } else if (!strcmp(ctx->filter->name, "sobel")) {
-        for (i = 0; i < 4; i++) {
-            s->filter[i] = filter_sobel;
-            s->copy[i] = !((1 << i) & s->planes);
-            s->size[i] = 3;
-            s->setup[i] = setup_3x3;
-            s->rdiv[i] = s->scale;
-            s->bias[i] = s->delta;
-        }
+        ff_sobel_init(s, s->depth, s->nb_planes);
+#endif
     } else if (!strcmp(ctx->filter->name, "kirsch")) {
         for (i = 0; i < 4; i++) {
             s->filter[i] = filter_kirsch;
@@ -830,18 +773,6 @@ static int param_init(AVFilterContext *ctx)
         }
     }
 
-    s->depth = desc->comp[0].depth;
-    s->max = (1 << s->depth) - 1;
-
-    s->planewidth[1] = s->planewidth[2] = AV_CEIL_RSHIFT(inlink->w, desc->log2_chroma_w);
-    s->planewidth[0] = s->planewidth[3] = inlink->w;
-    s->planeheight[1] = s->planeheight[2] = AV_CEIL_RSHIFT(inlink->h, desc->log2_chroma_h);
-    s->planeheight[0] = s->planeheight[3] = inlink->h;
-
-    s->nb_planes = av_pix_fmt_count_planes(inlink->format);
-    s->nb_threads = ff_filter_get_nb_threads(ctx);
-    s->bpc = (s->depth + 7) / 8;
-
     if (!strcmp(ctx->filter->name, "convolution")) {
         if (s->depth > 8) {
             for (p = 0; p < s->nb_planes; p++) {
@@ -857,7 +788,7 @@ static int param_init(AVFilterContext *ctx)
                     s->filter[p] = filter16_7x7;
             }
         }
-#if CONFIG_CONVOLUTION_FILTER && ARCH_X86_64
+#if CONFIG_CONVOLUTION_FILTER && ARCH_X86_64 && HAVE_X86ASM
         ff_convolution_init_x86(s);
 #endif
     } else if (!strcmp(ctx->filter->name, "prewitt")) {
@@ -868,10 +799,6 @@ static int param_init(AVFilterContext *ctx)
         if (s->depth > 8)
             for (p = 0; p < s->nb_planes; p++)
                 s->filter[p] = filter16_roberts;
-    } else if (!strcmp(ctx->filter->name, "sobel")) {
-        if (s->depth > 8)
-            for (p = 0; p < s->nb_planes; p++)
-                s->filter[p] = filter16_sobel;
     } else if (!strcmp(ctx->filter->name, "kirsch")) {
         if (s->depth > 8)
             for (p = 0; p < s->nb_planes; p++)
@@ -936,24 +863,17 @@ static const AVFilterPad convolution_inputs[] = {
     },
 };
 
-static const AVFilterPad convolution_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
 #if CONFIG_CONVOLUTION_FILTER
 
-const AVFilter ff_vf_convolution = {
-    .name          = "convolution",
-    .description   = NULL_IF_CONFIG_SMALL("Apply convolution filter."),
+const FFFilter ff_vf_convolution = {
+    .p.name        = "convolution",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply convolution filter."),
+    .p.priv_class  = &convolution_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ConvolutionContext),
-    .priv_class    = &convolution_class,
     FILTER_INPUTS(convolution_inputs),
-    FILTER_OUTPUTS(convolution_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = process_command,
 };
 
@@ -971,15 +891,15 @@ AVFILTER_DEFINE_CLASS_EXT(common, "kirsch/prewitt/roberts/scharr/sobel",
 
 #if CONFIG_PREWITT_FILTER
 
-const AVFilter ff_vf_prewitt = {
-    .name          = "prewitt",
-    .description   = NULL_IF_CONFIG_SMALL("Apply prewitt operator."),
+const FFFilter ff_vf_prewitt = {
+    .p.name        = "prewitt",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply prewitt operator."),
+    .p.priv_class  = &common_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ConvolutionContext),
-    .priv_class    = &common_class,
     FILTER_INPUTS(convolution_inputs),
-    FILTER_OUTPUTS(convolution_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = process_command,
 };
 
@@ -987,15 +907,15 @@ const AVFilter ff_vf_prewitt = {
 
 #if CONFIG_SOBEL_FILTER
 
-const AVFilter ff_vf_sobel = {
-    .name          = "sobel",
-    .description   = NULL_IF_CONFIG_SMALL("Apply sobel operator."),
+const FFFilter ff_vf_sobel = {
+    .p.name        = "sobel",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply sobel operator."),
+    .p.priv_class  = &common_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ConvolutionContext),
-    .priv_class    = &common_class,
     FILTER_INPUTS(convolution_inputs),
-    FILTER_OUTPUTS(convolution_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = process_command,
 };
 
@@ -1003,15 +923,15 @@ const AVFilter ff_vf_sobel = {
 
 #if CONFIG_ROBERTS_FILTER
 
-const AVFilter ff_vf_roberts = {
-    .name          = "roberts",
-    .description   = NULL_IF_CONFIG_SMALL("Apply roberts cross operator."),
+const FFFilter ff_vf_roberts = {
+    .p.name        = "roberts",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply roberts cross operator."),
+    .p.priv_class  = &common_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ConvolutionContext),
-    .priv_class    = &common_class,
     FILTER_INPUTS(convolution_inputs),
-    FILTER_OUTPUTS(convolution_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = process_command,
 };
 
@@ -1019,15 +939,15 @@ const AVFilter ff_vf_roberts = {
 
 #if CONFIG_KIRSCH_FILTER
 
-const AVFilter ff_vf_kirsch = {
-    .name          = "kirsch",
-    .description   = NULL_IF_CONFIG_SMALL("Apply kirsch operator."),
+const FFFilter ff_vf_kirsch = {
+    .p.name        = "kirsch",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply kirsch operator."),
+    .p.priv_class  = &common_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ConvolutionContext),
-    .priv_class    = &common_class,
     FILTER_INPUTS(convolution_inputs),
-    FILTER_OUTPUTS(convolution_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = process_command,
 };
 
@@ -1035,15 +955,15 @@ const AVFilter ff_vf_kirsch = {
 
 #if CONFIG_SCHARR_FILTER
 
-const AVFilter ff_vf_scharr = {
-    .name          = "scharr",
-    .description   = NULL_IF_CONFIG_SMALL("Apply scharr operator."),
+const FFFilter ff_vf_scharr = {
+    .p.name        = "scharr",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply scharr operator."),
+    .p.priv_class  = &common_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ConvolutionContext),
-    .priv_class    = &common_class,
     FILTER_INPUTS(convolution_inputs),
-    FILTER_OUTPUTS(convolution_outputs),
+    FILTER_OUTPUTS(ff_video_default_filterpad),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_GENERIC | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = process_command,
 };
 

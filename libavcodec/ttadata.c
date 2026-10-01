@@ -18,6 +18,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <string.h>
 #include "ttadata.h"
 
 const uint32_t ff_tta_shift_1[] = {
@@ -46,7 +47,8 @@ void ff_tta_rice_init(TTARice *c, uint32_t k0, uint32_t k1)
     c->sum1 = ff_tta_shift_16[k1];
 }
 
-void ff_tta_filter_init(TTAFilter *c, int32_t shift) {
+void ff_tta_filter_init(TTAFilter *c, int32_t shift)
+{
     memset(c, 0, sizeof(TTAFilter));
     c->shift = shift;
     c->round = ff_tta_shift_1[shift-1];

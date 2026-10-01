@@ -20,13 +20,16 @@
  */
 
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
+#include "dvdsub.h"
 #include "get_bits.h"
-#include "internal.h"
 
 #include "libavutil/attributes.h"
 #include "libavutil/colorspace.h"
+#include "libavutil/file_open.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
-#include "libavutil/imgutils.h"
 #include "libavutil/bswap.h"
 
 typedef struct DVDSubContext
@@ -42,9 +45,6 @@ typedef struct DVDSubContext
   int      buf_size;
   int      forced_subs_only;
   uint8_t  used_color[256];
-#ifdef DEBUG
-  int sub_id;
-#endif
 } DVDSubContext;
 
 static void yuv_a_to_rgba(const uint8_t *ycbcr, const uint8_t *alpha, uint32_t *rgba, int num_values)
@@ -217,8 +217,8 @@ static void reset_rects(AVSubtitle *sub_header)
 
 #define READ_OFFSET(a) (big_offsets ? AV_RB32(a) : AV_RB16(a))
 
-static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
-                                const uint8_t *buf, int buf_size)
+static int decode_dvd_subtitles(void *logctx, DVDSubContext *ctx,
+                                AVSubtitle *sub_header, const uint8_t *buf, int buf_size)
 {
     int cmd_pos, pos, cmd, x1, y1, x2, y2, next_cmd_pos;
     int big_offsets, offset_size, is_8bit = 0;
@@ -248,7 +248,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
 
     if (cmd_pos < 0 || cmd_pos > buf_size - 2 - offset_size) {
         if (cmd_pos > size) {
-            av_log(ctx, AV_LOG_ERROR, "Discarding invalid packet\n");
+            av_log(logctx, AV_LOG_ERROR, "Discarding invalid packet\n");
             return 0;
         }
         return AVERROR(EAGAIN);
@@ -257,7 +257,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
     while (cmd_pos > 0 && cmd_pos < buf_size - 2 - offset_size) {
         date = AV_RB16(buf + cmd_pos);
         next_cmd_pos = READ_OFFSET(buf + cmd_pos + 2);
-        ff_dlog(NULL, "cmd_pos=0x%04x next=0x%04x date=%d\n",
+        ff_dlog(logctx, "cmd_pos=0x%04x next=0x%04x date=%d\n",
                 cmd_pos, next_cmd_pos, date);
         pos = cmd_pos + 2 + offset_size;
         offset1 = -1;
@@ -265,7 +265,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
         x1 = y1 = x2 = y2 = 0;
         while (pos < buf_size) {
             cmd = buf[pos++];
-            ff_dlog(NULL, "cmd=%02x\n", cmd);
+            ff_dlog(logctx, "cmd=%02x\n", cmd);
             switch(cmd) {
             case 0x00:
                 /* menu subpicture */
@@ -298,7 +298,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
                 alpha[1] = buf[pos + 1] >> 4;
                 alpha[0] = buf[pos + 1] & 0x0f;
                 pos += 2;
-                ff_dlog(NULL, "alpha=%x%x%x%x\n", alpha[0],alpha[1],alpha[2],alpha[3]);
+                ff_dlog(logctx, "alpha=%x%x%x%x\n", alpha[0],alpha[1],alpha[2],alpha[3]);
                 break;
             case 0x05:
             case 0x85:
@@ -310,7 +310,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
                 y2 = ((buf[pos + 4] & 0x0f) << 8) | buf[pos + 5];
                 if (cmd & 0x80)
                     is_8bit = 1;
-                ff_dlog(NULL, "x1=%d x2=%d y1=%d y2=%d\n", x1, x2, y1, y2);
+                ff_dlog(logctx, "x1=%d x2=%d y1=%d y2=%d\n", x1, x2, y1, y2);
                 pos += 6;
                 break;
             case 0x06:
@@ -318,7 +318,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
                     goto fail;
                 offset1 = AV_RB16(buf + pos);
                 offset2 = AV_RB16(buf + pos + 2);
-                ff_dlog(NULL, "offset1=0x%04"PRIx64" offset2=0x%04"PRIx64"\n", offset1, offset2);
+                ff_dlog(logctx, "offset1=0x%04"PRIx64" offset2=0x%04"PRIx64"\n", offset1, offset2);
                 pos += 4;
                 break;
             case 0x86:
@@ -326,7 +326,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
                     goto fail;
                 offset1 = AV_RB32(buf + pos);
                 offset2 = AV_RB32(buf + pos + 4);
-                ff_dlog(NULL, "offset1=0x%04"PRIx64" offset2=0x%04"PRIx64"\n", offset1, offset2);
+                ff_dlog(logctx, "offset1=0x%04"PRIx64" offset2=0x%04"PRIx64"\n", offset1, offset2);
                 pos += 8;
                 break;
 
@@ -349,7 +349,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
             case 0xff:
                 goto the_end;
             default:
-                ff_dlog(NULL, "unrecognised subpicture command 0x%x\n", cmd);
+                ff_dlog(logctx, "unrecognised subpicture command 0x%x\n", cmd);
                 goto the_end;
             }
         }
@@ -400,7 +400,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
                 } else {
                     sub_header->rects[0]->nb_colors = 4;
                     guess_palette(ctx, (uint32_t*)sub_header->rects[0]->data[1],
-                                  0xffff00);
+                                  0xffffff);
                 }
                 sub_header->rects[0]->x = x1;
                 sub_header->rects[0]->y = y1;
@@ -412,7 +412,7 @@ static int decode_dvd_subtitles(DVDSubContext *ctx, AVSubtitle *sub_header,
             }
         }
         if (next_cmd_pos < cmd_pos) {
-            av_log(ctx, AV_LOG_ERROR, "Invalid command offset\n");
+            av_log(logctx, AV_LOG_ERROR, "Invalid command offset\n");
             break;
         }
         if (next_cmd_pos == cmd_pos)
@@ -498,38 +498,6 @@ static int find_smallest_bounding_rectangle(DVDSubContext *ctx, AVSubtitle *s)
     return 1;
 }
 
-#ifdef DEBUG
-#define ALPHA_MIX(A,BACK,FORE) (((255-(A)) * (BACK) + (A) * (FORE)) / 255)
-static void ppm_save(const char *filename, uint8_t *bitmap, int w, int h,
-                     uint32_t *rgba_palette)
-{
-    int x, y, alpha;
-    uint32_t v;
-    int back[3] = {0, 255, 0};  /* green background */
-    FILE *f;
-
-    f = fopen(filename, "w");
-    if (!f) {
-        perror(filename);
-        return;
-    }
-    fprintf(f, "P6\n"
-            "%d %d\n"
-            "%d\n",
-            w, h, 255);
-    for(y = 0; y < h; y++) {
-        for(x = 0; x < w; x++) {
-            v = rgba_palette[bitmap[y * w + x]];
-            alpha = v >> 24;
-            putc(ALPHA_MIX(alpha, back[0], (v >> 16) & 0xff), f);
-            putc(ALPHA_MIX(alpha, back[1], (v >> 8) & 0xff), f);
-            putc(ALPHA_MIX(alpha, back[2], (v >> 0) & 0xff), f);
-        }
-    }
-    fclose(f);
-}
-#endif
-
 static int append_to_cached_buf(AVCodecContext *avctx,
                                 const uint8_t *buf, int buf_size)
 {
@@ -547,14 +515,12 @@ static int append_to_cached_buf(AVCodecContext *avctx,
     return 0;
 }
 
-static int dvdsub_decode(AVCodecContext *avctx,
-                         void *data, int *data_size,
-                         AVPacket *avpkt)
+static int dvdsub_decode(AVCodecContext *avctx, AVSubtitle *sub,
+                         int *data_size, const AVPacket *avpkt)
 {
     DVDSubContext *ctx = avctx->priv_data;
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
-    AVSubtitle *sub = data;
     int appended = 0;
     int is_menu;
 
@@ -569,7 +535,7 @@ static int dvdsub_decode(AVCodecContext *avctx,
         appended = 1;
     }
 
-    is_menu = decode_dvd_subtitles(ctx, sub, buf, buf_size);
+    is_menu = decode_dvd_subtitles(avctx, ctx, sub, buf, buf_size);
     if (is_menu == AVERROR(EAGAIN)) {
         *data_size = 0;
         return appended ? 0 : append_to_cached_buf(avctx, buf, buf_size);
@@ -589,25 +555,12 @@ static int dvdsub_decode(AVCodecContext *avctx,
     if (ctx->forced_subs_only && !(sub->rects[0]->flags & AV_SUBTITLE_FLAG_FORCED))
         goto no_subtitle;
 
-#if defined(DEBUG)
-    {
-    char ppm_name[32];
-
-    snprintf(ppm_name, sizeof(ppm_name), "/tmp/%05d.ppm", ctx->sub_id++);
-    ff_dlog(NULL, "start=%d ms end =%d ms\n",
-            sub->start_display_time,
-            sub->end_display_time);
-    ppm_save(ppm_name, sub->rects[0]->data[0],
-             sub->rects[0]->w, sub->rects[0]->h, (uint32_t*) sub->rects[0]->data[1]);
-    }
-#endif
-
     ctx->buf_size = 0;
     *data_size = 1;
     return buf_size;
 }
 
-static int parse_ifo_palette(DVDSubContext *ctx, char *p)
+static int parse_ifo_palette(void *logctx, DVDSubContext *ctx, char *p)
 {
     FILE *ifo;
     char ifostr[12];
@@ -618,12 +571,12 @@ static int parse_ifo_palette(DVDSubContext *ctx, char *p)
     const uint8_t *cm = ff_crop_tab + MAX_NEG_CROP;
 
     ctx->has_palette = 0;
-    if ((ifo = fopen(p, "r")) == NULL) {
-        av_log(ctx, AV_LOG_WARNING, "Unable to open IFO file \"%s\": %s\n", p, av_err2str(AVERROR(errno)));
+    if ((ifo = avpriv_fopen_utf8(p, "r")) == NULL) {
+        av_log(logctx, AV_LOG_WARNING, "Unable to open IFO file \"%s\": %s\n", p, av_err2str(AVERROR(errno)));
         return AVERROR_EOF;
     }
     if (fread(ifostr, 12, 1, ifo) != 1 || memcmp(ifostr, "DVDVIDEO-VTS", 12)) {
-        av_log(ctx, AV_LOG_WARNING, "\"%s\" is not a proper IFO file\n", p);
+        av_log(logctx, AV_LOG_WARNING, "\"%s\" is not a proper IFO file\n", p);
         ret = AVERROR_INVALIDDATA;
         goto end;
     }
@@ -659,7 +612,7 @@ static int parse_ifo_palette(DVDSubContext *ctx, char *p)
         }
     }
     if (ctx->has_palette == 0) {
-        av_log(ctx, AV_LOG_WARNING, "Failed to read palette from IFO file \"%s\"\n", p);
+        av_log(logctx, AV_LOG_WARNING, "Failed to read palette from IFO file \"%s\"\n", p);
         ret = AVERROR_INVALIDDATA;
     }
 end:
@@ -671,10 +624,10 @@ static int dvdsub_parse_extradata(AVCodecContext *avctx)
 {
     DVDSubContext *ctx = (DVDSubContext*) avctx->priv_data;
     char *dataorig, *data;
-    int ret = 1;
+    int ret;
 
     if (!avctx->extradata || !avctx->extradata_size)
-        return 1;
+        return 0;
 
     dataorig = data = av_malloc(avctx->extradata_size+1);
     if (!data)
@@ -703,6 +656,7 @@ static int dvdsub_parse_extradata(AVCodecContext *avctx)
         data += strspn(data, "\n\r");
     }
 
+    ret = 0;
 fail:
     av_free(dataorig);
     return ret;
@@ -717,7 +671,7 @@ static av_cold int dvdsub_init(AVCodecContext *avctx)
         return ret;
 
     if (ctx->ifo_str)
-        parse_ifo_palette(ctx, ctx->ifo_str);
+        parse_ifo_palette(avctx, ctx, ctx->ifo_str);
     if (ctx->palette_str) {
         ctx->has_palette = 1;
         ff_dvdsub_parse_palette(ctx->palette, ctx->palette_str);
@@ -730,10 +684,10 @@ static av_cold int dvdsub_init(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_DEBUG, "\n");
     }
 
-    return 1;
+    return 0;
 }
 
-static void dvdsub_flush(AVCodecContext *avctx)
+static av_cold void dvdsub_flush(AVCodecContext *avctx)
 {
     DVDSubContext *ctx = avctx->priv_data;
     ctx->buf_size = 0;
@@ -754,15 +708,14 @@ static const AVClass dvdsub_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-const AVCodec ff_dvdsub_decoder = {
-    .name           = "dvdsub",
-    .long_name      = NULL_IF_CONFIG_SMALL("DVD subtitles"),
-    .type           = AVMEDIA_TYPE_SUBTITLE,
-    .id             = AV_CODEC_ID_DVD_SUBTITLE,
+const FFCodec ff_dvdsub_decoder = {
+    .p.name         = "dvdsub",
+    CODEC_LONG_NAME("DVD subtitles"),
+    .p.type         = AVMEDIA_TYPE_SUBTITLE,
+    .p.id           = AV_CODEC_ID_DVD_SUBTITLE,
     .priv_data_size = sizeof(DVDSubContext),
     .init           = dvdsub_init,
-    .decode         = dvdsub_decode,
+    FF_CODEC_DECODE_SUB_CB(dvdsub_decode),
     .flush          = dvdsub_flush,
-    .priv_class     = &dvdsub_class,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    .p.priv_class   = &dvdsub_class,
 };

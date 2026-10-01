@@ -16,11 +16,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
+#include "audio.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
+#include "video.h"
 
 enum BenchAction {
     ACTION_START,
@@ -39,9 +42,9 @@ typedef struct BenchContext {
 #define OFFSET(x) offsetof(BenchContext, x)
 #define DEFINE_OPTIONS(filt_name, FLAGS)                                                                                \
 static const AVOption filt_name##_options[] = {                                                                         \
-    { "action", "set action", OFFSET(action), AV_OPT_TYPE_INT, {.i64=ACTION_START}, 0, NB_ACTION-1, FLAGS, "action" },  \
-        { "start", "start timer",  0, AV_OPT_TYPE_CONST, {.i64=ACTION_START}, INT_MIN, INT_MAX, FLAGS, "action" },      \
-        { "stop",  "stop timer",   0, AV_OPT_TYPE_CONST, {.i64=ACTION_STOP},  INT_MIN, INT_MAX, FLAGS, "action" },      \
+    { "action", "set action", OFFSET(action), AV_OPT_TYPE_INT, {.i64=ACTION_START}, 0, NB_ACTION-1, FLAGS, .unit = "action" },  \
+        { "start", "start timer",  0, AV_OPT_TYPE_CONST, {.i64=ACTION_START}, INT_MIN, INT_MAX, FLAGS, .unit = "action" },      \
+        { "stop",  "stop timer",   0, AV_OPT_TYPE_CONST, {.i64=ACTION_STOP},  INT_MIN, INT_MAX, FLAGS, .unit = "action" },      \
     { NULL }                                                                                                            \
 }
 
@@ -77,7 +80,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             s->n++;
             s->min = FFMIN(s->min, diff);
             s->max = FFMAX(s->max, diff);
-            av_log(s, AV_LOG_INFO, "t:%f avg:%f max:%f min:%f\n",
+            av_log(ctx, AV_LOG_INFO, "t:%f avg:%f max:%f min:%f\n",
                    T2F(diff), T2F(s->sum / s->n), T2F(s->max), T2F(s->min));
         }
         av_dict_set(&in->metadata, START_TIME_KEY, NULL, 0);
@@ -98,22 +101,15 @@ static const AVFilterPad bench_inputs[] = {
     },
 };
 
-static const AVFilterPad bench_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_VIDEO,
-    },
-};
-
-const AVFilter ff_vf_bench = {
-    .name          = "bench",
-    .description   = NULL_IF_CONFIG_SMALL("Benchmark part of a filtergraph."),
+const FFFilter ff_vf_bench = {
+    .p.name        = "bench",
+    .p.description = NULL_IF_CONFIG_SMALL("Benchmark part of a filtergraph."),
+    .p.priv_class  = &bench_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(BenchContext),
     .init          = init,
     FILTER_INPUTS(bench_inputs),
-    FILTER_OUTPUTS(bench_outputs),
-    .priv_class    = &bench_class,
-    .flags         = AVFILTER_FLAG_METADATA_ONLY,
+    FILTER_OUTPUTS(ff_video_default_filterpad),
 };
 #endif /* CONFIG_BENCH_FILTER */
 
@@ -129,21 +125,14 @@ static const AVFilterPad abench_inputs[] = {
     },
 };
 
-static const AVFilterPad abench_outputs[] = {
-    {
-        .name = "default",
-        .type = AVMEDIA_TYPE_AUDIO,
-    },
-};
-
-const AVFilter ff_af_abench = {
-    .name          = "abench",
-    .description   = NULL_IF_CONFIG_SMALL("Benchmark part of a filtergraph."),
+const FFFilter ff_af_abench = {
+    .p.name        = "abench",
+    .p.description = NULL_IF_CONFIG_SMALL("Benchmark part of a filtergraph."),
+    .p.priv_class  = &abench_class,
+    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
     .priv_size     = sizeof(BenchContext),
     .init          = init,
     FILTER_INPUTS(abench_inputs),
-    FILTER_OUTPUTS(abench_outputs),
-    .priv_class    = &abench_class,
-    .flags         = AVFILTER_FLAG_METADATA_ONLY,
+    FILTER_OUTPUTS(ff_audio_default_filterpad),
 };
 #endif /* CONFIG_ABENCH_FILTER */

@@ -21,13 +21,17 @@
  * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
+
+#include "config_components.h"
+
 #include <limits.h>
 
 #include "libavutil/channel_layout.h"
 #include "libavutil/opt.h"
 #include "avcodec.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "encode.h"
-#include "internal.h"
 #include "get_bits.h"
 #include "put_bits.h"
 
@@ -55,12 +59,10 @@ static inline Float11* i2f(int i, Float11* f)
 
 static inline int16_t mult(Float11* f1, Float11* f2)
 {
-        int res, exp;
-
-        exp = f1->exp + f2->exp;
-        res = (((f1->mant * f2->mant) + 0x30) >> 4);
-        res = exp > 19 ? res << (exp - 19) : res >> (19 - exp);
-        return (f1->sign ^ f2->sign) ? -res : res;
+    int exp = f1->exp + f2->exp;
+    int res = (((f1->mant * f2->mant) + 0x30) >> 4);
+    res = exp > 19 ? res << (exp - 19) : res >> (19 - exp);
+    return (f1->sign ^ f2->sign) ? -res : res;
 }
 
 static inline int sgn(int value)
@@ -273,7 +275,7 @@ static int16_t g726_decode(G726Context* c, int I)
     return av_clip(re_signal * 4, -0xffff, 0xffff);
 }
 
-static av_cold int g726_reset(G726Context *c)
+static av_cold void g726_reset(G726Context *c)
 {
     int i;
 
@@ -289,8 +291,6 @@ static av_cold int g726_reset(G726Context *c)
     c->yl = 34816;
 
     c->y = 544;
-
-    return 0;
 }
 
 #if CONFIG_ADPCM_G726_ENCODER || CONFIG_ADPCM_G726LE_ENCODER
@@ -298,7 +298,7 @@ static int16_t g726_encode(G726Context* c, int16_t sig)
 {
     uint8_t i;
 
-    i = av_mod_uintp2(quant(c, sig/4 - c->se), c->code_size);
+    i = av_zero_extend(quant(c, sig/4 - c->se), c->code_size);
     g726_decode(c, i);
     return i;
 }
@@ -318,13 +318,8 @@ static av_cold int g726_encode_init(AVCodecContext *avctx)
                "Resample or reduce the compliance level.\n");
         return AVERROR(EINVAL);
     }
-    if (avctx->sample_rate <= 0) {
-        av_log(avctx, AV_LOG_ERROR, "Invalid sample rate %d\n",
-               avctx->sample_rate);
-        return AVERROR(EINVAL);
-    }
 
-    if(avctx->channels != 1){
+    if (avctx->ch_layout.nb_channels != 1) {
         av_log(avctx, AV_LOG_ERROR, "Only mono is supported\n");
         return AVERROR(EINVAL);
     }
@@ -389,45 +384,43 @@ static const AVClass g726_class = {
     .version    = LIBAVUTIL_VERSION_INT,
 };
 
-static const AVCodecDefault defaults[] = {
+static const FFCodecDefault defaults[] = {
     { "b", "0" },
     { NULL },
 };
 #endif
 
 #if CONFIG_ADPCM_G726_ENCODER
-const AVCodec ff_adpcm_g726_encoder = {
-    .name           = "g726",
-    .long_name      = NULL_IF_CONFIG_SMALL("G.726 ADPCM"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_ADPCM_G726,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SMALL_LAST_FRAME,
+const FFCodec ff_adpcm_g726_encoder = {
+    .p.name         = "g726",
+    CODEC_LONG_NAME("G.726 ADPCM"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_ADPCM_G726,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SMALL_LAST_FRAME |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(G726Context),
     .init           = g726_encode_init,
-    .encode2        = g726_encode_frame,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
-                                                     AV_SAMPLE_FMT_NONE },
-    .priv_class     = &g726_class,
+    FF_CODEC_ENCODE_CB(g726_encode_frame),
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16),
+    .p.priv_class   = &g726_class,
     .defaults       = defaults,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
 };
 #endif
 
 #if CONFIG_ADPCM_G726LE_ENCODER
-const AVCodec ff_adpcm_g726le_encoder = {
-    .name           = "g726le",
-    .long_name      = NULL_IF_CONFIG_SMALL("G.726 little endian ADPCM (\"right-justified\")"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_ADPCM_G726LE,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SMALL_LAST_FRAME,
+const FFCodec ff_adpcm_g726le_encoder = {
+    .p.name         = "g726le",
+    CODEC_LONG_NAME("G.726 little endian ADPCM (\"right-justified\")"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_ADPCM_G726LE,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_SMALL_LAST_FRAME |
+                      AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
     .priv_data_size = sizeof(G726Context),
     .init           = g726_encode_init,
-    .encode2        = g726_encode_frame,
-    .sample_fmts    = (const enum AVSampleFormat[]){ AV_SAMPLE_FMT_S16,
-                                                     AV_SAMPLE_FMT_NONE },
-    .priv_class     = &g726_class,
+    FF_CODEC_ENCODE_CB(g726_encode_frame),
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16),
+    .p.priv_class   = &g726_class,
     .defaults       = defaults,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
 };
 #endif
 
@@ -436,12 +429,12 @@ static av_cold int g726_decode_init(AVCodecContext *avctx)
 {
     G726Context* c = avctx->priv_data;
 
-    if(avctx->channels > 1){
+    if (avctx->ch_layout.nb_channels > 1){
         avpriv_request_sample(avctx, "Decoding more than one channel");
         return AVERROR_PATCHWELCOME;
     }
-    avctx->channels       = 1;
-    avctx->channel_layout = AV_CH_LAYOUT_MONO;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout      = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
     c->little_endian = !strcmp(avctx->codec->name, "g726le");
 
@@ -453,14 +446,15 @@ static av_cold int g726_decode_init(AVCodecContext *avctx)
     g726_reset(c);
 
     avctx->sample_fmt = AV_SAMPLE_FMT_S16;
+    if (!avctx->sample_rate)
+        avctx->sample_rate = 8000;
 
     return 0;
 }
 
-static int g726_decode_frame(AVCodecContext *avctx, void *data,
+static int g726_decode_frame(AVCodecContext *avctx, AVFrame *frame,
                              int *got_frame_ptr, AVPacket *avpkt)
 {
-    AVFrame *frame     = data;
     const uint8_t *buf = avpkt->data;
     int buf_size = avpkt->size;
     G726Context *c = avctx->priv_data;
@@ -499,31 +493,29 @@ static void g726_decode_flush(AVCodecContext *avctx)
 #endif
 
 #if CONFIG_ADPCM_G726_DECODER
-const AVCodec ff_adpcm_g726_decoder = {
-    .name           = "g726",
-    .long_name      = NULL_IF_CONFIG_SMALL("G.726 ADPCM"),
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_ADPCM_G726,
+const FFCodec ff_adpcm_g726_decoder = {
+    .p.name         = "g726",
+    CODEC_LONG_NAME("G.726 ADPCM"),
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_ADPCM_G726,
     .priv_data_size = sizeof(G726Context),
     .init           = g726_decode_init,
-    .decode         = g726_decode_frame,
+    FF_CODEC_DECODE_CB(g726_decode_frame),
     .flush          = g726_decode_flush,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
 };
 #endif
 
 #if CONFIG_ADPCM_G726LE_DECODER
-const AVCodec ff_adpcm_g726le_decoder = {
-    .name           = "g726le",
-    .type           = AVMEDIA_TYPE_AUDIO,
-    .id             = AV_CODEC_ID_ADPCM_G726LE,
+const FFCodec ff_adpcm_g726le_decoder = {
+    .p.name         = "g726le",
+    .p.type         = AVMEDIA_TYPE_AUDIO,
+    .p.id           = AV_CODEC_ID_ADPCM_G726LE,
     .priv_data_size = sizeof(G726Context),
     .init           = g726_decode_init,
-    .decode         = g726_decode_frame,
+    FF_CODEC_DECODE_CB(g726_decode_frame),
     .flush          = g726_decode_flush,
-    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
-    .long_name      = NULL_IF_CONFIG_SMALL("G.726 ADPCM little-endian"),
-    .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE,
+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_CHANNEL_CONF,
+    CODEC_LONG_NAME("G.726 ADPCM little-endian"),
 };
 #endif

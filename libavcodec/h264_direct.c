@@ -25,17 +25,16 @@
  * @author Michael Niedermayer <michaelni@gmx.at>
  */
 
-#include "internal.h"
 #include "avcodec.h"
 #include "h264dec.h"
 #include "h264_ps.h"
 #include "mpegutils.h"
 #include "rectangle.h"
-#include "thread.h"
+#include "threadframe.h"
 
 #include <assert.h>
 
-static int get_scale_factor(H264SliceContext *sl,
+static int get_scale_factor(const H264SliceContext *sl,
                             int poc, int poc1, int i)
 {
     int poc0 = sl->ref_list[0][i].poc;
@@ -84,7 +83,7 @@ static void fill_colmap(const H264Context *h, H264SliceContext *sl,
                         int map[2][16 + 32], int list,
                         int field, int colfield, int mbafi)
 {
-    H264Picture *const ref1 = sl->ref_list[1][0].parent;
+    const H264Picture *const ref1 = sl->ref_list[1][0].parent;
     int j, old_ref, rfield;
     int start  = mbafi ? 16                       : 0;
     int end    = mbafi ? 16 + 2 * sl->ref_count[0] : sl->ref_count[0];
@@ -122,26 +121,30 @@ void ff_h264_direct_ref_list_init(const H264Context *const h, H264SliceContext *
 {
     H264Ref *const ref1 = &sl->ref_list[1][0];
     H264Picture *const cur = h->cur_pic_ptr;
-    int list, j, field;
+    int list, field;
     int sidx     = (h->picture_structure & 1) ^ 1;
     int ref1sidx = (ref1->reference      & 1) ^ 1;
 
-    for (list = 0; list < sl->list_count; list++) {
-        cur->ref_count[sidx][list] = sl->ref_count[list];
-        for (j = 0; j < sl->ref_count[list]; j++)
-            cur->ref_poc[sidx][list][j] = 4 * sl->ref_list[list][j].parent->frame_num +
-                                          (sl->ref_list[list][j].reference & 3);
-    }
+    /* Updates to cur_pic are not safe once ff_thread_finish_setup() has been
+     * called (other threads may already be reading these fields). */
+    if (!h->setup_finished) {
+        for (list = 0; list < sl->list_count; list++) {
+            cur->ref_count[sidx][list] = sl->ref_count[list];
+            for (int j = 0; j < sl->ref_count[list]; j++)
+                cur->ref_poc[sidx][list][j] = 4 * sl->ref_list[list][j].parent->frame_num +
+                                                 (sl->ref_list[list][j].reference & 3);
+        }
 
-    if (h->picture_structure == PICT_FRAME) {
-        memcpy(cur->ref_count[1], cur->ref_count[0], sizeof(cur->ref_count[0]));
-        memcpy(cur->ref_poc[1],   cur->ref_poc[0],   sizeof(cur->ref_poc[0]));
-    }
+        if (h->picture_structure == PICT_FRAME) {
+            memcpy(cur->ref_count[1], cur->ref_count[0], sizeof(cur->ref_count[0]));
+            memcpy(cur->ref_poc[1],   cur->ref_poc[0],   sizeof(cur->ref_poc[0]));
+        }
 
-    if (h->current_slice == 0) {
-        cur->mbaff = FRAME_MBAFF(h);
-    } else {
-        av_assert0(cur->mbaff == FRAME_MBAFF(h));
+        if (h->current_slice == 0) {
+            cur->mbaff = FRAME_MBAFF(h);
+        } else {
+            av_assert0(cur->mbaff == FRAME_MBAFF(h));
+        }
     }
 
     sl->col_fieldoff = 0;
@@ -151,7 +154,7 @@ void ff_h264_direct_ref_list_init(const H264Context *const h, H264SliceContext *
 
     if (h->picture_structure == PICT_FRAME) {
         int cur_poc  = h->cur_pic_ptr->poc;
-        int *col_poc = sl->ref_list[1][0].parent->field_poc;
+        const int *col_poc = sl->ref_list[1][0].parent->field_poc;
         if (col_poc[0] == INT_MAX && col_poc[1] == INT_MAX) {
             av_log(h->avctx, AV_LOG_ERROR, "co located POCs unavailable\n");
             sl->col_parity = 1;
@@ -181,20 +184,25 @@ void ff_h264_direct_ref_list_init(const H264Context *const h, H264SliceContext *
 static void await_reference_mb_row(const H264Context *const h, H264Ref *ref,
                                    int mb_y)
 {
+    if (!HAVE_THREADS || !(h->avctx->active_thread_type & FF_THREAD_FRAME))
+        return;
+
     int ref_field         = ref->reference - 1;
     int ref_field_picture = ref->parent->field_picture;
     int ref_height        = 16 * h->mb_height >> ref_field_picture;
-
-    if (!HAVE_THREADS || !(h->avctx->active_thread_type & FF_THREAD_FRAME))
-        return;
+    int row               = FFMIN(16 * mb_y >> ref_field_picture, ref_height - 1);
 
     /* FIXME: It can be safe to access mb stuff
      * even if pixels aren't deblocked yet. */
 
-    ff_thread_await_progress(&ref->parent->tf,
-                             FFMIN(16 * mb_y >> ref_field_picture,
-                                   ref_height - 1),
+    ff_thread_await_progress(&ref->parent->tf, row,
                              ref_field_picture && ref_field);
+
+    /* A frame references a field pair as a whole, so the wait above covers
+     * its bottom field only, while the colocated data is read from the field
+     * selected by col_parity. The two are decoded by different threads. */
+    if (ref_field_picture && !FIELD_PICTURE(h))
+        ff_thread_await_progress(&ref->parent->tf, row, 0);
 }
 
 static void pred_spatial_direct_motion(const H264Context *const h, H264SliceContext *sl,
@@ -284,7 +292,8 @@ static void pred_spatial_direct_motion(const H264Context *const h, H264SliceCont
         return;
     }
 
-    if (IS_INTERLACED(sl->ref_list[1][0].parent->mb_type[mb_xy])) { // AFL/AFR/FR/FL -> AFL/FL
+    if (sl->ref_list[1][0].parent->field_picture ||
+        IS_INTERLACED(sl->ref_list[1][0].parent->mb_type[mb_xy])) { // AFL/AFR/FR/FL -> AFL/FL
         if (!IS_INTERLACED(*mb_type)) {                    //     AFR/FR    -> AFL/FL
             mb_y  = (sl->mb_y & ~1) + sl->col_parity;
             mb_xy = sl->mb_x +
@@ -502,7 +511,8 @@ static void pred_temp_direct_motion(const H264Context *const h, H264SliceContext
     await_reference_mb_row(h, &sl->ref_list[1][0],
                            sl->mb_y + !!IS_INTERLACED(*mb_type));
 
-    if (IS_INTERLACED(sl->ref_list[1][0].parent->mb_type[mb_xy])) { // AFL/AFR/FR/FL -> AFL/FL
+    if (sl->ref_list[1][0].parent->field_picture ||
+        IS_INTERLACED(sl->ref_list[1][0].parent->mb_type[mb_xy])) { // AFL/AFR/FR/FL -> AFL/FL
         if (!IS_INTERLACED(*mb_type)) {                    //     AFR/FR    -> AFL/FL
             mb_y  = (sl->mb_y & ~1) + sl->col_parity;
             mb_xy = sl->mb_x +

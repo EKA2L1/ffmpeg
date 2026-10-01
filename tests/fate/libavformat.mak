@@ -2,6 +2,16 @@
 #fate-async: libavformat/tests/async$(EXESUF)
 #fate-async: CMD = run libavformat/tests/async
 
+FATE_LIBAVFORMAT += fate-mkdir
+fate-mkdir: libavformat/tests/mkdir$(EXESUF)
+fate-mkdir: CMD = run libavformat/tests/mkdir$(EXESUF)
+fate-mkdir: CMP = null
+
+FATE_LIBAVFORMAT += fate-rename
+fate-rename: libavformat/tests/rename$(EXESUF)
+fate-rename: CMD = run libavformat/tests/rename$(EXESUF)
+fate-rename: CMP = null
+
 FATE_LIBAVFORMAT-$(CONFIG_NETWORK) += fate-noproxy
 fate-noproxy: libavformat/tests/noproxy$(EXESUF)
 fate-noproxy: CMD = run libavformat/tests/noproxy$(EXESUF)
@@ -18,13 +28,18 @@ FATE_LIBAVFORMAT-yes += fate-url
 fate-url: libavformat/tests/url$(EXESUF)
 fate-url: CMD = run libavformat/tests/url$(EXESUF)
 
-FATE_LIBAVFORMAT-$(CONFIG_MOV_MUXER) += fate-movenc
+FATE_LIBAVFORMAT-$(call ALLYES, MP4_MUXER ISMV_MUXER) += fate-movenc
 fate-movenc: libavformat/tests/movenc$(EXESUF)
 fate-movenc: CMD = run libavformat/tests/movenc$(EXESUF)
 
 FATE_LIBAVFORMAT-$(CONFIG_IMF_DEMUXER) += fate-imf
 fate-imf: libavformat/tests/imf$(EXESUF)
 fate-imf: CMD = run libavformat/tests/imf$(EXESUF)
+
+FATE_LIBAVFORMAT += fate-seek_utils
+fate-seek_utils: libavformat/tests/seek_utils$(EXESUF)
+fate-seek_utils: CMD = run libavformat/tests/seek_utils$(EXESUF)
+fate-seek_utils: CMP = null
 
 FATE_LIBAVFORMAT-$(call ALLYES, EPOC_DEMUXER PCM_ALAW_DECODER) += fate-epoc
 fate-epoc: libavformat/tests/epoc$(EXESUF)

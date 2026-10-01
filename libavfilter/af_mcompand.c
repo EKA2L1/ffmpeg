@@ -30,11 +30,12 @@
 
 #include "libavutil/avstring.h"
 #include "libavutil/ffmath.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/samplefmt.h"
 #include "audio.h"
 #include "avfilter.h"
-#include "internal.h"
+#include "filters.h"
 
 typedef struct CompandSegment {
     double x, y;
@@ -302,7 +303,7 @@ static int crossover_setup(AVFilterLink *outlink, Crossover *p, double frequency
     square_quadratic(x + 3, p->coefs + 5);
     square_quadratic(x + 6, p->coefs + 10);
 
-    p->previous = av_calloc(outlink->channels, sizeof(*p->previous));
+    p->previous = av_calloc(outlink->ch_layout.nb_channels, sizeof(*p->previous));
     if (!p->previous)
         return AVERROR(ENOMEM);
 
@@ -350,13 +351,13 @@ static int config_output(AVFilterLink *outlink)
             return AVERROR(EINVAL);
         }
 
-        s->bands[i].attack_rate = av_calloc(outlink->channels, sizeof(double));
-        s->bands[i].decay_rate = av_calloc(outlink->channels, sizeof(double));
-        s->bands[i].volume = av_calloc(outlink->channels, sizeof(double));
+        s->bands[i].attack_rate = av_calloc(outlink->ch_layout.nb_channels, sizeof(double));
+        s->bands[i].decay_rate = av_calloc(outlink->ch_layout.nb_channels, sizeof(double));
+        s->bands[i].volume = av_calloc(outlink->ch_layout.nb_channels, sizeof(double));
         if (!s->bands[i].attack_rate || !s->bands[i].decay_rate || !s->bands[i].volume)
             return AVERROR(ENOMEM);
 
-        for (k = 0; k < FFMIN(nb_attacks / 2, outlink->channels); k++) {
+        for (k = 0; k < FFMIN(nb_attacks / 2, outlink->ch_layout.nb_channels); k++) {
             char *tstr3 = av_strtok(p3, ",", &saveptr3);
 
             p3 = NULL;
@@ -377,7 +378,7 @@ static int config_output(AVFilterLink *outlink)
             }
         }
 
-        for (ch = k; ch < outlink->channels; ch++) {
+        for (ch = k; ch < outlink->ch_layout.nb_channels; ch++) {
             s->bands[i].attack_rate[ch] = s->bands[i].attack_rate[k - 1];
             s->bands[i].decay_rate[ch]  = s->bands[i].decay_rate[k - 1];
         }
@@ -417,8 +418,8 @@ static int config_output(AVFilterLink *outlink)
         }
 
         new_nb_items += sscanf(tstr2, "%lf", &s->bands[i].topfreq) == 1;
-        if (s->bands[i].topfreq < 0 || s->bands[i].topfreq >= outlink->sample_rate / 2) {
-            av_log(ctx, AV_LOG_ERROR, "crossover_frequency: %f, should be >=0 and lower than half of sample rate: %d.\n", s->bands[i].topfreq, outlink->sample_rate / 2);
+        if (s->bands[i].topfreq < 0 || s->bands[i].topfreq >= outlink->sample_rate / 2.0) {
+            av_log(ctx, AV_LOG_ERROR, "crossover_frequency: %f, should be >=0 and lower than half of sample rate: %f.\n", s->bands[i].topfreq, outlink->sample_rate / 2.0);
             return AVERROR(EINVAL);
         }
 
@@ -440,7 +441,7 @@ static int config_output(AVFilterLink *outlink)
                 sscanf(tstr2, "%lf", &initial_volume);
                 initial_volume = pow(10.0, initial_volume / 20);
 
-                for (k = 0; k < outlink->channels; k++) {
+                for (k = 0; k < outlink->ch_layout.nb_channels; k++) {
                     s->bands[i].volume[k] = initial_volume;
                 }
 
@@ -574,7 +575,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         s->band_samples = in->nb_samples;
     }
 
-    for (ch = 0; ch < outlink->channels; ch++) {
+    for (ch = 0; ch < outlink->ch_layout.nb_channels; ch++) {
         double *a, *dst = (double *)out->extended_data[ch];
 
         for (band = 0, abuf = in, bbuf = s->band_buf2, cbuf = s->band_buf1; band < s->nb_bands; band++) {
@@ -633,12 +634,12 @@ static const AVFilterPad mcompand_outputs[] = {
 };
 
 
-const AVFilter ff_af_mcompand = {
-    .name           = "mcompand",
-    .description    = NULL_IF_CONFIG_SMALL(
+const FFFilter ff_af_mcompand = {
+    .p.name         = "mcompand",
+    .p.description  = NULL_IF_CONFIG_SMALL(
             "Multiband Compress or expand audio dynamic range."),
+    .p.priv_class   = &mcompand_class,
     .priv_size      = sizeof(MCompandContext),
-    .priv_class     = &mcompand_class,
     .uninit         = uninit,
     FILTER_INPUTS(mcompand_inputs),
     FILTER_OUTPUTS(mcompand_outputs),

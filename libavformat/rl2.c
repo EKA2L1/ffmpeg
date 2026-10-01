@@ -36,7 +36,9 @@
 
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/mem.h"
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 #define EXTRADATA1_SIZE (6 + 256 * 3) ///< video base, clr, palette
@@ -147,12 +149,12 @@ static av_cold int rl2_read_header(AVFormatContext *s)
         st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
         st->codecpar->codec_id = AV_CODEC_ID_PCM_U8;
         st->codecpar->codec_tag = 1;
-        st->codecpar->channels = channels;
+        st->codecpar->ch_layout.nb_channels = channels;
         st->codecpar->bits_per_coded_sample = 8;
         st->codecpar->sample_rate = rate;
-        st->codecpar->bit_rate = st->codecpar->channels * st->codecpar->sample_rate *
+        st->codecpar->bit_rate = channels * st->codecpar->sample_rate *
             st->codecpar->bits_per_coded_sample;
-        st->codecpar->block_align = st->codecpar->channels *
+        st->codecpar->block_align = channels *
             st->codecpar->bits_per_coded_sample / 8;
         avpriv_set_pts_info(st,32,1,rate);
     }
@@ -257,7 +259,7 @@ static int rl2_read_packet(AVFormatContext *s,
     /** fill the packet */
     ret = av_get_packet(pb, pkt, sample->size);
     if(ret != sample->size){
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     }
 
     pkt->stream_index = stream_id;
@@ -301,9 +303,9 @@ static int rl2_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp
     return 0;
 }
 
-const AVInputFormat ff_rl2_demuxer = {
-    .name           = "rl2",
-    .long_name      = NULL_IF_CONFIG_SMALL("RL2"),
+const FFInputFormat ff_rl2_demuxer = {
+    .p.name         = "rl2",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("RL2"),
     .priv_data_size = sizeof(Rl2DemuxContext),
     .read_probe     = rl2_probe,
     .read_header    = rl2_read_header,

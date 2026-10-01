@@ -19,8 +19,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/mem.h"
 #include "bytestream.h"
-#include "internal.h"
+#include "codec_internal.h"
+#include "decode.h"
 
 enum PsdCompr {
     PSD_RAW,
@@ -50,6 +52,7 @@ typedef struct PSDContext {
 
     uint16_t channel_count;
     uint16_t channel_depth;
+    uint16_t primary_channels;
 
     uint64_t uncompressed_size;
     unsigned int pixel_size;/* 1 for 8 bits, 2 for 16 bits */
@@ -57,6 +60,8 @@ typedef struct PSDContext {
 
     int width;
     int height;
+
+    int16_t layer_count;
 
     enum PsdCompr compression;
     enum PsdColorMode color_mode;
@@ -171,10 +176,10 @@ static int decode_header(PSDContext * s)
     }
     bytestream2_skip(&s->gb, len_section);
 
-    /* image ressources */
+    /* image resources */
     len_section = bytestream2_get_be32(&s->gb);
     if (len_section < 0) {
-        av_log(s->avctx, AV_LOG_ERROR, "Negative size for image ressources section.\n");
+        av_log(s->avctx, AV_LOG_ERROR, "Negative size for image resources section.\n");
         return AVERROR_INVALIDDATA;
     }
 
@@ -189,6 +194,13 @@ static int decode_header(PSDContext * s)
     if (len_section < 0) {
         av_log(s->avctx, AV_LOG_ERROR, "Negative size for layers and masks data section.\n");
         return AVERROR_INVALIDDATA;
+    }
+
+    if (len_section >= 6) {
+        /* layer count (in layers and masks section) */
+        bytestream2_skip(&s->gb, 4);
+        s->layer_count = bytestream2_get_be16(&s->gb);
+        len_section -= 6;
     }
 
     if (bytestream2_get_bytes_left(&s->gb) < len_section) {
@@ -288,7 +300,7 @@ static int decode_rle(PSDContext * s){
     return 0;
 }
 
-static int decode_frame(AVCodecContext *avctx, void *data,
+static int decode_frame(AVCodecContext *avctx, AVFrame *picture,
                         int *got_frame, AVPacket *avpkt)
 {
     int ret;
@@ -298,14 +310,14 @@ static int decode_frame(AVCodecContext *avctx, void *data,
     uint8_t eq_channel[4] = {2,0,1,3};/* RGBA -> GBRA channel order */
     uint8_t plane_number;
 
-    AVFrame *picture = data;
-
     PSDContext *s = avctx->priv_data;
-    s->avctx     = avctx;
-    s->channel_count = 0;
-    s->channel_depth = 0;
-    s->tmp           = NULL;
-    s->line_size     = 0;
+    s->avctx            = avctx;
+    s->channel_count    = 0;
+    s->channel_depth    = 0;
+    s->primary_channels = 0;
+    s->tmp              = NULL;
+    s->line_size        = 0;
+    s->layer_count      = 0;
 
     bytestream2_init(&s->gb, avpkt->data, avpkt->size);
 
@@ -317,35 +329,28 @@ static int decode_frame(AVCodecContext *avctx, void *data,
 
     switch (s->color_mode) {
     case PSD_BITMAP:
-        if (s->channel_depth != 1 || s->channel_count != 1) {
+        if (s->channel_depth != 1 || s->channel_count < 1) {
             av_log(s->avctx, AV_LOG_ERROR,
                     "Invalid bitmap file (channel_depth %d, channel_count %d)\n",
                     s->channel_depth, s->channel_count);
             return AVERROR_INVALIDDATA;
         }
         s->line_size = s->width + 7 >> 3;
+        s->primary_channels = 1;
         avctx->pix_fmt = AV_PIX_FMT_MONOWHITE;
         break;
     case PSD_INDEXED:
-        if (s->channel_depth != 8 || s->channel_count != 1) {
+        if (s->channel_depth != 8 || s->channel_count < 1) {
             av_log(s->avctx, AV_LOG_ERROR,
                    "Invalid indexed file (channel_depth %d, channel_count %d)\n",
                    s->channel_depth, s->channel_count);
             return AVERROR_INVALIDDATA;
         }
+        s->primary_channels = 1;
         avctx->pix_fmt = AV_PIX_FMT_PAL8;
         break;
     case PSD_CMYK:
-        if (s->channel_count == 4) {
-            if (s->channel_depth == 8) {
-                avctx->pix_fmt = AV_PIX_FMT_GBRP;
-            } else if (s->channel_depth == 16) {
-                avctx->pix_fmt = AV_PIX_FMT_GBRP16BE;
-            } else {
-                avpriv_report_missing_feature(avctx, "channel depth %d for cmyk", s->channel_depth);
-                return AVERROR_PATCHWELCOME;
-            }
-        } else if (s->channel_count == 5) {
+        if (s->layer_count < 0 && s->channel_count >= 5) {
             if (s->channel_depth == 8) {
                 avctx->pix_fmt = AV_PIX_FMT_GBRAP;
             } else if (s->channel_depth == 16) {
@@ -354,22 +359,26 @@ static int decode_frame(AVCodecContext *avctx, void *data,
                 avpriv_report_missing_feature(avctx, "channel depth %d for cmyk", s->channel_depth);
                 return AVERROR_PATCHWELCOME;
             }
+            s->primary_channels = 5;
+        } else if (s->channel_count >= 4) {
+            if (s->channel_depth == 8) {
+                avctx->pix_fmt = AV_PIX_FMT_GBRP;
+            } else if (s->channel_depth == 16) {
+                avctx->pix_fmt = AV_PIX_FMT_GBRP16BE;
+            } else {
+                avpriv_report_missing_feature(avctx, "channel depth %d for cmyk", s->channel_depth);
+                return AVERROR_PATCHWELCOME;
+            }
+            s->primary_channels = 4;
         } else {
-            avpriv_report_missing_feature(avctx, "channel count %d for cmyk", s->channel_count);
-            return AVERROR_PATCHWELCOME;
+            av_log(s->avctx, AV_LOG_ERROR,
+                   "Invalid cmyk file (channel_count %d)\n",
+                   s->channel_count);
+            return AVERROR_INVALIDDATA;
         }
         break;
     case PSD_RGB:
-        if (s->channel_count == 3) {
-            if (s->channel_depth == 8) {
-                avctx->pix_fmt = AV_PIX_FMT_GBRP;
-            } else if (s->channel_depth == 16) {
-                avctx->pix_fmt = AV_PIX_FMT_GBRP16BE;
-            } else {
-                avpriv_report_missing_feature(avctx, "channel depth %d for rgb", s->channel_depth);
-                return AVERROR_PATCHWELCOME;
-            }
-        } else if (s->channel_count == 4) {
+        if (s->layer_count < 0 && s->channel_count >= 4) {
             if (s->channel_depth == 8) {
                 avctx->pix_fmt = AV_PIX_FMT_GBRAP;
             } else if (s->channel_depth == 16) {
@@ -378,15 +387,39 @@ static int decode_frame(AVCodecContext *avctx, void *data,
                 avpriv_report_missing_feature(avctx, "channel depth %d for rgb", s->channel_depth);
                 return AVERROR_PATCHWELCOME;
             }
+            s->primary_channels = 4;
+        } else if (s->channel_count >= 3) {
+            if (s->channel_depth == 8) {
+                avctx->pix_fmt = AV_PIX_FMT_GBRP;
+            } else if (s->channel_depth == 16) {
+                avctx->pix_fmt = AV_PIX_FMT_GBRP16BE;
+            } else {
+                avpriv_report_missing_feature(avctx, "channel depth %d for rgb", s->channel_depth);
+                return AVERROR_PATCHWELCOME;
+            }
+            s->primary_channels = 3;
         } else {
-            avpriv_report_missing_feature(avctx, "channel count %d for rgb", s->channel_count);
-            return AVERROR_PATCHWELCOME;
+            av_log(s->avctx, AV_LOG_ERROR,
+                   "Invalid rgb file (channel_count %d)\n",
+                   s->channel_count);
+            return AVERROR_INVALIDDATA;
         }
         break;
     case PSD_DUOTONE:
         av_log(avctx, AV_LOG_WARNING, "ignoring unknown duotone specification.\n");
+        av_fallthrough;
     case PSD_GRAYSCALE:
-        if (s->channel_count == 1) {
+        if (s->layer_count < 0 && s->channel_count >= 2) {
+            if (s->channel_depth == 8) {
+                avctx->pix_fmt = AV_PIX_FMT_YA8;
+            } else if (s->channel_depth == 16) {
+                avctx->pix_fmt = AV_PIX_FMT_YA16BE;
+            } else {
+                avpriv_report_missing_feature(avctx, "channel depth %d for grayscale", s->channel_depth);
+                return AVERROR_PATCHWELCOME;
+            }
+            s->primary_channels = 2;
+        } else if (s->channel_count >= 1) {
             if (s->channel_depth == 8) {
                 avctx->pix_fmt = AV_PIX_FMT_GRAY8;
             } else if (s->channel_depth == 16) {
@@ -397,18 +430,12 @@ static int decode_frame(AVCodecContext *avctx, void *data,
                 avpriv_report_missing_feature(avctx, "channel depth %d for grayscale", s->channel_depth);
                 return AVERROR_PATCHWELCOME;
             }
-        } else if (s->channel_count == 2) {
-            if (s->channel_depth == 8) {
-                avctx->pix_fmt = AV_PIX_FMT_YA8;
-            } else if (s->channel_depth == 16) {
-                avctx->pix_fmt = AV_PIX_FMT_YA16BE;
-            } else {
-                avpriv_report_missing_feature(avctx, "channel depth %d for grayscale", s->channel_depth);
-                return AVERROR_PATCHWELCOME;
-            }
+            s->primary_channels = 1;
         } else {
-            avpriv_report_missing_feature(avctx, "channel count %d for grayscale", s->channel_count);
-            return AVERROR_PATCHWELCOME;
+            av_log(s->avctx, AV_LOG_ERROR,
+                   "Invalid grayscale file (channel_count %d)\n",
+                   s->channel_count);
+            return AVERROR_INVALIDDATA;
         }
         break;
     default:
@@ -417,9 +444,6 @@ static int decode_frame(AVCodecContext *avctx, void *data,
     }
 
     s->uncompressed_size = s->line_size * s->height * s->channel_count;
-
-    if ((ret = ff_get_buffer(avctx, picture, 0)) < 0)
-        return ret;
 
     /* decode picture if need */
     if (s->compression == PSD_RLE) {
@@ -443,13 +467,16 @@ static int decode_frame(AVCodecContext *avctx, void *data,
         ptr_data = s->gb.buffer;
     }
 
+    if ((ret = ff_get_buffer(avctx, picture, 0)) < 0)
+        return ret;
+
     /* Store data */
     if ((avctx->pix_fmt == AV_PIX_FMT_YA8)||(avctx->pix_fmt == AV_PIX_FMT_YA16BE)){/* Interleaved */
         ptr = picture->data[0];
-        for (c = 0; c < s->channel_count; c++) {
+        for (c = 0; c < 2; c++) {
             for (y = 0; y < s->height; y++) {
                 for (x = 0; x < s->width; x++) {
-                    index_out = y * picture->linesize[0] + x * s->channel_count * s->pixel_size + c * s->pixel_size;
+                    index_out = y * picture->linesize[0] + x * 2 * s->pixel_size + c * s->pixel_size;
                     for (p = 0; p < s->pixel_size; p++) {
                         ptr[index_out + p] = *ptr_data;
                         ptr_data ++;
@@ -518,10 +545,10 @@ static int decode_frame(AVCodecContext *avctx, void *data,
             }
         }
     } else {/* Planar */
-        if (s->channel_count == 1)/* gray 8 or gray 16be */
+        if (s->primary_channels == 1)/* bitmap, indexed, grayscale */
             eq_channel[0] = 0;/* assign first channel, to first plane */
 
-        for (c = 0; c < s->channel_count; c++) {
+        for (c = 0; c < s->primary_channels; c++) {
             plane_number = eq_channel[c];
             ptr = picture->data[plane_number];/* get the right plane */
             for (y = 0; y < s->height; y++) {
@@ -533,7 +560,6 @@ static int decode_frame(AVCodecContext *avctx, void *data,
     }
 
     if (s->color_mode == PSD_INDEXED) {
-        picture->palette_has_changed = 1;
         memcpy(picture->data[1], s->palette, AVPALETTE_SIZE);
     }
 
@@ -545,12 +571,12 @@ static int decode_frame(AVCodecContext *avctx, void *data,
     return avpkt->size;
 }
 
-const AVCodec ff_psd_decoder = {
-    .name             = "psd",
-    .long_name        = NULL_IF_CONFIG_SMALL("Photoshop PSD file"),
-    .type             = AVMEDIA_TYPE_VIDEO,
-    .id               = AV_CODEC_ID_PSD,
+const FFCodec ff_psd_decoder = {
+    .p.name           = "psd",
+    CODEC_LONG_NAME("Photoshop PSD file"),
+    .p.type           = AVMEDIA_TYPE_VIDEO,
+    .p.id             = AV_CODEC_ID_PSD,
+    .p.capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
     .priv_data_size   = sizeof(PSDContext),
-    .decode           = decode_frame,
-    .capabilities     = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_FRAME_THREADS,
+    FF_CODEC_DECODE_CB(decode_frame),
 };

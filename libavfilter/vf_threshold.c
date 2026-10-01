@@ -28,10 +28,11 @@
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "framesync.h"
-#include "internal.h"
 #include "video.h"
 #include "threshold.h"
+#include "vf_threshold_init.h"
 
 #define OFFSET(x) offsetof(ThresholdContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
@@ -85,8 +86,8 @@ static int filter_slice(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
 
     for (int p = 0; p < s->nb_planes; p++) {
         const int h = s->height[p];
-        const int slice_start = (h * jobnr) / nb_jobs;
-        const int slice_end = (h * (jobnr+1)) / nb_jobs;
+        const int slice_start = ff_slice_pos(h, jobnr, nb_jobs);
+        const int slice_end = ff_slice_pos(h, jobnr + 1, nb_jobs);
 
         if (!(s->planes & (1 << p))) {
             av_image_copy_plane(out->data[p] + slice_start * out->linesize[p],
@@ -150,57 +151,6 @@ static int process_frame(FFFrameSync *fs)
     return ff_filter_frame(outlink, out);
 }
 
-static void threshold8(const uint8_t *in, const uint8_t *threshold,
-                       const uint8_t *min, const uint8_t *max,
-                       uint8_t *out,
-                       ptrdiff_t ilinesize, ptrdiff_t tlinesize,
-                       ptrdiff_t flinesize, ptrdiff_t slinesize,
-                       ptrdiff_t olinesize,
-                       int w, int h)
-{
-    int x, y;
-
-    for (y = 0; y < h; y++) {
-        for (x = 0; x < w; x++) {
-            out[x] = in[x] < threshold[x] ? min[x] : max[x];
-        }
-
-        in        += ilinesize;
-        threshold += tlinesize;
-        min       += flinesize;
-        max       += slinesize;
-        out       += olinesize;
-    }
-}
-
-static void threshold16(const uint8_t *iin, const uint8_t *tthreshold,
-                        const uint8_t *ffirst, const uint8_t *ssecond,
-                        uint8_t *oout,
-                        ptrdiff_t ilinesize, ptrdiff_t tlinesize,
-                        ptrdiff_t flinesize, ptrdiff_t slinesize,
-                        ptrdiff_t olinesize,
-                        int w, int h)
-{
-    const uint16_t *in = (const uint16_t *)iin;
-    const uint16_t *threshold = (const uint16_t *)tthreshold;
-    const uint16_t *min = (const uint16_t *)ffirst;
-    const uint16_t *max = (const uint16_t *)ssecond;
-    uint16_t *out = (uint16_t *)oout;
-    int x, y;
-
-    for (y = 0; y < h; y++) {
-        for (x = 0; x < w; x++) {
-            out[x] = in[x] < threshold[x] ? min[x] : max[x];
-        }
-
-        in        += ilinesize / 2;
-        threshold += tlinesize / 2;
-        min       += flinesize / 2;
-        max       += slinesize / 2;
-        out       += olinesize / 2;
-    }
-}
-
 static int config_input(AVFilterLink *inlink)
 {
     AVFilterContext *ctx = inlink->dst;
@@ -223,20 +173,6 @@ static int config_input(AVFilterLink *inlink)
     return 0;
 }
 
-void ff_threshold_init(ThresholdContext *s)
-{
-    if (s->depth == 8) {
-        s->threshold = threshold8;
-        s->bpc = 1;
-    } else {
-        s->threshold = threshold16;
-        s->bpc = 2;
-    }
-
-    if (ARCH_X86)
-        ff_threshold_init_x86(s);
-}
-
 static int config_output(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
@@ -245,6 +181,8 @@ static int config_output(AVFilterLink *outlink)
     AVFilterLink *threshold = ctx->inputs[1];
     AVFilterLink *min = ctx->inputs[2];
     AVFilterLink *max = ctx->inputs[3];
+    FilterLink *il = ff_filter_link(base);
+    FilterLink *ol = ff_filter_link(outlink);
     FFFrameSyncIn *in;
     int ret;
 
@@ -269,7 +207,7 @@ static int config_output(AVFilterLink *outlink)
     outlink->w = base->w;
     outlink->h = base->h;
     outlink->sample_aspect_ratio = base->sample_aspect_ratio;
-    outlink->frame_rate = base->frame_rate;
+    ol->frame_rate = il->frame_rate;
 
     if ((ret = ff_framesync_init(&s->fs, ctx, 4)) < 0)
         return ret;
@@ -341,16 +279,16 @@ static const AVFilterPad outputs[] = {
     },
 };
 
-const AVFilter ff_vf_threshold = {
-    .name          = "threshold",
-    .description   = NULL_IF_CONFIG_SMALL("Threshold first video stream using other video streams."),
+const FFFilter ff_vf_threshold = {
+    .p.name        = "threshold",
+    .p.description = NULL_IF_CONFIG_SMALL("Threshold first video stream using other video streams."),
+    .p.priv_class  = &threshold_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(ThresholdContext),
-    .priv_class    = &threshold_class,
     .uninit        = uninit,
     .activate      = activate,
     FILTER_INPUTS(inputs),
     FILTER_OUTPUTS(outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = ff_filter_process_command,
 };

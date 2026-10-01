@@ -27,15 +27,13 @@
 
 #include <float.h>
 
-#include "libavutil/avstring.h"
+#include "libavutil/internal.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
+#include "filters.h"
 #include "framesync.h"
-#include "drawutils.h"
-#include "formats.h"
-#include "internal.h"
-#include "video.h"
 
 #define NUM_DATA_BUFS 13
 
@@ -63,7 +61,7 @@ static const AVOption vif_options[] = {
     { NULL }
 };
 
-AVFILTER_DEFINE_CLASS(vif);
+FRAMESYNC_DEFINE_CLASS(vif, VIFContext, fs);
 
 static const uint8_t vif_filter1d_width1[4] = { 17, 9, 5, 3 };
 
@@ -218,8 +216,8 @@ static int vif_filter1d(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
     int dst_stride = td->dst_stride;
     int filt_w = td->filter_width;
     float *temp = td->temp[jobnr];
-    const int slice_start = (h * jobnr) / nb_jobs;
-    const int slice_end = (h * (jobnr+1)) / nb_jobs;
+    const int slice_start = ff_slice_pos(h, jobnr, nb_jobs);
+    const int slice_end = ff_slice_pos(h, jobnr + 1, nb_jobs);
 
     for (int i = slice_start; i < slice_end; i++) {
         /** Vertical pass. */
@@ -241,7 +239,7 @@ static int vif_filter1d(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
                     int ii = i - filt_w / 2 + filt_i;
                     float img_coeff;
 
-                    ii = ii < 0 ? -ii : (ii >= h ? 2 * h - ii - 1 : ii);
+                    ii = avpriv_mirror(ii, h - 1);
 
                     img_coeff = src[ii * src_stride + j];
                     sum += filt_coeff * img_coeff;
@@ -270,7 +268,7 @@ static int vif_filter1d(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs)
                     int jj = j - filt_w / 2 + filt_j;
                     float img_coeff;
 
-                    jj = jj < 0 ? -jj : (jj >= w ? 2 * w - jj - 1 : jj);
+                    jj = avpriv_mirror(jj, w - 1);
 
                     img_coeff = temp[jj];
                     sum += filt_coeff * img_coeff;
@@ -305,8 +303,8 @@ static int compute_vif2(AVFilterContext *ctx,
     float *main_sq_filt = data_buf[11];
     float *ref_main_filt = data_buf[12];
 
-    float *curr_ref_scale = (float *)ref;
-    float *curr_main_scale = (float *)main;
+    const float *curr_ref_scale  = ref;
+    const float *curr_main_scale = main;
     int curr_ref_stride = ref_stride;
     int curr_main_stride = main_stride;
 
@@ -553,6 +551,8 @@ static int config_output(AVFilterLink *outlink)
     AVFilterContext *ctx = outlink->src;
     VIFContext *s = ctx->priv;
     AVFilterLink *mainlink = ctx->inputs[0];
+    FilterLink *il = ff_filter_link(mainlink);
+    FilterLink *ol = ff_filter_link(outlink);
     FFFrameSyncIn *in;
     int ret;
 
@@ -560,7 +560,7 @@ static int config_output(AVFilterLink *outlink)
     outlink->h = mainlink->h;
     outlink->time_base = mainlink->time_base;
     outlink->sample_aspect_ratio = mainlink->sample_aspect_ratio;
-    outlink->frame_rate = mainlink->frame_rate;
+    ol->frame_rate = il->frame_rate;
     if ((ret = ff_framesync_init(&s->fs, ctx, 2)) < 0)
         return ret;
 
@@ -628,17 +628,18 @@ static const AVFilterPad vif_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_vif = {
-    .name          = "vif",
-    .description   = NULL_IF_CONFIG_SMALL("Calculate the VIF between two video streams."),
+const FFFilter ff_vf_vif = {
+    .p.name        = "vif",
+    .p.description = NULL_IF_CONFIG_SMALL("Calculate the VIF between two video streams."),
+    .p.priv_class  = &vif_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
+                     AVFILTER_FLAG_SLICE_THREADS             |
+                     AVFILTER_FLAG_METADATA_ONLY,
+    .preinit       = vif_framesync_preinit,
     .uninit        = uninit,
     .priv_size     = sizeof(VIFContext),
-    .priv_class    = &vif_class,
     .activate      = activate,
     FILTER_INPUTS(vif_inputs),
     FILTER_OUTPUTS(vif_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL |
-                     AVFILTER_FLAG_SLICE_THREADS             |
-                     AVFILTER_FLAG_METADATA_ONLY,
 };

@@ -20,7 +20,7 @@
 
 #include <string.h>
 #include "checkasm.h"
-#include "libavcodec/v210enc.h"
+#include "libavcodec/v210enc_init.h"
 #include "libavutil/common.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
@@ -72,9 +72,10 @@
             randomize_buffers(mask);                                               \
             call_ref(y0 + y_offset, u0 + uv_offset, v0 + uv_offset, dst0, width);  \
             call_new(y1 + y_offset, u1 + uv_offset, v1 + uv_offset, dst1, width);  \
-            if (memcmp(y0, y1, BUF_SIZE) || memcmp(u0, u1, BUF_SIZE / 2) ||        \
-                memcmp(v0, v1, BUF_SIZE / 2) || memcmp(dst0, dst1, width * 8 / 3)) \
-                fail();                                                            \
+            checkasm_check(type,    y0,   0, y1,   0, BUF_SIZE,      1, "y");      \
+            checkasm_check(type,    u0,   0, u1,   0, BUF_SIZE / 2,  1, "u");      \
+            checkasm_check(type,    v0,   0, v1,   0, BUF_SIZE / 2,  1, "v");      \
+            checkasm_check(uint8_t, dst0, 0, dst1, 0, width * 8 / 3, 1, "dst");    \
             bench_new(y1 + y_offset, u1 + uv_offset, v1 + uv_offset, dst1, width); \
         }                                                                          \
     } while (0)

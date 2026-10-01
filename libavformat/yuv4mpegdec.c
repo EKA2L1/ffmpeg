@@ -23,11 +23,12 @@
 #include "libavutil/imgutils.h"
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 #include "yuv4mpeg.h"
 
 /* Header size increased to allow room for optional flags */
-#define MAX_YUV4_HEADER 96
+#define MAX_YUV4_HEADER 128
 #define MAX_FRAME_HEADER 80
 
 static int yuv4_read_header(AVFormatContext *s)
@@ -35,7 +36,6 @@ static int yuv4_read_header(AVFormatContext *s)
     char header[MAX_YUV4_HEADER + 10];  // Include headroom for
                                         // the longest option
     char *tokstart, *tokend, *header_end;
-    int i;
     AVIOContext *pb = s->pb;
     int width = -1, height  = -1, raten   = 0,
         rated =  0, aspectn =  0, aspectd = 0;
@@ -46,25 +46,25 @@ static int yuv4_read_header(AVFormatContext *s)
     AVStream *st;
     int64_t data_offset;
 
-    for (i = 0; i < MAX_YUV4_HEADER; i++) {
+    for (int i = 0;;) {
         header[i] = avio_r8(pb);
         if (header[i] == '\n') {
             header[i + 1] = 0x20;  // Add a space after last option.
                                    // Makes parsing "444" vs "444alpha" easier.
             header[i + 2] = 0;
+            header_end = &header[i + 1]; // Include space
             break;
         }
-    }
-    if (i == MAX_YUV4_HEADER) {
-        av_log(s, AV_LOG_ERROR, "Header too large.\n");
-        return AVERROR(EINVAL);
+        if (++i == MAX_YUV4_HEADER) {
+            av_log(s, AV_LOG_ERROR, "Header too large.\n");
+            return AVERROR(EINVAL);
+        }
     }
     if (strncmp(header, Y4M_MAGIC, strlen(Y4M_MAGIC))) {
         av_log(s, AV_LOG_ERROR, "Invalid magic number for yuv4mpeg.\n");
         return AVERROR(EINVAL);
     }
 
-    header_end = &header[i + 1]; // Include space
     for (tokstart = &header[strlen(Y4M_MAGIC) + 1];
          tokstart < header_end; tokstart++) {
         if (*tokstart == 0x20)
@@ -116,6 +116,7 @@ static int yuv4_read_header(AVFormatContext *s)
                 { "mono9",    AV_PIX_FMT_GRAY9,     AVCHROMA_LOC_UNSPECIFIED },
                 { "mono",     AV_PIX_FMT_GRAY8,     AVCHROMA_LOC_UNSPECIFIED },
             };
+            size_t i;
             for (i = 0; i < FF_ARRAY_ELEMS(pix_fmt_array); i++) {
                 if (av_strstart(tokstart, pix_fmt_array[i].name, NULL)) {
                     pix_fmt = pix_fmt_array[i].pix_fmt;
@@ -150,6 +151,7 @@ static int yuv4_read_header(AVFormatContext *s)
             case 'm':
                 av_log(s, AV_LOG_ERROR, "YUV4MPEG stream contains mixed "
                        "interlaced and non-interlaced frames.\n");
+                return AVERROR(ENOTSUP);
             default:
                 av_log(s, AV_LOG_ERROR, "YUV4MPEG has invalid header.\n");
                 return AVERROR(EINVAL);
@@ -290,7 +292,7 @@ static int yuv4_read_packet(AVFormatContext *s, AVPacket *pkt)
     if (ret < 0)
         return ret;
     else if (ret != s->packet_size - Y4M_FRAME_MAGIC_LEN) {
-        return s->pb->eof_reached ? AVERROR_EOF : AVERROR(EIO);
+        return s->pb->eof_reached ? AVERROR_EOF : AVERROR_INVALIDDATA;
     }
     pkt->stream_index = 0;
     pkt->pts = (off - ffformatcontext(s)->data_offset) / s->packet_size;
@@ -323,12 +325,12 @@ static int yuv4_probe(const AVProbeData *pd)
         return 0;
 }
 
-const AVInputFormat ff_yuv4mpegpipe_demuxer = {
-    .name           = "yuv4mpegpipe",
-    .long_name      = NULL_IF_CONFIG_SMALL("YUV4MPEG pipe"),
+const FFInputFormat ff_yuv4mpegpipe_demuxer = {
+    .p.name         = "yuv4mpegpipe",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("YUV4MPEG pipe"),
+    .p.extensions   = "y4m",
     .read_probe     = yuv4_probe,
     .read_header    = yuv4_read_header,
     .read_packet    = yuv4_read_packet,
     .read_seek      = yuv4_read_seek,
-    .extensions     = "y4m",
 };

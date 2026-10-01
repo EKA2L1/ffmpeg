@@ -20,6 +20,7 @@
  */
 
 #include "avformat.h"
+#include "demux.h"
 #include "internal.h"
 
 static int svag_probe(const AVProbeData *p)
@@ -47,14 +48,15 @@ static int svag_read_header(AVFormatContext *s)
     st->codecpar->sample_rate = avio_rl32(s->pb);
     if (st->codecpar->sample_rate <= 0)
         return AVERROR_INVALIDDATA;
-    st->codecpar->channels    = avio_rl32(s->pb);
-    if (st->codecpar->channels <= 0 || st->codecpar->channels > 8)
+    st->codecpar->ch_layout.nb_channels = avio_rl32(s->pb);
+    if (st->codecpar->ch_layout.nb_channels <= 0 ||
+        st->codecpar->ch_layout.nb_channels > 8)
         return AVERROR_INVALIDDATA;
-    st->duration           = size / (16 * st->codecpar->channels) * 28;
+    st->duration           = size / (16 * st->codecpar->ch_layout.nb_channels) * 28;
     align                  = avio_rl32(s->pb);
-    if (align <= 0 || align > INT_MAX / st->codecpar->channels)
+    if (align <= 0 || align > INT_MAX / st->codecpar->ch_layout.nb_channels)
         return AVERROR_INVALIDDATA;
-    st->codecpar->block_align = align * st->codecpar->channels;
+    st->codecpar->block_align = align * st->codecpar->ch_layout.nb_channels;
     avio_skip(s->pb, 0x800 - avio_tell(s->pb));
     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
 
@@ -68,11 +70,11 @@ static int svag_read_packet(AVFormatContext *s, AVPacket *pkt)
     return av_get_packet(s->pb, pkt, par->block_align);
 }
 
-const AVInputFormat ff_svag_demuxer = {
-    .name           = "svag",
-    .long_name      = NULL_IF_CONFIG_SMALL("Konami PS2 SVAG"),
+const FFInputFormat ff_svag_demuxer = {
+    .p.name         = "svag",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Konami PS2 SVAG"),
+    .p.extensions   = "svag",
     .read_probe     = svag_probe,
     .read_header    = svag_read_header,
     .read_packet    = svag_read_packet,
-    .extensions     = "svag",
 };

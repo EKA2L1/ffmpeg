@@ -34,7 +34,6 @@ echo "Compiling FFmpeg for $CPU"
     --disable-programs \
     --disable-network \
     --disable-avfilter \
-    --disable-postproc \
     --disable-encoders \
     --disable-doc \
     --disable-ffplay \
@@ -141,5 +140,5 @@ SYSROOT=${NDK_HOME}/toolchains/llvm/prebuilt/${PLATFORM}-x86_64/sysroot
 CROSS_PREFIX=${TOOLCHAIN}/bin/llvm-
 PREFIX=$(pwd)/android/x86_64
 OPTIMIZE_CFLAGS="-march=$CPU -msse4.2 -mpopcnt -m64"
-ASM_FLAGS=" --disable-neon --disable-asm --disable-inline-asm"
+ASM_FLAGS=""
 build_ffmpeg

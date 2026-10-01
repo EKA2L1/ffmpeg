@@ -23,11 +23,11 @@
 
 #include "libavutil/common.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
 #include "avfilter.h"
-#include "formats.h"
-#include "internal.h"
+#include "filters.h"
 #include "video.h"
 #include "w3fdif.h"
 
@@ -52,20 +52,20 @@ typedef struct W3FDIFContext {
 
 #define OFFSET(x) offsetof(W3FDIFContext, x)
 #define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_RUNTIME_PARAM
-#define CONST(name, help, val, unit) { name, help, 0, AV_OPT_TYPE_CONST, {.i64=val}, 0, 0, FLAGS, unit }
+#define CONST(name, help, val, u) { name, help, 0, AV_OPT_TYPE_CONST, {.i64=val}, 0, 0, FLAGS, .unit = u }
 
 static const AVOption w3fdif_options[] = {
-    { "filter", "specify the filter", OFFSET(filter), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS, "filter" },
+    { "filter", "specify the filter", OFFSET(filter), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS, .unit = "filter" },
     CONST("simple",  NULL, 0, "filter"),
     CONST("complex", NULL, 1, "filter"),
-    { "mode",   "specify the interlacing mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS, "mode"},
+    { "mode",   "specify the interlacing mode", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=1}, 0, 1, FLAGS, .unit = "mode"},
     CONST("frame", "send one frame for each frame", 0, "mode"),
     CONST("field", "send one frame for each field", 1, "mode"),
-    { "parity", "specify the assumed picture field parity", OFFSET(parity), AV_OPT_TYPE_INT, {.i64=-1}, -1, 1, FLAGS, "parity" },
+    { "parity", "specify the assumed picture field parity", OFFSET(parity), AV_OPT_TYPE_INT, {.i64=-1}, -1, 1, FLAGS, .unit = "parity" },
     CONST("tff",  "assume top field first",     0, "parity"),
     CONST("bff",  "assume bottom field first",  1, "parity"),
     CONST("auto", "auto detect parity",        -1, "parity"),
-    { "deint",  "specify which frames to deinterlace", OFFSET(deint), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, "deint" },
+    { "deint",  "specify which frames to deinterlace", OFFSET(deint), AV_OPT_TYPE_INT, {.i64=0}, 0, 1, FLAGS, .unit = "deint" },
     CONST("all",        "deinterlace all frames",                       0, "deint"),
     CONST("interlaced", "only deinterlace frames marked as interlaced", 1, "deint"),
     { NULL }
@@ -317,18 +317,24 @@ static int config_input(AVFilterLink *inlink)
         s->dsp.filter_scale        = filter16_scale;
     }
 
-    if (ARCH_X86)
-        ff_w3fdif_init_x86(&s->dsp, depth);
+#if ARCH_X86 && HAVE_X86ASM
+    ff_w3fdif_init_x86(&s->dsp, depth);
+#endif
 
     return 0;
 }
 
 static int config_output(AVFilterLink *outlink)
 {
-    AVFilterLink *inlink = outlink->src->inputs[0];
+    AVFilterContext *ctx = outlink->src;
+    AVFilterLink *inlink = ctx->inputs[0];
+    FilterLink *il = ff_filter_link(inlink);
+    FilterLink *ol = ff_filter_link(outlink);
+    W3FDIFContext *s = ctx->priv;
 
     outlink->time_base = av_mul_q(inlink->time_base, (AVRational){1, 2});
-    outlink->frame_rate = av_mul_q(inlink->frame_rate, (AVRational){2, 1});
+    if (s->mode)
+        ol->frame_rate = av_mul_q(il->frame_rate, (AVRational){2, 1});
 
     return 0;
 }
@@ -372,11 +378,11 @@ static int deinterlace_plane_slice(AVFilterContext *ctx, void *arg,
     const int cur_line_stride = cur->linesize[plane];
     const int adj_line_stride = adj->linesize[plane];
     const int dst_line_stride = out->linesize[plane];
-    const int start = (height * jobnr) / nb_jobs;
-    const int end = (height * (jobnr+1)) / nb_jobs;
+    const int start = ff_slice_pos(height, jobnr, nb_jobs);
+    const int end = ff_slice_pos(height, jobnr + 1, nb_jobs);
     const int max = s->max;
-    const int interlaced = cur->interlaced_frame;
-    const int tff = s->field == (s->parity == -1 ? interlaced ? cur->top_field_first : 1 :
+    const int interlaced = !!(cur->flags & AV_FRAME_FLAG_INTERLACED);
+    const int tff = s->field == (s->parity == -1 ? interlaced ? !!(cur->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) : 1 :
                                  s->parity ^ 1);
     int j, y_in, y_out;
 
@@ -482,7 +488,7 @@ static int filter(AVFilterContext *ctx, int is_second)
     if (!out)
         return AVERROR(ENOMEM);
     av_frame_copy_props(out, s->cur);
-    out->interlaced_frame = 0;
+    out->flags &= ~AV_FRAME_FLAG_INTERLACED;
 
     if (!is_second) {
         if (out->pts != AV_NOPTS_VALUE)
@@ -529,7 +535,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     if (!s->prev)
         return 0;
 
-    if ((s->deint && !s->cur->interlaced_frame) || ctx->is_disabled) {
+    if ((s->deint && !(s->cur->flags & AV_FRAME_FLAG_INTERLACED)) || ctx->is_disabled) {
         AVFrame *out = av_frame_clone(s->cur);
         if (!out)
             return AVERROR(ENOMEM);
@@ -605,15 +611,15 @@ static const AVFilterPad w3fdif_outputs[] = {
     },
 };
 
-const AVFilter ff_vf_w3fdif = {
-    .name          = "w3fdif",
-    .description   = NULL_IF_CONFIG_SMALL("Apply Martin Weston three field deinterlace."),
+const FFFilter ff_vf_w3fdif = {
+    .p.name        = "w3fdif",
+    .p.description = NULL_IF_CONFIG_SMALL("Apply Martin Weston three field deinterlace."),
+    .p.priv_class  = &w3fdif_class,
+    .p.flags       = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(W3FDIFContext),
-    .priv_class    = &w3fdif_class,
     .uninit        = uninit,
     FILTER_INPUTS(w3fdif_inputs),
     FILTER_OUTPUTS(w3fdif_outputs),
     FILTER_PIXFMTS_ARRAY(pix_fmts),
-    .flags         = AVFILTER_FLAG_SUPPORT_TIMELINE_INTERNAL | AVFILTER_FLAG_SLICE_THREADS,
     .process_command = ff_filter_process_command,
 };

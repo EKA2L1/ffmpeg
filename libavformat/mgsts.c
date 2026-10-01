@@ -22,6 +22,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/intfloat.h"
 #include "avformat.h"
+#include "demux.h"
 #include "riff.h"
 
 static int read_probe(const AVProbeData *p)
@@ -43,7 +44,7 @@ static int read_header(AVFormatContext *s)
     avio_skip(pb, 4);
     chunk_size = avio_rb32(pb);
     if (chunk_size != 80)
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
     avio_skip(pb, 20);
 
     st = avformat_new_stream(s, 0);
@@ -83,7 +84,7 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     payload_size = avio_rb32(pb);
 
     if (chunk_size < payload_size + 16)
-        return AVERROR(EIO);
+        return AVERROR_INVALIDDATA;
 
     ret = av_get_packet(pb, pkt, payload_size);
     if (ret < 0)
@@ -96,11 +97,11 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
     return ret;
 }
 
-const AVInputFormat ff_mgsts_demuxer = {
-    .name        = "mgsts",
-    .long_name   = NULL_IF_CONFIG_SMALL("Metal Gear Solid: The Twin Snakes"),
+const FFInputFormat ff_mgsts_demuxer = {
+    .p.name      = "mgsts",
+    .p.long_name = NULL_IF_CONFIG_SMALL("Metal Gear Solid: The Twin Snakes"),
+    .p.flags     = AVFMT_GENERIC_INDEX,
     .read_probe  = read_probe,
     .read_header = read_header,
     .read_packet = read_packet,
-    .flags       = AVFMT_GENERIC_INDEX,
 };

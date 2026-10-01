@@ -28,7 +28,8 @@
 #include <stdint.h>
 
 #include "libavutil/intreadwrite.h"
-#include "parser.h"
+#include "avcodec.h"
+#include "parser_internal.h"
 
 typedef struct CookParseContext {
     int duration;
@@ -41,8 +42,8 @@ static int cook_parse(AVCodecParserContext *s1, AVCodecContext *avctx,
     CookParseContext *s = s1->priv_data;
 
     if (!s->duration &&
-                avctx->extradata && avctx->extradata_size >= 8 && avctx->channels)
-        s->duration = AV_RB16(avctx->extradata + 4) / avctx->channels;
+        avctx->extradata && avctx->extradata_size >= 8 && avctx->ch_layout.nb_channels)
+        s->duration = AV_RB16(avctx->extradata + 4) / avctx->ch_layout.nb_channels;
 
     s1->duration = s->duration;
 
@@ -53,8 +54,8 @@ static int cook_parse(AVCodecParserContext *s1, AVCodecContext *avctx,
     return buf_size;
 }
 
-const AVCodecParser ff_cook_parser = {
-    .codec_ids      = { AV_CODEC_ID_COOK },
+const FFCodecParser ff_cook_parser = {
+    PARSER_CODEC_LIST(AV_CODEC_ID_COOK),
     .priv_data_size = sizeof(CookParseContext),
-    .parser_parse   = cook_parse,
+    .parse          = cook_parse,
 };

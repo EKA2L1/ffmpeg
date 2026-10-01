@@ -19,13 +19,18 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config_components.h"
+
 #include "libavutil/channel_layout.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
+#include "mux.h"
 #include "pcm.h"
 #include "rawenc.h"
 #include "riff.h"
+#include "version.h"
 
 typedef struct MMFContext {
     int64_t atrpos, atsqpos, awapos;
@@ -80,7 +85,7 @@ static int mmf_write_header(AVFormatContext *s)
         return AVERROR(EINVAL);
     }
 
-    mmf->stereo = s->streams[0]->codecpar->channels > 1;
+    mmf->stereo = s->streams[0]->codecpar->ch_layout.nb_channels > 1;
     if (mmf->stereo &&
         s->strict_std_compliance > FF_COMPLIANCE_EXPERIMENTAL) {
         av_log(s, AV_LOG_ERROR, "Yamaha SMAF stereo is experimental, "
@@ -261,8 +266,7 @@ static int mmf_read_header(AVFormatContext *s)
     st->codecpar->codec_type            = AVMEDIA_TYPE_AUDIO;
     st->codecpar->codec_id              = AV_CODEC_ID_ADPCM_YAMAHA;
     st->codecpar->sample_rate           = rate;
-    st->codecpar->channels              = (params >> 7) + 1;
-    st->codecpar->channel_layout        = params >> 7 ? AV_CH_LAYOUT_STEREO : AV_CH_LAYOUT_MONO;
+    av_channel_layout_default(&st->codecpar->ch_layout, (params >> 7) + 1);
     st->codecpar->bits_per_coded_sample = 4;
     st->codecpar->bit_rate              = st->codecpar->sample_rate *
                                           st->codecpar->bits_per_coded_sample;
@@ -295,26 +299,29 @@ static int mmf_read_packet(AVFormatContext *s, AVPacket *pkt)
 }
 
 #if CONFIG_MMF_DEMUXER
-const AVInputFormat ff_mmf_demuxer = {
-    .name           = "mmf",
-    .long_name      = NULL_IF_CONFIG_SMALL("Yamaha SMAF"),
+const FFInputFormat ff_mmf_demuxer = {
+    .p.name         = "mmf",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Yamaha SMAF"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .priv_data_size = sizeof(MMFContext),
     .read_probe     = mmf_probe,
     .read_header    = mmf_read_header,
     .read_packet    = mmf_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
 };
 #endif
 
 #if CONFIG_MMF_MUXER
-const AVOutputFormat ff_mmf_muxer = {
-    .name           = "mmf",
-    .long_name      = NULL_IF_CONFIG_SMALL("Yamaha SMAF"),
-    .mime_type      = "application/vnd.smaf",
-    .extensions     = "mmf",
+const FFOutputFormat ff_mmf_muxer = {
+    .p.name         = "mmf",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Yamaha SMAF"),
+    .p.mime_type    = "application/vnd.smaf",
+    .p.extensions   = "mmf",
     .priv_data_size = sizeof(MMFContext),
-    .audio_codec    = AV_CODEC_ID_ADPCM_YAMAHA,
-    .video_codec    = AV_CODEC_ID_NONE,
+    .p.audio_codec  = AV_CODEC_ID_ADPCM_YAMAHA,
+    .p.video_codec  = AV_CODEC_ID_NONE,
+    .p.subtitle_codec = AV_CODEC_ID_NONE,
+    .flags_internal   = FF_OFMT_FLAG_MAX_ONE_OF_EACH |
+                        FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
     .write_header   = mmf_write_header,
     .write_packet   = ff_raw_write_packet,
     .write_trailer  = mmf_write_trailer,

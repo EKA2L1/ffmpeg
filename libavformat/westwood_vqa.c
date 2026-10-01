@@ -32,6 +32,7 @@
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
 #include "avio_internal.h"
+#include "demux.h"
 #include "internal.h"
 
 #define FORM_TAG MKBETAG('F', 'O', 'R', 'M')
@@ -137,8 +138,8 @@ static int wsvqa_read_header(AVFormatContext *s)
     /* there are 0 or more chunks before the FINF chunk; iterate until
      * FINF has been skipped and the file will be ready to be demuxed */
     do {
-        if (avio_read(pb, scratch, VQA_PREAMBLE_SIZE) != VQA_PREAMBLE_SIZE)
-            return AVERROR(EIO);
+        if ((ret = ffio_read_size(pb, scratch, VQA_PREAMBLE_SIZE)) < 0)
+            return ret;
         chunk_tag = AV_RB32(&scratch[0]);
         chunk_size = AV_RB32(&scratch[4]);
 
@@ -177,13 +178,15 @@ static int wsvqa_read_packet(AVFormatContext *s,
     int ret = -1;
     uint8_t preamble[VQA_PREAMBLE_SIZE];
     uint32_t chunk_type;
-    uint32_t chunk_size;
-    int skip_byte;
+    int chunk_size;
+    unsigned skip_byte;
 
     while (avio_read(pb, preamble, VQA_PREAMBLE_SIZE) == VQA_PREAMBLE_SIZE) {
         chunk_type = AV_RB32(&preamble[0]);
         chunk_size = AV_RB32(&preamble[4]);
 
+        if (chunk_size < 0)
+            return AVERROR_INVALIDDATA;
         skip_byte = chunk_size & 0x01;
 
         if (chunk_type == VQFL_TAG) {
@@ -192,21 +195,23 @@ static int wsvqa_read_packet(AVFormatContext *s,
              * so it can be combined with the next VQFR packet. This way each packet
              * includes a whole frame as expected. */
             wsvqa->vqfl_chunk_pos = avio_tell(pb);
-            wsvqa->vqfl_chunk_size = (int)(chunk_size);
-            if (wsvqa->vqfl_chunk_size < 0 || wsvqa->vqfl_chunk_size > 3 * (1 << 20))
+            if (chunk_size > 3 * (1 << 20))
                 return AVERROR_INVALIDDATA;
+            wsvqa->vqfl_chunk_size = chunk_size;
             /* We need a big seekback buffer because there can be SNxx, VIEW and ZBUF
              * chunks (<512 KiB total) in the stream before we read VQFR (<256 KiB) and
              * seek back here. */
-            ffio_ensure_seekback(pb, wsvqa->vqfl_chunk_size + (512 + 256) * 1024);
+            ret = ffio_ensure_seekback(pb, wsvqa->vqfl_chunk_size + (512 + 256) * 1024);
             avio_skip(pb, chunk_size + skip_byte);
+            if (ret < 0)
+                return ret;
             continue;
         } else if ((chunk_type == SND0_TAG) || (chunk_type == SND1_TAG) ||
             (chunk_type == SND2_TAG) || (chunk_type == VQFR_TAG)) {
 
             ret= av_get_packet(pb, pkt, chunk_size);
             if (ret<0)
-                return AVERROR(EIO);
+                return AVERROR_INVALIDDATA;
 
             switch (chunk_type) {
             case SND0_TAG:
@@ -226,7 +231,7 @@ static int wsvqa_read_packet(AVFormatContext *s,
                         wsvqa->bps = 8;
                     st->codecpar->sample_rate = wsvqa->sample_rate;
                     st->codecpar->bits_per_coded_sample = wsvqa->bps;
-                    st->codecpar->channels = wsvqa->channels;
+                    av_channel_layout_default(&st->codecpar->ch_layout, wsvqa->channels);
                     st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
 
                     avpriv_set_pts_info(st, 64, 1, st->codecpar->sample_rate);
@@ -259,7 +264,7 @@ static int wsvqa_read_packet(AVFormatContext *s,
                     break;
                 case SND2_TAG:
                     /* 2 samples/byte, 1 or 2 samples per frame depending on stereo */
-                    pkt->duration = (chunk_size * 2) / wsvqa->channels;
+                    pkt->duration = (chunk_size * 2LL) / wsvqa->channels;
                     break;
                 }
                 break;
@@ -267,20 +272,20 @@ static int wsvqa_read_packet(AVFormatContext *s,
                 /* if a new codebook is available inside an earlier a VQFL chunk then
                  * append it to 'pkt' */
                 if (wsvqa->vqfl_chunk_size > 0) {
-                    int64_t current_pos = pkt->pos;
+                    int64_t ret64, current_pos = pkt->pos;
 
-                    if (avio_seek(pb, wsvqa->vqfl_chunk_pos, SEEK_SET) < 0)
-                        return AVERROR(EIO);
+                    if ((ret64 = avio_seek(pb, wsvqa->vqfl_chunk_pos, SEEK_SET)) < 0)
+                        return (int)ret64;
 
                     /* the decoder expects chunks to be 16-bit aligned */
                     if (wsvqa->vqfl_chunk_size % 2 == 1)
                         wsvqa->vqfl_chunk_size++;
 
                     if (av_append_packet(pb, pkt, wsvqa->vqfl_chunk_size) < 0)
-                        return AVERROR(EIO);
+                        return AVERROR_INVALIDDATA;
 
-                    if (avio_seek(pb, current_pos, SEEK_SET) < 0)
-                        return AVERROR(EIO);
+                    if ((ret64 = avio_seek(pb, current_pos, SEEK_SET)) < 0)
+                        return (int)ret64;
 
                     wsvqa->vqfl_chunk_pos = 0;
                     wsvqa->vqfl_chunk_size = 0;
@@ -314,9 +319,9 @@ static int wsvqa_read_packet(AVFormatContext *s,
     return ret;
 }
 
-const AVInputFormat ff_wsvqa_demuxer = {
-    .name           = "wsvqa",
-    .long_name      = NULL_IF_CONFIG_SMALL("Westwood Studios VQA"),
+const FFInputFormat ff_wsvqa_demuxer = {
+    .p.name         = "wsvqa",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("Westwood Studios VQA"),
     .priv_data_size = sizeof(WsVqaDemuxContext),
     .read_probe     = wsvqa_probe,
     .read_header    = wsvqa_read_header,

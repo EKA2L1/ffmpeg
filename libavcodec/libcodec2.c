@@ -21,10 +21,12 @@
 
 #include <codec2/codec2.h>
 #include "libavutil/channel_layout.h"
+#include "libavutil/mem.h"
 #include "avcodec.h"
 #include "libavutil/opt.h"
+#include "codec_internal.h"
+#include "decode.h"
 #include "encode.h"
-#include "internal.h"
 #include "codec2utils.h"
 
 typedef struct {
@@ -85,9 +87,9 @@ libcodec2_init_common_error:
 static av_cold int libcodec2_init_decoder(AVCodecContext *avctx)
 {
     avctx->sample_rate      = 8000;
-    avctx->channels         = 1;
     avctx->sample_fmt       = AV_SAMPLE_FMT_S16;
-    avctx->channel_layout   = AV_CH_LAYOUT_MONO;
+    av_channel_layout_uninit(&avctx->ch_layout);
+    avctx->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
 
     if (avctx->extradata_size != CODEC2_EXTRADATA_SIZE) {
         av_log(avctx, AV_LOG_ERROR, "must have exactly %i bytes of extradata (got %i)\n",
@@ -101,14 +103,6 @@ static av_cold int libcodec2_init_decoder(AVCodecContext *avctx)
 static av_cold int libcodec2_init_encoder(AVCodecContext *avctx)
 {
     LibCodec2Context *c2 = avctx->priv_data;
-
-    //will need to be smarter once we get wideband support
-    if (avctx->sample_rate != 8000 ||
-        avctx->channels != 1 ||
-        avctx->sample_fmt != AV_SAMPLE_FMT_S16) {
-        av_log(avctx, AV_LOG_ERROR, "only 8 kHz 16-bit mono allowed\n");
-        return AVERROR(EINVAL);
-    }
 
     avctx->extradata = av_mallocz(CODEC2_EXTRADATA_SIZE + AV_INPUT_BUFFER_PADDING_SIZE);
     if (!avctx->extradata) {
@@ -129,16 +123,17 @@ static av_cold int libcodec2_close(AVCodecContext *avctx)
     return 0;
 }
 
-static int libcodec2_decode(AVCodecContext *avctx, void *data,
+static int libcodec2_decode(AVCodecContext *avctx, AVFrame *frame,
                             int *got_frame_ptr, AVPacket *pkt)
 {
     LibCodec2Context *c2 = avctx->priv_data;
-    AVFrame *frame = data;
     int ret, nframes, i;
-    uint8_t *input;
+    const uint8_t *input;
     int16_t *output;
 
     nframes           = pkt->size / avctx->block_align;
+    if (nframes > INT_MAX / avctx->frame_size)
+        return AVERROR_INVALIDDATA;
     frame->nb_samples = avctx->frame_size * nframes;
 
     ret = ff_get_buffer(avctx, frame, 0);
@@ -176,33 +171,33 @@ static int libcodec2_encode(AVCodecContext *avctx, AVPacket *avpkt,
     return 0;
 }
 
-const AVCodec ff_libcodec2_decoder = {
-    .name                   = "libcodec2",
-    .long_name              = NULL_IF_CONFIG_SMALL("codec2 decoder using libcodec2"),
-    .type                   = AVMEDIA_TYPE_AUDIO,
-    .id                     = AV_CODEC_ID_CODEC2,
+const FFCodec ff_libcodec2_decoder = {
+    .p.name                 = "libcodec2",
+    CODEC_LONG_NAME("codec2 decoder using libcodec2"),
+    .p.type                 = AVMEDIA_TYPE_AUDIO,
+    .p.id                   = AV_CODEC_ID_CODEC2,
+    .p.capabilities         = AV_CODEC_CAP_CHANNEL_CONF,
+    .caps_internal          = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
     .priv_data_size         = sizeof(LibCodec2Context),
     .init                   = libcodec2_init_decoder,
     .close                  = libcodec2_close,
-    .decode                 = libcodec2_decode,
-    .capabilities           = AV_CODEC_CAP_CHANNEL_CONF,
-    .supported_samplerates  = (const int[]){ 8000, 0 },
-    .sample_fmts            = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_NONE },
-    .channel_layouts        = (const uint64_t[]) { AV_CH_LAYOUT_MONO, 0 },
+    FF_CODEC_DECODE_CB(libcodec2_decode),
 };
 
-const AVCodec ff_libcodec2_encoder = {
-    .name                   = "libcodec2",
-    .long_name              = NULL_IF_CONFIG_SMALL("codec2 encoder using libcodec2"),
-    .type                   = AVMEDIA_TYPE_AUDIO,
-    .id                     = AV_CODEC_ID_CODEC2,
-    .capabilities           = AV_CODEC_CAP_DR1,
+const FFCodec ff_libcodec2_encoder = {
+    .p.name                 = "libcodec2",
+    CODEC_LONG_NAME("codec2 encoder using libcodec2"),
+    .p.type                 = AVMEDIA_TYPE_AUDIO,
+    .p.id                   = AV_CODEC_ID_CODEC2,
+    .p.capabilities         = AV_CODEC_CAP_DR1 |
+                              AV_CODEC_CAP_ENCODER_REORDERED_OPAQUE,
+    CODEC_SAMPLERATES(8000),
+    CODEC_SAMPLEFMTS(AV_SAMPLE_FMT_S16),
+    CODEC_CH_LAYOUTS(AV_CHANNEL_LAYOUT_MONO),
+    .p.priv_class           = &libcodec2_enc_class,
+    .caps_internal          = FF_CODEC_CAP_NOT_INIT_THREADSAFE,
     .priv_data_size         = sizeof(LibCodec2Context),
     .init                   = libcodec2_init_encoder,
     .close                  = libcodec2_close,
-    .encode2                = libcodec2_encode,
-    .supported_samplerates  = (const int[]){ 8000, 0 },
-    .sample_fmts            = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_S16, AV_SAMPLE_FMT_NONE },
-    .channel_layouts        = (const uint64_t[]) { AV_CH_LAYOUT_MONO, 0 },
-    .priv_class             = &libcodec2_enc_class,
+    FF_CODEC_ENCODE_CB(libcodec2_encode),
 };

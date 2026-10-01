@@ -22,10 +22,12 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "config.h"
 #include "attributes.h"
-#include "avutil.h"
 #include "bswap.h"
+#include "error.h"
 #include "intreadwrite.h"
+#include "macros.h"
 #include "ripemd.h"
 #include "mem.h"
 
@@ -134,7 +136,7 @@ static const int WB[80] = {
 
 static void ripemd128_transform(uint32_t *state, const uint8_t buffer[64])
 {
-    uint32_t a, b, c, d, e, f, g, h, av_unused t;
+    uint32_t a, b, c, d, e, f, g, h, t av_unused;
     uint32_t block[16];
     int n;
 
@@ -191,7 +193,7 @@ static void ripemd128_transform(uint32_t *state, const uint8_t buffer[64])
 
 static void ripemd256_transform(uint32_t *state, const uint8_t buffer[64])
 {
-    uint32_t a, b, c, d, e, f, g, h, av_unused t;
+    uint32_t a, b, c, d, e, f, g, h, t av_unused;
     uint32_t block[16];
     int n;
 
@@ -316,7 +318,7 @@ static void ripemd256_transform(uint32_t *state, const uint8_t buffer[64])
 
 static void ripemd160_transform(uint32_t *state, const uint8_t buffer[64])
 {
-    uint32_t a, b, c, d, e, f, g, h, i, j, av_unused t;
+    uint32_t a, b, c, d, e, f, g, h, i, j, t av_unused;
     uint32_t block[16];
     int n;
 
@@ -388,7 +390,7 @@ static void ripemd160_transform(uint32_t *state, const uint8_t buffer[64])
 
 static void ripemd320_transform(uint32_t *state, const uint8_t buffer[64])
 {
-    uint32_t a, b, c, d, e, f, g, h, i, j, av_unused t;
+    uint32_t a, b, c, d, e, f, g, h, i, j, t av_unused;
     uint32_t block[16];
     int n;
 

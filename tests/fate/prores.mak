@@ -6,9 +6,9 @@ FATE_PRORES = fate-prores-422                                           \
               fate-prores-alpha_skip                                    \
               fate-prores-transparency                                  \
               fate-prores-transparency_skip                             \
-              fate-prores-gray                                          \
+              $(if $(call ALLYES, ARESAMPLE_FILTER AAC_FIXED_DECODER),fate-prores-gray) \
 
-FATE_SAMPLES_AVCONV-$(call DEMDEC, MOV, PRORES) += $(FATE_PRORES)
+FATE_SAMPLES_FFMPEG-$(call FRAMECRC, MOV, PRORES, SCALE_FILTER) += $(FATE_PRORES)
 fate-prores: $(FATE_PRORES)
 
 fate-prores-422:       CMD = framecrc -flags +bitexact -i $(TARGET_SAMPLES)/prores/Sequence_1-Apple_ProRes_422.mov -pix_fmt yuv422p10le -vf scale
@@ -25,4 +25,7 @@ fate-prores-gray:      CMD = framecrc -flags +bitexact -c:a aac_fixed -i $(TARGE
 FATE_PRORES_METADATA_BSF += fate-prores-metadata
 fate-prores-metadata: CMD = md5 -i $(TARGET_SAMPLES)/prores/Sequence_1-Apple_ProRes_422_Proxy.mov -c:v copy -bsf:v prores_metadata=color_primaries=bt470bg:color_trc=bt709:colorspace=smpte170m -bitexact -f mov
 
-FATE_SAMPLES_FFMPEG-$(call ALLYES, MOV_DEMUXER PRORES_METADATA_BSF) += $(FATE_PRORES_METADATA_BSF)
+FATE_SAMPLES_FFMPEG_FFPROBE-$(call FRAMECRC, MOV, PRORES,) += fate-prores-probe
+fate-prores-probe: CMD = stream_demux mov $(TARGET_SAMPLES)/prores/Sequence_1-Apple_ProRes_422_HQ.mov "" "-c:v copy" "-show_frames"
+
+FATE_SAMPLES_FFMPEG-$(call DEMMUX, MOV, MOV, PRORES_METADATA_BSF) += $(FATE_PRORES_METADATA_BSF)

@@ -27,10 +27,12 @@
 
 #include "libavutil/bswap.h"
 
-#include "libavcodec/ac3.h"
+#include "libavcodec/ac3defs.h"
 #include "libavcodec/adts_parser.h"
 
 #include "avformat.h"
+#include "demux.h"
+#include "internal.h"
 #include "spdif.h"
 
 static int spdif_get_offset_and_codec(AVFormatContext *s,
@@ -93,6 +95,10 @@ static int spdif_get_offset_and_codec(AVFormatContext *s,
         *offset = 8192;
         *codec = AV_CODEC_ID_DTS;
         break;
+    case IEC61937_EAC3:
+        *offset = 24576;
+        *codec = AV_CODEC_ID_EAC3;
+        break;
     default:
         if (s) { /* be silent during a probe */
             avpriv_request_sample(s, "Data type 0x%04x in IEC 61937",
@@ -136,7 +142,10 @@ int ff_spdif_probe(const uint8_t *p_buf, int buf_size, enum AVCodecID *codec)
             } else
                 consecutive_codes = 0;
 
-            if (buf + 4 + AV_AAC_ADTS_HEADER_SIZE > p_buf + buf_size)
+            /* spdif_get_offset_and_codec() parses AV_AAC_ADTS_HEADER_SIZE
+             * bytes starting at buf[5] (the payload after the 4 byte sync and
+             * the Pc/Pd burst header), so that many bytes must be available. */
+            if (buf + 5 + AV_AAC_ADTS_HEADER_SIZE > p_buf + buf_size)
                 break;
 
             /* continue probing to find more sync codes */
@@ -170,6 +179,16 @@ static int spdif_read_header(AVFormatContext *s)
     return 0;
 }
 
+static int spdif_get_pkt_size_bits(int type, int code)
+{
+    switch (type & 0xff) {
+    case IEC61937_EAC3:
+        return code << 3;
+    default:
+        return code;
+    }
+}
+
 int ff_spdif_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     AVIOContext *pb = s->pb;
@@ -185,7 +204,7 @@ int ff_spdif_read_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     data_type = avio_rl16(pb);
-    pkt_size_bits = avio_rl16(pb);
+    pkt_size_bits = spdif_get_pkt_size_bits(data_type, avio_rl16(pb));
 
     if (pkt_size_bits % 16)
         avpriv_request_sample(s, "Packet not ending at a 16-bit boundary");
@@ -218,6 +237,10 @@ int ff_spdif_read_packet(AVFormatContext *s, AVPacket *pkt)
         }
         st->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
         st->codecpar->codec_id = codec_id;
+        if (codec_id == AV_CODEC_ID_EAC3)
+            ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL;
+        else
+            ffstream(st)->need_parsing = AVSTREAM_PARSE_HEADERS;
     } else if (codec_id != s->streams[0]->codecpar->codec_id) {
         avpriv_report_missing_feature(s, "Codec change in IEC 61937");
         return AVERROR_PATCHWELCOME;
@@ -226,16 +249,16 @@ int ff_spdif_read_packet(AVFormatContext *s, AVPacket *pkt)
     if (!s->bit_rate && s->streams[0]->codecpar->sample_rate)
         /* stream bitrate matches 16-bit stereo PCM bitrate for currently
            supported codecs */
-        s->bit_rate = 2 * 16 * s->streams[0]->codecpar->sample_rate;
+        s->bit_rate = 2 * 16LL * s->streams[0]->codecpar->sample_rate;
 
     return 0;
 }
 
-const AVInputFormat ff_spdif_demuxer = {
-    .name           = "spdif",
-    .long_name      = NULL_IF_CONFIG_SMALL("IEC 61937 (compressed data in S/PDIF)"),
+const FFInputFormat ff_spdif_demuxer = {
+    .p.name         = "spdif",
+    .p.long_name    = NULL_IF_CONFIG_SMALL("IEC 61937 (compressed data in S/PDIF)"),
+    .p.flags        = AVFMT_GENERIC_INDEX,
     .read_probe     = spdif_probe,
     .read_header    = spdif_read_header,
     .read_packet    = ff_spdif_read_packet,
-    .flags          = AVFMT_GENERIC_INDEX,
 };

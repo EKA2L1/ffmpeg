@@ -30,16 +30,27 @@
 #include "aacenc_is.h"
 #include "aacenc_quantization.h"
 
-struct AACISError ff_aac_is_encoding_err(AACEncContext *s, ChannelElement *cpe,
-                                         int start, int w, int g, float ener0,
-                                         float ener1, float ener01,
-                                         int use_pcoeffs, int phase)
+/** Frequency in Hz for lower limit of intensity stereo **/
+#define INT_STEREO_LOW_LIMIT 6100
+
+struct AACISError {
+    int pass;    /* 1 if dist2 <= dist1  */
+    int phase;   /* -1 or +1             */
+    float error; /* fabs(dist1 - dist2)  */
+    float dist1; /* From original coeffs */
+    float dist2; /* From IS'd coeffs     */
+    float ener01;
+};
+
+static struct AACISError aac_is_encoding_err(AACEncContext *s, ChannelElement *cpe,
+                                             int start, int w, int g, float ener0,
+                                             float ener1, float ener01, int phase)
 {
     int i, w2;
     SingleChannelElement *sce0 = &cpe->ch[0];
     SingleChannelElement *sce1 = &cpe->ch[1];
-    float *L = use_pcoeffs ? sce0->pcoeffs : sce0->coeffs;
-    float *R = use_pcoeffs ? sce1->pcoeffs : sce1->coeffs;
+    float *L = sce0->coeffs;
+    float *R = sce1->coeffs;
     float *L34 = &s->scoefs[256*0], *R34 = &s->scoefs[256*1];
     float *IS  = &s->scoefs[256*2], *I34 = &s->scoefs[256*3];
     float dist1 = 0.0f, dist2 = 0.0f;
@@ -59,24 +70,24 @@ struct AACISError ff_aac_is_encoding_err(AACEncContext *s, ChannelElement *cpe,
         float minthr = FFMIN(band0->threshold, band1->threshold);
         for (i = 0; i < sce0->ics.swb_sizes[g]; i++)
             IS[i] = (L[start+(w+w2)*128+i] + phase*R[start+(w+w2)*128+i])*sqrt(ener0/ener01);
-        s->abs_pow34(L34, &L[start+(w+w2)*128], sce0->ics.swb_sizes[g]);
-        s->abs_pow34(R34, &R[start+(w+w2)*128], sce0->ics.swb_sizes[g]);
-        s->abs_pow34(I34, IS,                   sce0->ics.swb_sizes[g]);
+        s->aacdsp.abs_pow34(L34, &L[start+(w+w2)*128], sce0->ics.swb_sizes[g]);
+        s->aacdsp.abs_pow34(R34, &R[start+(w+w2)*128], sce0->ics.swb_sizes[g]);
+        s->aacdsp.abs_pow34(I34, IS,                   sce0->ics.swb_sizes[g]);
         maxval = find_max_val(1, sce0->ics.swb_sizes[g], I34);
         is_band_type = find_min_book(maxval, is_sf_idx);
         dist1 += quantize_band_cost(s, &L[start + (w+w2)*128], L34,
                                     sce0->ics.swb_sizes[g],
                                     sce0->sf_idx[w*16+g],
                                     sce0->band_type[w*16+g],
-                                    s->lambda / band0->threshold, INFINITY, NULL, NULL, 0);
+                                    s->lambda / band0->threshold, INFINITY, NULL, NULL);
         dist1 += quantize_band_cost(s, &R[start + (w+w2)*128], R34,
                                     sce1->ics.swb_sizes[g],
                                     sce1->sf_idx[w*16+g],
                                     sce1->band_type[w*16+g],
-                                    s->lambda / band1->threshold, INFINITY, NULL, NULL, 0);
+                                    s->lambda / band1->threshold, INFINITY, NULL, NULL);
         dist2 += quantize_band_cost(s, IS, I34, sce0->ics.swb_sizes[g],
                                     is_sf_idx, is_band_type,
-                                    s->lambda / minthr, INFINITY, NULL, NULL, 0);
+                                    s->lambda / minthr, INFINITY, NULL, NULL);
         for (i = 0; i < sce0->ics.swb_sizes[g]; i++) {
             dist_spec_err += (L34[i] - I34[i])*(L34[i] - I34[i]);
             dist_spec_err += (R34[i] - I34[i]*e01_34)*(R34[i] - I34[i]*e01_34);
@@ -128,10 +139,10 @@ void ff_aac_search_for_is(AACEncContext *s, AVCodecContext *avctx, ChannelElemen
                         ener01p += (coef0 - coef1)*(coef0 - coef1);
                     }
                 }
-                ph_err1 = ff_aac_is_encoding_err(s, cpe, start, w, g,
-                                                 ener0, ener1, ener01p, 0, -1);
-                ph_err2 = ff_aac_is_encoding_err(s, cpe, start, w, g,
-                                                 ener0, ener1, ener01, 0, +1);
+                ph_err1 = aac_is_encoding_err(s, cpe, start, w, g,
+                                              ener0, ener1, ener01p, -1);
+                ph_err2 = aac_is_encoding_err(s, cpe, start, w, g,
+                                              ener0, ener1, ener01, +1);
                 best = (ph_err1.pass && ph_err1.error < ph_err2.error) ? &ph_err1 : &ph_err2;
                 if (best->pass) {
                     cpe->is_mask[w*16+g] = 1;
