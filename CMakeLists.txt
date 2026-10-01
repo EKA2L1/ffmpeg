@@ -216,13 +216,13 @@ if(MSVC)
 else()
     set(ffmpeg_command "${EKA2L1_FFMPEG_BASH}" "${ffmpeg_script_path}")
 endif()
-set(ffmpeg_build_config "set(cache [==[${ffmpeg_cache}]==])\nset(command [==[${ffmpeg_command}]==])\n")
-file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-build-config.cmake" CONTENT "${ffmpeg_build_config}")
 set(ffmpeg_archives)
 foreach(library avformat avcodec swscale swresample avutil)
-    list(APPEND ffmpeg_archives "${ffmpeg_prefix}/lib/lib${library}.a")
+    list(APPEND ffmpeg_archives "${ffmpeg_prefix}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}${library}${CMAKE_STATIC_LIBRARY_SUFFIX}")
 endforeach()
 set(ffmpeg_header "${ffmpeg_prefix}/include/libavcodec/avcodec.h")
+set(ffmpeg_build_config "set(cache [==[${ffmpeg_cache}]==])\nset(command [==[${ffmpeg_command}]==])\nset(outputs [==[${ffmpeg_archives};${ffmpeg_header}]==])\n")
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-build-config.cmake" CONTENT "${ffmpeg_build_config}")
 add_custom_command(OUTPUT ${ffmpeg_archives} "${ffmpeg_cache}/complete" "${ffmpeg_header}"
     COMMAND "${CMAKE_COMMAND}" "-Dconfig=${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-build-config.cmake"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildFFmpeg.cmake"
