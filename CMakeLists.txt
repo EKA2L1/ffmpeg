@@ -106,6 +106,17 @@ else()
         string(APPEND ffmpeg_cflags " -arch ${apple_arch}")
         string(APPEND ffmpeg_ldflags " -arch ${apple_arch}")
         if(CMAKE_SYSTEM_NAME STREQUAL iOS)
+            # Build-time generators must run on macOS, even inside an iOS Xcode build.
+            execute_process(COMMAND xcrun --sdk macosx --find clang
+                OUTPUT_VARIABLE ffmpeg_host_cc OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE host_cc_result)
+            execute_process(COMMAND xcrun --sdk macosx --show-sdk-path
+                OUTPUT_VARIABLE ffmpeg_host_sdk OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE host_sdk_result)
+            if(NOT host_cc_result EQUAL 0 OR NOT host_sdk_result EQUAL 0)
+                message(FATAL_ERROR "Cannot resolve the macOS compiler and SDK for FFmpeg build tools")
+            endif()
+            set(ffmpeg_host_flags "-target ${CMAKE_HOST_SYSTEM_PROCESSOR}-apple-macos -isysroot ${ffmpeg_host_sdk}")
+            list(APPEND ffmpeg_options "--host-cc=${ffmpeg_host_cc}"
+                "--host-cflags=${ffmpeg_host_flags}" "--host-ldflags=${ffmpeg_host_flags}")
             if(ffmpeg_sdk MATCHES "[Ss]imulator")
                 set(min_version_flag -mios-simulator-version-min)
             else()

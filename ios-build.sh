@@ -36,6 +36,9 @@ build_one() {
         --cpu=armv8-a \
         --cc="$(xcrun --sdk "${sdk}" -f clang)" \
         --cxx="$(xcrun --sdk "${sdk}" -f clang++)" \
+        --host-cc="$(xcrun --sdk macosx -f clang)" \
+        --host-cflags="-target $(uname -m)-apple-macos -isysroot $(xcrun --sdk macosx --show-sdk-path)" \
+        --host-ldflags="-target $(uname -m)-apple-macos -isysroot $(xcrun --sdk macosx --show-sdk-path)" \
         --sysroot="${sdk_path}" \
         --enable-cross-compile \
         --extra-cflags="-arch arm64 -isysroot ${sdk_path} ${min_flag}=${DEPLOYMENT_TARGET} -Os -D__STDC_CONSTANT_MACROS" \
@@ -49,7 +52,7 @@ build_one() {
         --disable-programs \
         --disable-network \
         --disable-avfilter \
-            --disable-encoders \
+        --disable-encoders \
         --disable-doc \
         --disable-ffplay \
         --disable-ffprobe \
