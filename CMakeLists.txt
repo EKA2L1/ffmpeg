@@ -43,7 +43,7 @@ set(ffmpeg_options
     --enable-pic --disable-avdevice --disable-avfilter
     --disable-programs --disable-doc --disable-network
     --enable-decoder=h264,mpeg4,h263,h263p,mpeg2video,mjpeg,mjpegb
-    --enable-decoder=aac,aac_latm,wavpack,amrnb,amrwb,mp3,pcm_alaw,pcm_s16le,pcm_s8
+    --enable-decoder=aac,aac_latm,wavpack,amrnb,amrwb,mp3,pcm_alaw,pcm_s16le,pcm_s8,pcm_u8
     --enable-encoder=pcm_s16le
     --enable-demuxer=h264,m4v,mp3,mpegvideo,mpegps,mjpeg,mov,avi,aac,amr,amrnb,amrwb,epoc,pcm_s16le,pcm_s8,wav
     --enable-muxer=amr,avi,mp3,wav,pcm_s16le,pcm_s8,ogg
