@@ -44,10 +44,10 @@ set(ffmpeg_options
     --disable-programs --disable-doc --disable-network
     --enable-decoder=h264,mpeg4,h263,h263p,mpeg2video,mjpeg,mjpegb
     --enable-decoder=aac,aac_latm,wavpack,amrnb,amrwb,mp3,adpcm_ima_wav,pcm_alaw,pcm_s16le,pcm_s8,pcm_u8
-    --enable-encoder=pcm_s16le
+    --enable-encoder=pcm_s16le,aac
     --enable-demuxer=h264,m4v,mp3,mpegvideo,mpegps,mjpeg,mov,avi,aac,amr,amrnb,amrwb,epoc,pcm_s16le,pcm_s8,wav
-    --enable-muxer=amr,avi,mp3,wav,pcm_s16le,pcm_s8,ogg
-    --enable-parser=h264,mpeg4video,mpegvideo,mjpeg,aac,aac_latm,mpegaudio
+    --enable-muxer=amr,avi,mp3,mp4,wav,pcm_s16le,pcm_s8,ogg
+    --enable-parser=h264,mpeg4video,mpegvideo,mjpeg,aac,aac_latm,amr,mpegaudio
     --enable-protocol=file "--arch=${ffmpeg_arch}")
 set(ffmpeg_cflags "${CMAKE_C_FLAGS}")
 set(ffmpeg_ldflags "${CMAKE_EXE_LINKER_FLAGS}")
@@ -155,6 +155,20 @@ else()
 endif()
 list(APPEND ffmpeg_options "--extra-cflags=${ffmpeg_cflags}" "--extra-ldflags=${ffmpeg_ldflags}")
 
+if(TARGET opencore-amrnb)
+    # The libopencore_amrnb wrapper is only available under the (L)GPL version 3 terms.
+    list(APPEND ffmpeg_options --enable-version3 --enable-libopencore-amrnb --enable-encoder=libopencore_amrnb)
+    set(ffmpeg_opencore "${CMAKE_CURRENT_BINARY_DIR}/opencore-amrnb")
+    # The generator expression keeps multi-config generators from adding a per-configuration directory.
+    set_target_properties(opencore-amrnb PROPERTIES
+        OUTPUT_NAME opencore-amrnb ARCHIVE_OUTPUT_DIRECTORY "$<1:${ffmpeg_opencore}/lib>")
+    get_target_property(opencore_includes opencore-amrnb INTERFACE_INCLUDE_DIRECTORIES)
+    foreach(directory IN LISTS opencore_includes)
+        file(GLOB opencore_headers "${directory}/interf_*.h")
+        file(COPY ${opencore_headers} DESTINATION "${ffmpeg_opencore}/include/opencore-amrnb")
+    endforeach()
+endif()
+
 # Hash source contents as well as the toolchain so local edits cannot reuse stale libraries.
 file(GLOB_RECURSE ffmpeg_inputs CONFIGURE_DEPENDS
     "libavcodec/*.c" "libavcodec/*.h" "libavcodec/*.S" "libavcodec/*.asm" "libavcodec/*Makefile"
@@ -179,6 +193,10 @@ foreach(input IN LISTS ffmpeg_inputs)
     string(APPEND ffmpeg_signature "${digest}")
 endforeach()
 string(SHA256 ffmpeg_key "${ffmpeg_signature}")
+if(ffmpeg_opencore)
+    # Only configure probes the library; the static archives do not embed it, so its location stays out of the key.
+    list(APPEND ffmpeg_options "--extra-cflags=-I${ffmpeg_opencore}/include" "--extra-ldflags=-L${ffmpeg_opencore}/lib")
+endif()
 set(ffmpeg_cache "${EKA2L1_FFMPEG_CACHE_DIR}/${CMAKE_SYSTEM_NAME}-${ffmpeg_arch}-${ffmpeg_key}")
 set(ffmpeg_prefix "${ffmpeg_cache}/install")
 file(MAKE_DIRECTORY "${ffmpeg_prefix}/include")
@@ -223,16 +241,21 @@ endforeach()
 set(ffmpeg_header "${ffmpeg_prefix}/include/libavcodec/avcodec.h")
 set(ffmpeg_build_config "set(cache [==[${ffmpeg_cache}]==])\nset(command [==[${ffmpeg_command}]==])\nset(outputs [==[${ffmpeg_archives};${ffmpeg_header}]==])\n")
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-build-config.cmake" CONTENT "${ffmpeg_build_config}")
+set(ffmpeg_dependencies)
+if(ffmpeg_opencore)
+    set(ffmpeg_dependencies opencore-amrnb)
+endif()
 add_custom_command(OUTPUT ${ffmpeg_archives} "${ffmpeg_cache}/complete" "${ffmpeg_header}"
     COMMAND "${CMAKE_COMMAND}" "-Dconfig=${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-build-config.cmake"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildFFmpeg.cmake"
+    DEPENDS ${ffmpeg_dependencies}
     COMMENT "Building cached FFmpeg (${CMAKE_SYSTEM_NAME}/${ffmpeg_arch})"
     VERBATIM)
 add_custom_target(ffmpeg-build DEPENDS ${ffmpeg_archives} "${ffmpeg_cache}/complete" "${ffmpeg_header}")
 add_library(ffmpeg INTERFACE)
 add_dependencies(ffmpeg ffmpeg-build)
 target_include_directories(ffmpeg INTERFACE "${ffmpeg_prefix}/include")
-target_link_libraries(ffmpeg INTERFACE ${ffmpeg_archives} ${ffmpeg_libraries})
+target_link_libraries(ffmpeg INTERFACE ${ffmpeg_archives} ${ffmpeg_dependencies} ${ffmpeg_libraries})
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ffmpeg_inputs})
 message(STATUS "FFmpeg source build cache: ${ffmpeg_cache}")
 
